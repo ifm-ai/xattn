@@ -1,0 +1,6 @@
+# Python build dependencies for source installs with --no-build-isolation.
+# System CUDA prerequisites such as nvcc are not installed by pip.
+setuptools>=64
+wheel
+ninja
+torch>=2.10

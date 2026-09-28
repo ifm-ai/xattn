@@ -1,0 +1,5 @@
+#include "flash_swa/hopper/bwd_template.cuh"
+
+XATTN_FLASH_SWA_BWD_SM90_INSTANTIATE_NONDET(cutlass::bfloat16_t, 256, 256, 80)
+XATTN_FLASH_SWA_BWD_SM90_INSTANTIATE_DENSE_SEGMENT(cutlass::bfloat16_t, 256, 256, 64)
+XATTN_FLASH_SWA_BWD_SM90_INSTANTIATE_VARLEN(cutlass::bfloat16_t, 256, 256, 64)

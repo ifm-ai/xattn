@@ -1,0 +1,4 @@
+#include "softdelta/fwd_dynamic_chunk_tile_instantiation.cuh"
+
+XATTN_FLASH_SOFTDELTA_FWD_SM90_INSTANTIATE_DYNAMIC_CHUNK_TILE(
+    cutlass::half_t, 256, 96, 128, 96, 2)

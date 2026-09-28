@@ -1,0 +1,7 @@
+include README.md LICENSE THIRD_PARTY_NOTICES requirements-build.txt
+recursive-include docs *.md
+recursive-include tests *.py
+recursive-include csrc *.cc *.cu *.cuh *.h *.hpp *.inl *.json *.py *.txt
+prune csrc/cutlass
+recursive-include csrc/cutlass/include *.h *.hpp *.inl
+include csrc/cutlass/LICENSE.txt

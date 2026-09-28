@@ -1,0 +1,168 @@
+{
+  "architecture": "sm90a",
+  "compat_registry": {
+    "compat_registry_coverage_sha256": "cee39eea09d79aad81c08683dc54c4ddefd4ce14c8d1673f555ee293b26a37ae",
+    "compat_registry_source_sha256": "92d64a03f05a1acac5b4a8727eeb5bca7aad3b45922558d5439371f971e490c0",
+    "entries": [
+      {
+        "direction_kind": "kForward",
+        "plan_type": "ScaDenseFwdCompatPlanSm90",
+        "route_kind": "kDenseOrSegmentBundle",
+        "semantic_type": "ScaDenseFwdSemantic",
+        "stable_instance_route_bundle_id": "sca_compat_fwd_dense_segment_varlen",
+        "stable_plan_id": "sca_compat_fwd_dense_segment"
+      },
+      {
+        "direction_kind": "kForward",
+        "plan_type": "ScaVarlenFwdCompatPlanSm90",
+        "route_kind": "kVarlen",
+        "semantic_type": "ScaVarlenFwdSemantic",
+        "stable_instance_route_bundle_id": "sca_compat_fwd_dense_segment_varlen",
+        "stable_plan_id": "sca_compat_fwd_varlen"
+      },
+      {
+        "direction_kind": "kBackward",
+        "plan_type": "ScaDenseBwdCompatPlanSm90",
+        "route_kind": "kDenseOrSegmentBundle",
+        "semantic_type": "ScaDenseBwdSemantic",
+        "stable_instance_route_bundle_id": "sca_compat_bwd_dense_segment_varlen",
+        "stable_plan_id": "sca_compat_bwd_dense_segment"
+      },
+      {
+        "direction_kind": "kBackward",
+        "plan_type": "ScaVarlenBwdCompatPlanSm90",
+        "route_kind": "kVarlen",
+        "semantic_type": "ScaVarlenBwdSemantic",
+        "stable_instance_route_bundle_id": "sca_compat_bwd_dense_segment_varlen",
+        "stable_plan_id": "sca_compat_bwd_varlen"
+      }
+    ],
+    "source": "csrc/flash_sca/hopper/plans/sca_compat/registry.h"
+  },
+  "axes": {
+    "directions": [
+      "fwd",
+      "bwd"
+    ],
+    "head_dims": [
+      32,
+      64,
+      96,
+      128,
+      160,
+      192,
+      256
+    ],
+    "kernel_dtypes": [
+      "fp16",
+      "bf16"
+    ],
+    "value_head_dims": [
+      32,
+      64,
+      96,
+      128,
+      160,
+      192,
+      256
+    ]
+  },
+  "coverage_sha256": "651164bb31505536885bcec88c0ad7420bcd51756e7ee3b50bbf77e9b1b77177",
+  "formula_resource_class": "StandardSingleStream",
+  "generator": {
+    "loader_source": "csrc/flash_sca/hopper/manifest/sm90.py",
+    "loader_source_sha256": "21defa2e4c0f9f8d6ac14965e8ff8dc8be814bf5d6149ee7f75bd4db12180417",
+    "name": "xattn.flash_sca.sm90_manifest",
+    "validator_source": "csrc/flash_sca/hopper/manifest/validate_sm90.py",
+    "validator_source_sha256": "2826037bcbb5e2299eabf62fdbd0c4cb4a4c3b61f374bfb272cce310a9775723",
+    "version": 1
+  },
+  "group_counts": {
+    "bwd": 98,
+    "fwd": 98,
+    "total": 196
+  },
+  "route_bundles": {
+    "bwd": {
+      "determinism": [
+        "nondeterministic",
+        "deterministic"
+      ],
+      "routes": [
+        {
+          "partition": "none",
+          "position": [
+            "global",
+            "reset"
+          ],
+          "route": "dense"
+        },
+        {
+          "partition": "segment_index",
+          "position": [
+            "global",
+            "reset"
+          ],
+          "route": "segment"
+        },
+        {
+          "partition": "varlen",
+          "position": [
+            "global",
+            "reset"
+          ],
+          "route": "varlen"
+        }
+      ],
+      "stable_id": "sca_compat_bwd_dense_segment_varlen"
+    },
+    "fwd": {
+      "determinism": [
+        "not_applicable"
+      ],
+      "routes": [
+        {
+          "partition": "none",
+          "position": [
+            "global",
+            "reset"
+          ],
+          "route": "dense"
+        },
+        {
+          "partition": "segment_index",
+          "position": [
+            "global",
+            "reset"
+          ],
+          "route": "segment"
+        },
+        {
+          "partition": "varlen",
+          "position": [
+            "global",
+            "reset"
+          ],
+          "route": "varlen"
+        }
+      ],
+      "stable_id": "sca_compat_fwd_dense_segment_varlen"
+    }
+  },
+  "schema_version": 1,
+  "semantic_identity": {
+    "boundary": "inclusive",
+    "formula": "standard",
+    "head_mapping": [
+      "mha",
+      "gqa",
+      "mqa"
+    ],
+    "visibility": "sliding_chunk"
+  },
+  "source": {
+    "directory": "csrc/flash_sca/hopper/src/instantiations",
+    "filename": "sliding_chunk_attention_{direction}_hdim{head_dim}_vdim{value_head_dim}_{kernel_dtype}_sm90.cu"
+  },
+  "variant": "sca"
+}
