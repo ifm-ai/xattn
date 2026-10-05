@@ -1,3 +1,4 @@
+from ._backward_precision import validate_high_precision_level, validate_backward_precision
 # Author: Shicheng Wen
 
 """Standalone SoftDelta state and gradients, using the production SM90 routes."""
@@ -19,14 +20,13 @@ from .softdelta_attention import (
 
 def _prepare(q, k, v, g, *, visibility, span, scale, prev_k, prev_v,
              q_segment_idx, k_segment_idx, segment_idx, bos_mask, backend,
-             reset, deterministic, high_precision_output, api_name):
+             reset, deterministic, high_precision_level, api_name):
     backend = _normalize_backend(backend)
     _, _, _, prev_length = _validate_inputs(
         q, k, v, g, prev_k, prev_v, deterministic, api_name,
         allow_short_q=True,
     )
-    if not isinstance(high_precision_output, bool):
-        raise TypeError(f"{api_name} high_precision_output must be a bool")
+    validate_high_precision_level(high_precision_level)
     if not isinstance(reset, bool):
         raise TypeError(f"{api_name} reset_chunk_pos_per_seq must be a bool")
     plan = _make_plan(visibility, span, reset)
@@ -42,7 +42,7 @@ def _prepare(q, k, v, g, *, visibility, span, scale, prev_k, prev_v,
             raise ValueError(f"{api_name} BOS masks and segment indices are mutually exclusive")
         q_segment_idx, k_segment_idx, bos = _prepare_flash_bos_plan(
             q, k, v, plan, total_length, bos_mask, deterministic, True,
-            api_name, high_precision_output=high_precision_output,
+            api_name, high_precision_level=high_precision_level,
         )
     else:
         q_segment_idx, k_segment_idx = _prepare_partition(
@@ -52,7 +52,7 @@ def _prepare(q, k, v, g, *, visibility, span, scale, prev_k, prev_v,
     span = total_length - 1 if visibility is AttentionVisibility.CAUSAL_FULL else span
     _, paired = _paired_training_route(
         q, k, v, plan, span, prev_k, prev_v, q_segment_idx, k_segment_idx,
-        bos, deterministic, high_precision_output,
+        bos, deterministic, high_precision_level,
     )
     visibility = {
         AttentionVisibility.CAUSAL_FULL: 0,
@@ -64,8 +64,14 @@ def _prepare(q, k, v, g, *, visibility, span, scale, prev_k, prev_v,
 
 def _reader(q, k, v, *, span, scale, prev_k, prev_v, qi, ki, bos,
             visibility, reset, strict, deterministic, state=None,
-            dy=None, y=None, lse=None):
+            dy=None, y=None, lse=None, high_precision_level=0):
     backward = dy is not None
+    if backward and high_precision_level >= 2:
+        from ._precision_backend import backward as precision_backward
+        return precision_backward(dy, q, k, v, level=high_precision_level,
+            visibility=visibility, span=span, scale=scale, prev_k=prev_k, prev_v=prev_v,
+            q_segment_idx=qi, k_segment_idx=ki, reset=reset, strict=strict,
+            deterministic=deterministic, return_fp32=True)
     varlen = bos is not None and (bos.bwd_use_varlen if backward else bos.fwd_use_varlen)
     prefix = (dy, q, k, v, y, lse) if backward else (q, k, v)
     if visibility == 2:
@@ -75,7 +81,7 @@ def _reader(q, k, v, *, span, scale, prev_k, prev_v, qi, ki, bos,
                     prev_k, prev_v, qi, ki, "sm90", "default", deterministic,
                     strict_past=strict)
             output, saved, lp = matched_forward(q, k, v, span, scale,
-                prev_k, prev_v, qi, ki, "sm90", "default", state is not None,
+                prev_k, prev_v, qi, ki, "sm90", "default", int(state is not None),
                 strict_past=strict)
             if state is not None:
                 state.copy_(saved)
@@ -115,7 +121,7 @@ def _pack_readers(first, second):
 def _softdelta_fwd(q, k, v, g, **options):
     span, scale, qi, ki, bos, paired, visibility = _prepare(q, k, v, g, **options)
     flat_v = v.flatten(3)
-    hp = options['high_precision_output']
+    hp = options['high_precision_level']
     ops = flash._extension_ops()
     shape = (*q.shape[:3], *v.shape[3:])
     if paired:
@@ -146,6 +152,7 @@ def _softdelta_fwd(q, k, v, g, **options):
 
 @torch.no_grad()
 def _softdelta_bwd(dy, q, k, v, g, readers, lse, **options):
+    validate_backward_precision(options["high_precision_level"], readers, q)
     # Validate saved-state tensors before any native pointer access.
     _validate_inputs(q, k, v, g, options['prev_k'], options['prev_v'],
                      options['deterministic'], options['api_name'],
@@ -158,6 +165,9 @@ def _softdelta_bwd(dy, q, k, v, g, readers, lse, **options):
         if tensor.shape != shape or tensor.device != q.device or tensor.dtype not in dtypes:
             raise ValueError(f"{options['api_name']} {name} has incompatible shape, device, or dtype")
     span, scale, qi, ki, bos, paired, visibility = _prepare(q, k, v, g, **options)
+    if options["high_precision_level"] >= 2 and options['bos_mask'] is not None:
+        ki = options['bos_mask'].to(torch.int64).cumsum(-1)
+        qi = ki[:, -q.shape[1]:]
     flat_v = v.flatten(3)
     flat_prev_v = None if options['prev_v'] is None else options['prev_v'].flatten(3)
     readers = readers.flatten(3).contiguous()
@@ -166,7 +176,7 @@ def _softdelta_bwd(dy, q, k, v, g, readers, lse, **options):
     ops = flash._extension_ops()
     det = options['deterministic']
     hp = readers.dtype == torch.float32
-    if paired and not flash._use_window_composed_backward(q, k, v, span, visibility, det, hp):
+    if options["high_precision_level"] < 2 and paired and not flash._use_window_composed_backward(q, k, v, span, visibility, det, hp):
         dq, dk, dv, dg = ops._flash_softdelta_paired_bwd(
             dy, q, k, flat_v, g, readers, readers, lse, span, scale, visibility, det,
         )
@@ -182,14 +192,17 @@ def _softdelta_bwd(dy, q, k, v, g, readers, lse, **options):
         )
     else:
         # Pair gate BWD supports both FP32 and input-precision reader state.
-        pair_grad, dg = ops._flash_softdelta_pair_gate_bwd(dy, readers, g)
+        # Gate belongs to the ordinary low-dtype forward pipeline. FP32
+        # state is used only by attention backward in advanced levels.
+        gate_readers = readers.to(q.dtype) if options["high_precision_level"] >= 2 else readers
+        pair_grad, dg = ops._flash_softdelta_pair_gate_bwd(dy, gate_readers, g)
         gradients = []
         for i in range(2):
             gradients.append(_reader(
                 q[:, :, i::2], k, flat_v, span=span, scale=scale,
                 prev_k=options['prev_k'], prev_v=flat_prev_v, qi=qi, ki=ki,
                 bos=bos, visibility=visibility, reset=options['reset'],
-                strict=bool(i), deterministic=det,
+                strict=bool(i), deterministic=det, high_precision_level=options["high_precision_level"],
                 dy=pair_grad[:, :, i::2].contiguous(),
                 y=readers[:, :, i::2].contiguous(), lse=lse[:, i::2].contiguous(),
             ))
@@ -198,6 +211,8 @@ def _softdelta_bwd(dy, q, k, v, g, readers, lse, **options):
             None if a is None else a + b
             for a, b in zip(gradients[0][1:], gradients[1][1:])
         )
+    if options["high_precision_level"] >= 2:
+        dq, dk, dv, dpk, dpv = (None if x is None else x.to(q.dtype) for x in (dq, dk, dv, dpk, dpv))
     return dq, dk, dv.reshape(v.shape), dg, dpk, None if dpv is None else dpv.reshape(options['prev_v'].shape)
 
 

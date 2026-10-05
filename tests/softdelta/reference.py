@@ -46,10 +46,15 @@ def _allowed_masks(
             (left & (k_position < q_position)).expand(batch, -1, -1),
         )
 
-    inclusive = torch.zeros(
-        batch, q_length, k_length, dtype=torch.bool, device=device
-    )
-    strict_past = torch.zeros_like(inclusive)
+    # Keep the independent literal mask oracle, but build its bits on the CPU.
+    # Per-element CUDA assignments turn a small reference into thousands of
+    # kernel launches and dominate comprehensive correctness sweeps.
+    count = batch * q_length * k_length
+    if count == 0:
+        empty = torch.zeros(batch, q_length, k_length, dtype=torch.bool, device=device)
+        return empty, torch.zeros_like(empty)
+    inclusive_bits = bytearray(count)
+    strict_bits = bytearray(count)
 
     for batch_idx in range(batch):
         if q_segment_idx is None:
@@ -101,10 +106,13 @@ def _allowed_masks(
                     raise AssertionError(visibility)
 
                 if in_left_range and k_position <= q_position:
-                    inclusive[batch_idx, q_index, k_index] = True
+                    inclusive_bits[(batch_idx * q_length + q_index) * k_length + k_index] = 1
                 if in_left_range and k_position < q_position:
-                    strict_past[batch_idx, q_index, k_index] = True
-    return inclusive, strict_past
+                    strict_bits[(batch_idx * q_length + q_index) * k_length + k_index] = 1
+    return (
+        torch.frombuffer(inclusive_bits, dtype=torch.bool).reshape(batch, q_length, k_length).to(device),
+        torch.frombuffer(strict_bits, dtype=torch.bool).reshape(batch, q_length, k_length).to(device),
+    )
 
 
 def _attention_from_mask(

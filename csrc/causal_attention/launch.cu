@@ -1327,18 +1327,22 @@ CausalAttentionSM90BwdWithHeadBoundary(
 
   torch::Tensor dq_pad = torch::empty_like(q_c);
   const bool grouped_heads = q.size(2) != k.size(2);
+  // Dispatch sees padded input dimensions, not the original public shape.
+  // Use those same dimensions when allocating square-template GQA outputs.
+  const int kernel_d = static_cast<int>(q_c.size(3));
+  const int kernel_v = static_cast<int>(v_c.size(3));
   const bool native_window160 = dense && !use_full_visibility &&
       UseNativeWindow160Bwd(
-          D, V, q.size(0), q.size(1), k_c.size(1), q.size(2), k.size(2),
+          kernel_d, kernel_v, q.size(0), q.size(1), k_c.size(1), q.size(2), k.size(2),
           window_size, strict_past ? -1 : 0, odd_head_window_right_delta,
           deterministic);
   const bool use_d192 =
       dense && !native_window160 &&
-      ((D == 192 && V == 128) || (D == 160 && V == 128) ||
-       (D == 160 && V == 160));
-  const bool use_d96 = dense && D == 64 && V == 96;
+      ((kernel_d == 192 && kernel_v == 128) || (kernel_d == 160 && kernel_v == 128) ||
+       (kernel_d == 160 && kernel_v == 160));
+  const bool use_d96 = dense && kernel_d == 64 && kernel_v == 96;
   const bool use_d256 =
-      use_full_visibility && !deterministic && D == 64 && V == 256;
+      use_full_visibility && !deterministic && kernel_d == 64 && kernel_v == 256;
   // The causal-flash-attn cast can remove square-template padding while writing
   // grouped gradients directly into their actual D/V shape.
   const bool trim_grouped_grads =
@@ -1348,9 +1352,9 @@ CausalAttentionSM90BwdWithHeadBoundary(
        CausalFlashAttnBwdMixedSquareDim(q_c.size(3), v_c.size(3), deterministic) != 0);
   const bool pad_grouped_k_grad =
       grouped_heads && !trim_grouped_grads &&
-      ((use_d192 && D != 192) || use_d96 || use_d256);
+      ((use_d192 && kernel_d != 192) || use_d96 || use_d256);
   const bool pad_grouped_v_grad =
-      grouped_heads && !trim_grouped_grads && use_d192 && V != 192;
+      grouped_heads && !trim_grouped_grads && use_d192 && kernel_v != 192;
   const int64_t grouped_k_dim = use_d256 ? 256 : (use_d192 ? 192 : 96);
   torch::Tensor dk_total_pad = pad_grouped_k_grad
       ? EmptyLastDimLike(k_c, grouped_k_dim)

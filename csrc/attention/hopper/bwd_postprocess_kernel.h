@@ -74,7 +74,7 @@ public:
 
     using SmemCopyAtomdQ = Copy_Atom<
         std::conditional_t<
-            IsSm90,
+            IsSm90 && sizeof(Element) == 2,
             std::conditional_t<!dQ_swapAB, cute::SM90_U32x4_STSM_N, cute::SM90_U16x8_STSM_T>,
             AutoVectorizingCopyWithAssumedAlignment<128>
         >,

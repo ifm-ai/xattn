@@ -35,6 +35,13 @@ struct AttentionDefaultMainloop {
   using Type = Mainloop;
 };
 
+// Keep the LP mainloop type and generated arithmetic unchanged. Only the HP
+// specialization adds the compile-time softmax policy.
+template <typename Mainloop>
+struct AttentionSubtractBeforeScaleMainloop : Mainloop {
+  static constexpr bool UseSubtractBeforeScale = true;
+};
+
 template <typename Visibility, bool kVarlen, bool kHasSegment>
 constexpr std::tuple<int, int, bool, bool> AttentionTileSizeFwdSm90(
     int headdim, int headdim_v) {
@@ -189,9 +196,26 @@ template <
     int kStages = 2,
     bool kSoftDeltaSplitKVMulticast = false,
     bool kSoftDeltaClusteredRowPair = false,
-    bool kInitializeTileCounterOnlyForMultipleWaves = false>
+    bool kInitializeTileCounterOnlyForMultipleWaves = false,
+    bool kSubtractBeforeScale = false>
 void RunAttentionFwdSm90KernelTile(
     AttentionFwdParams& params, cudaStream_t stream) {
+  // Select before launching, rather than branching inside every softmax tile.
+  // The existing FP32 saved-state/output switches define effective HP mode.
+  if constexpr (!kSubtractBeforeScale) {
+    if (params.o_state_ptr != nullptr || params.output_fp32) {
+      RunAttentionFwdSm90KernelTile<
+          kHeadDim, kHeadDimV, Element, ElementOut, kVarlen, kHasSegment,
+          kUsePersistentScheduler, kBlockM, kBlockN, MmaPVIsRS,
+          IntraWGOverlap, kUseFastExp2, Visibility, FwdKernel, kClusterM,
+          kSoftDeltaPair, kSoftDeltaSingleCTA, SchedulerOverride,
+          FwdEpilogue, EpilogueArguments, MainloopAdapter, kStages,
+          kSoftDeltaSplitKVMulticast, kSoftDeltaClusteredRowPair,
+          kInitializeTileCounterOnlyForMultipleWaves,
+          /*kSubtractBeforeScale=*/true>(params, stream);
+      return;
+    }
+  }
   static constexpr bool IsCausal = Visibility::kUseCausalMask;
   static constexpr bool IsLocal = Visibility::kUseLocalMask;
   static constexpr bool IsSlidingChunk = Visibility::kIsSlidingChunk;
@@ -243,8 +267,11 @@ void RunAttentionFwdSm90KernelTile(
       Split, VColmajor, kUseFastExp2, IsSlidingChunk, kSoftDeltaPair,
       kSoftDeltaSingleCTA, kSoftDeltaSplitKVMulticast,
       kSoftDeltaClusteredRowPair>;
-  using CollectiveMainloop =
+  using AdaptedMainloop =
       typename MainloopAdapter<DefaultCollectiveMainloop>::Type;
+  using CollectiveMainloop = std::conditional_t<
+      kSubtractBeforeScale,
+      AttentionSubtractBeforeScaleMainloop<AdaptedMainloop>, AdaptedMainloop>;
   using CollectiveEpilogue = FwdEpilogue<
       TileShapeMNKPV, ClusterShape, ElementOut, ArchTag,
       CollectiveMainloop::NumMmaThreads, Varlen, PackGQA, Split,

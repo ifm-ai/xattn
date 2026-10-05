@@ -1,3 +1,6 @@
+from ._attention_core import validate_sm90_dimensions, validate_attention_scale
+from ._backward_precision import _dispatch_nonpositive_scale
+from ._backward_precision import validate_high_precision_level
 # Author: Shicheng Wen
 
 """Public sliding-window attention API."""
@@ -40,7 +43,7 @@ def flash_swa(
     bos_mask: Optional[Tensor] = None,
     backend: str = "auto",
     deterministic: bool = False,
-    high_precision_output: bool = False,
+    high_precision_level: int = 0,
 ) -> Tensor:
     """Run causal sliding-window attention with optional segment metadata.
 
@@ -52,9 +55,20 @@ def flash_swa(
     ``window_size`` is an inclusive left radius. Query position ``i`` attends
     keys in ``[i + Lk - Lq - window_size, i + Lk - Lq]``.
 
-    ``high_precision_output=True`` saves FP32 attention state for backward.
+    ``high_precision_level=1`` saves FP32 attention state for backward.
     The public output keeps the input dtype.
     """
+    validate_high_precision_level(high_precision_level, api_name="flash_swa")
+    validate_attention_scale(scale)
+    validate_sm90_dimensions(q, v, backend, api_name="flash_swa")
+    if scale is not None and float(scale) <= 0:
+        return _dispatch_nonpositive_scale(flash_swa, locals())
+    if high_precision_level >= 2:
+        from ._precision_backend import apply as precision_apply
+        return precision_apply(q, k, v, visibility=1, window_size=window_size, prev_k=prev_k, prev_v=prev_v,
+            scale=scale, q_segment_idx=q_segment_idx, k_segment_idx=k_segment_idx,
+            segment_idx=segment_idx, bos_mask=bos_mask, backend=backend,
+            deterministic=deterministic, high_precision_level=high_precision_level)
     _validate_window_size(window_size)
     return _causal_attention(
         q,
@@ -70,7 +84,7 @@ def flash_swa(
         bos_mask=bos_mask,
         backend=backend,
         deterministic=deterministic,
-        high_precision_output=high_precision_output,
+        high_precision_level=high_precision_level,
     )
 
 
@@ -88,7 +102,7 @@ def flash_swa_fwd(
     segment_idx: Optional[Tensor] = None,
     bos_mask: Optional[Tensor] = None,
     backend: str = "auto",
-    high_precision_output: bool = False,
+    high_precision_level: int = 0,
 ) -> Tuple[Tensor, Optional[Tensor], Tensor]:
     """Return ``(y, y_fp32, lse)``; ``y_fp32`` is None without high precision.
 
@@ -99,6 +113,11 @@ def flash_swa_fwd(
     Pass ``y_fp32`` as backward's ``y`` for high-precision state, while
     keeping ``y_grad`` in the Q/K/V dtype.
     """
+    validate_high_precision_level(high_precision_level, api_name="flash_swa_fwd")
+    validate_attention_scale(scale)
+    validate_sm90_dimensions(q, v, backend, api_name="flash_swa_fwd")
+    if scale is not None and float(scale) <= 0:
+        return _dispatch_nonpositive_scale(flash_swa_fwd, locals())
     _validate_window_size(window_size)
     return _causal_attention_fwd(
         q,
@@ -113,7 +132,7 @@ def flash_swa_fwd(
         segment_idx=segment_idx,
         bos_mask=bos_mask,
         backend=backend,
-        high_precision_output=high_precision_output,
+        high_precision_level=high_precision_level,
     )
 
 
@@ -135,11 +154,17 @@ def flash_swa_bwd(
     bos_mask: Optional[Tensor] = None,
     backend: str = "auto",
     deterministic: bool = False,
+    high_precision_level: int = 0,
 ) -> Tuple[Tensor, Tensor, Tensor, Optional[Tensor], Optional[Tensor]]:
-    """Run FlashSWA BWD, automatically selecting state precision by y.dtype.
+    """Run FlashSWA BWD using the requested high_precision_level.
 
     ``y`` may be FP32 or input dtype; ``y_grad`` must match Q/K/V dtype.
     """
+    validate_high_precision_level(high_precision_level, api_name="flash_swa_bwd")
+    validate_attention_scale(scale)
+    validate_sm90_dimensions(q, v, backend, api_name="flash_swa_bwd")
+    if scale is not None and float(scale) <= 0:
+        return _dispatch_nonpositive_scale(flash_swa_bwd, locals())
     _validate_window_size(window_size)
     return _causal_attention_bwd(
         y_grad,
@@ -158,4 +183,5 @@ def flash_swa_bwd(
         bos_mask=bos_mask,
         backend=backend,
         deterministic=deterministic,
+        high_precision_level=high_precision_level,
     )

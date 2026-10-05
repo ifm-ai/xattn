@@ -27,7 +27,7 @@ other PyTorch projects.
 
 | Feature | Capabilities |
 | --- | --- |
-| **High-precision Flash Attention output state** | Retains FP32 attention output state for backward, reducing gradient error from BF16 output. Enable with `high_precision_output=True`. |
+| **Attention precision** | Five precision correction levels, with unchanged output and gradient dtypes. |
 | **Flexible segment-aware attention masking** | Isolates packed sequences using segment IDs or BOS masks.|
 
 ## Supported Attention

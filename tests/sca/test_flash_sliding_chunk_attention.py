@@ -859,7 +859,7 @@ def test_flash_sca_high_precision_varlen_matches_fp64_reference():
         position_offsets=packed["position_offsets"],
         backend="sm90",
         deterministic=True,
-        high_precision_output=True,
+        high_precision_level=int(True),
     )
     expected = y_ref.flatten(0, 1).index_select(
         0, packed["q_dense_indices"]

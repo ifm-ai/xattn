@@ -1,3 +1,4 @@
+from ._backward_precision import require_precision_backward
 # Author: Shicheng Wen
 
 from typing import Optional
@@ -128,7 +129,7 @@ def flash_softdelta_fwd(
 
 
 def _use_window_composed_backward(q, k, v, span, visibility,
-                                  deterministic, high_precision_output):
+                                  deterministic, high_precision_level):
     """Restore the measured ordinary-reader BWD for underfilled KV grids."""
     value_dim = v.shape[3] * v.shape[4]
     restored_shape = (
@@ -180,7 +181,7 @@ def _use_window_composed_backward(q, k, v, span, visibility,
     )
     return (
         visibility == 1 and span == 255 and not deterministic
-        and not high_precision_output and restored_shape
+        and not high_precision_level and restored_shape
         and q.dtype in (torch.float16, torch.bfloat16)
         and q.shape[0] == 1 and q.shape[2] == 16 and v.shape[3] == 4
         and q.shape[1] * k.shape[2] < 16384
@@ -200,15 +201,16 @@ class _FlashSoftDeltaPairedTrainingFunc(torch.autograd.Function):
         scale: float,
         visibility: int,
         deterministic: bool,
-        high_precision_output: bool,
+        high_precision_level: int,
     ) -> Tensor:
+        ctx.high_precision_level = high_precision_level
         flat_v = v.flatten(3)
         ctx.composed_backward = _use_window_composed_backward(
-            q, k, v, span, visibility, deterministic, high_precision_output
+            q, k, v, span, visibility, deterministic, high_precision_level
         )
         output_state = (
             allocate_backward_output_state(q, flat_v)
-            if high_precision_output
+            if high_precision_level
             else None
         )
         output, pair_output, pair_lse = (
@@ -244,6 +246,7 @@ class _FlashSoftDeltaPairedTrainingFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx: FunctionCtx, output_grad: Tensor) -> tuple:
+        require_precision_backward(ctx.high_precision_level)
         (
             q,
             k,
@@ -301,7 +304,7 @@ def flash_softdelta_paired_training(
     scale: float,
     visibility: int,
     deterministic: bool,
-    high_precision_output: bool,
+    high_precision_level: int,
 ) -> Tensor:
     return _FlashSoftDeltaPairedTrainingFunc.apply(
         q,
@@ -312,7 +315,7 @@ def flash_softdelta_paired_training(
         scale,
         visibility,
         deterministic,
-        high_precision_output,
+        high_precision_level,
     )
 
 
@@ -535,8 +538,9 @@ class _FlashWindowReadFunc(torch.autograd.Function):
         k_segment_idx: Optional[Tensor],
         strict_past: bool,
         deterministic: bool,
-        high_precision_output: bool,
+        high_precision_level: int,
     ) -> Tensor:
+        ctx.high_precision_level = high_precision_level
         operation = (
             _window_strict_past_fwd
             if strict_past
@@ -544,7 +548,7 @@ class _FlashWindowReadFunc(torch.autograd.Function):
         )
         output_state = (
             allocate_backward_output_state(q, v)
-            if high_precision_output
+            if high_precision_level
             else None
         )
         args = (
@@ -581,6 +585,7 @@ class _FlashWindowReadFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx: FunctionCtx, y_grad: Tensor) -> tuple:
+        require_precision_backward(ctx.high_precision_level)
         (
             q,
             k,
@@ -652,11 +657,12 @@ class _FlashWindowBosReadFunc(torch.autograd.Function):
         bwd_use_varlen: bool,
         strict_past: bool,
         deterministic: bool,
-        high_precision_output: bool,
+        high_precision_level: int,
     ) -> Tensor:
+        ctx.high_precision_level = high_precision_level
         output_state = (
             allocate_backward_output_state(q, v)
-            if high_precision_output
+            if high_precision_level
             else None
         )
         if fwd_use_varlen:
@@ -721,6 +727,7 @@ class _FlashWindowBosReadFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx: FunctionCtx, y_grad: Tensor) -> tuple:
+        require_precision_backward(ctx.high_precision_level)
         (
             q,
             k,
@@ -817,7 +824,7 @@ def flash_window_bos_read(
     bwd_use_varlen: bool,
     strict_past: bool,
     deterministic: bool,
-    high_precision_output: bool = False,
+    high_precision_level: int = 0,
 ) -> Tensor:
     return _FlashWindowBosReadFunc.apply(
         q,
@@ -837,7 +844,7 @@ def flash_window_bos_read(
         bwd_use_varlen,
         strict_past,
         deterministic,
-        high_precision_output,
+        high_precision_level,
     )
 
 
@@ -852,7 +859,7 @@ def flash_window_inclusive_read(
     q_segment_idx: Optional[Tensor],
     k_segment_idx: Optional[Tensor],
     deterministic: bool,
-    high_precision_output: bool = False,
+    high_precision_level: int = 0,
 ) -> Tensor:
     if not torch.is_grad_enabled():
         return _window_fwd(
@@ -879,7 +886,7 @@ def flash_window_inclusive_read(
         k_segment_idx,
         False,
         deterministic,
-        high_precision_output,
+        high_precision_level,
     )
 
 
@@ -894,7 +901,7 @@ def flash_window_strict_past_read(
     q_segment_idx: Optional[Tensor],
     k_segment_idx: Optional[Tensor],
     deterministic: bool,
-    high_precision_output: bool = False,
+    high_precision_level: int = 0,
 ) -> Tensor:
     if not torch.is_grad_enabled():
         return _window_strict_past_fwd(
@@ -921,7 +928,7 @@ def flash_window_strict_past_read(
         k_segment_idx,
         True,
         deterministic,
-        high_precision_output,
+        high_precision_level,
     )
 
 
@@ -941,8 +948,9 @@ class _FlashChunkReadFunc(torch.autograd.Function):
         reset_chunk_pos_per_seq: bool,
         strict_past: bool,
         deterministic: bool,
-        high_precision_output: bool,
+        high_precision_level: int,
     ) -> Tensor:
+        ctx.high_precision_level = high_precision_level
         operation = (
             _extension_ops()._flash_sca_sm90_strict_past_fwd
             if strict_past
@@ -950,7 +958,7 @@ class _FlashChunkReadFunc(torch.autograd.Function):
         )
         output_state = (
             allocate_backward_output_state(q, v)
-            if high_precision_output
+            if high_precision_level
             else None
         )
         args = (
@@ -989,6 +997,7 @@ class _FlashChunkReadFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx: FunctionCtx, y_grad: Tensor) -> tuple:
+        require_precision_backward(ctx.high_precision_level)
         (
             q,
             k,
@@ -1063,11 +1072,12 @@ class _FlashChunkBosReadFunc(torch.autograd.Function):
         bwd_use_varlen: bool,
         strict_past: bool,
         deterministic: bool,
-        high_precision_output: bool,
+        high_precision_level: int,
     ) -> Tensor:
+        ctx.high_precision_level = high_precision_level
         output_state = (
             allocate_backward_output_state(q, v)
-            if high_precision_output
+            if high_precision_level
             else None
         )
         y, lse = _flash_sca_fwd(
@@ -1114,6 +1124,7 @@ class _FlashChunkBosReadFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx: FunctionCtx, y_grad: Tensor) -> tuple:
+        require_precision_backward(ctx.high_precision_level)
         (
             q,
             k,
@@ -1192,7 +1203,7 @@ def flash_chunk_bos_read(
     bwd_use_varlen: bool,
     strict_past: bool,
     deterministic: bool,
-    high_precision_output: bool = False,
+    high_precision_level: int = 0,
 ) -> Tensor:
     return _FlashChunkBosReadFunc.apply(
         q,
@@ -1213,7 +1224,7 @@ def flash_chunk_bos_read(
         bwd_use_varlen,
         strict_past,
         deterministic,
-        high_precision_output,
+        high_precision_level,
     )
 
 
@@ -1229,7 +1240,7 @@ def flash_chunk_inclusive_read(
     k_segment_idx: Optional[Tensor],
     reset_chunk_pos_per_seq: bool,
     deterministic: bool,
-    high_precision_output: bool = False,
+    high_precision_level: int = 0,
 ) -> Tensor:
     if not torch.is_grad_enabled():
         return _extension_ops().flash_sca_fwd(
@@ -1258,7 +1269,7 @@ def flash_chunk_inclusive_read(
         reset_chunk_pos_per_seq,
         False,
         deterministic,
-        high_precision_output,
+        high_precision_level,
     )
 
 
@@ -1274,7 +1285,7 @@ def flash_chunk_strict_past_read(
     k_segment_idx: Optional[Tensor],
     reset_chunk_pos_per_seq: bool,
     deterministic: bool,
-    high_precision_output: bool = False,
+    high_precision_level: int = 0,
 ) -> Tensor:
     if not torch.is_grad_enabled():
         return _extension_ops()._flash_sca_sm90_strict_past_fwd(
@@ -1303,5 +1314,5 @@ def flash_chunk_strict_past_read(
         reset_chunk_pos_per_seq,
         True,
         deterministic,
-        high_precision_output,
+        high_precision_level,
     )

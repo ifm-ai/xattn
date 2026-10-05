@@ -30,7 +30,7 @@ y = flash_sca(
     reset_chunk_pos_per_seq=False,
     deterministic=False,
     attn_method="default",
-    high_precision_output=False,
+    high_precision_level=0,
 )
 ```
 
@@ -57,6 +57,8 @@ mutually exclusive.
 `scale` multiplies the QK logits before softmax; `None` uses
 `1 / sqrt(qk_dim)`.
 
+- `high_precision_level` (int, default `0`): `0` disables repairs; `1` saves FP32 backward state and uses subtract-before-scale (SBS) softmax to reduce output-rounding and cancellation error; `2` adds K/V centering and stable softmax-gradient evaluation to reduce common-offset leakage; `3` adds dS row-sum repair (`sum(dS)=0`) for consistent dQ/dK corrections; `4` adds dual-BF16 P/dS operands, range protection and nonnegative probability-mass repair (`sum(P)=1`) to improve dQ/dK/dV. Only integers 0–4 are accepted. Outputs and gradients keep the input dtype; constraints hold up to floating-point rounding.
+
 Standalone forward/backward:
 
 ```python
@@ -75,7 +77,7 @@ y, y_fp32, lse = flash_sca_fwd(
     backend="auto",
     reset_chunk_pos_per_seq=False,
     attn_method="default",
-    high_precision_output=True,
+    high_precision_level=1,
 )
 dq, dk, dv, dprev_k, dprev_v = flash_sca_bwd(
     dy, q, k, v, y_fp32, lse,
@@ -91,6 +93,7 @@ dq, dk, dv, dprev_k, dprev_v = flash_sca_bwd(
     reset_chunk_pos_per_seq=False,
     deterministic=True,
     attn_method="default",
+    high_precision_level=1,
 )
 ```
 
@@ -104,8 +107,15 @@ Output layouts:
 - `dprev_k`, `dprev_v`: same shapes and dtypes as previous K/V, or `None`
 
 Forward always returns `(y, y_fp32, lse)`; `y_fp32` is `None` when
-`high_precision_output=False`, including under `no_grad`/inference mode.
-Backward's `y` can be the original dtype or FP32; its dtype selects the
-computation. Pass `y_fp32` as `y` to use high precision. Reuse forward's options.
+`high_precision_level=0`, including under `no_grad`/inference mode.
+Pass the same `high_precision_level` to forward and backward. At level 0,
+pass `y` to backward; at levels 1–4, pass `y_fp32`. The state dtype does not
+select the backward algorithm. Reuse forward's other options and LSE.
 Standalone calls do not build an autograd graph or populate `.grad`.
-The autograd API returns `y` and saves FP32 state internally when enabled for training.
+The autograd API returns `y` and saves FP32 state internally at levels 1–4.
+
+SM90 requires a positive batch size and Q/K width and flattened V width to be
+multiples of 8 in `[8, 256]`. Unsupported widths are rejected before native
+launch. Finite zero/negative scales use an exact Q zero/sign transform so
+masking remains defined. Shape coverage does not guarantee bounded relative
+error for arbitrary ill-conditioned or overflowing floating-point inputs.

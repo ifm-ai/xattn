@@ -336,7 +336,7 @@ def test_flash_swa_high_precision_varlen_matches_fp64_oracle():
         max_seqlen_k=max(k_lengths),
         backend="sm90",
         deterministic=True,
-        high_precision_output=True,
+        high_precision_level=int(True),
     )
     torch.testing.assert_close(
         actual,

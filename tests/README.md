@@ -1,13 +1,24 @@
 # Correctness and performance
 
 Run commands from the checkout root, after building xattn for the target GPU.
-The four correctness modules cover causal attention, FlashSCA, FlashSWA,
+The attention-family correctness modules cover causal attention, FlashSCA, FlashSWA,
 and the three SoftDelta SM90 variants.
 
 ```bash
 python -m pytest tests -q
 python -m pytest tests -q --full-matrix --long
 ```
+
+Run the consolidated precision validation separately with:
+
+```bash
+python -m pytest tests/test_high_precision.py -q
+```
+
+This module covers repair levels 1–4 and the level 0 baseline: API validation,
+SBS saved state, FP64 output/gradient parity, chunk boundaries, padded GQA,
+and live previous KV. Advanced repair regressions retain their applicable
+level 2–4 coverage; tolerances are unchanged.
 
 The normal suite combines output and gradient checks, FP16/BF16, MHA/GQA/MQA,
 short queries, previous KV, segment/BOS inputs, noncontiguous inputs, chunk

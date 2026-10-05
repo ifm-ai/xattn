@@ -424,8 +424,27 @@ FLASH_SOFTDELTA_SM90_CSRCS = [
     *_flash_softdelta_sm90_instantiation_sources(),
 ]
 
+ATTENTION_PRECISION_CSRCS = [
+    CSRC / "attention" / "precision" / "constant_keys.cu",
+    CSRC / "attention" / "precision" / "bindings.cc",
+    CSRC / "attention" / "precision" / "anchor_repair.cu",
+    CSRC / "attention" / "precision" / "preprocess.cu",
+    CSRC / "attention" / "precision" / "row_statistics.cu",
+    CSRC / "attention" / "precision" / "probability_repair.cu",
+    CSRC / "attention" / "precision" / "deterministic.cu",
+    CSRC / "attention" / "precision" / "deterministic_uncached.cu",
+    CSRC / "attention" / "precision" / "main.cu",
+    CSRC / "attention" / "precision" / "ordered_level2.cu",
+    CSRC / "attention" / "precision" / "rectangular.cu",
+    CSRC / "attention" / "precision" / "mha_direct.cu",
+    CSRC / "attention" / "precision" / "deterministic_cached.cu",
+    CSRC / "attention" / "precision" / "deterministic_cached_bounds.cu",
+    *sorted((CSRC / "attention" / "precision" / "instantiations").glob("*.cu")),
+]
+
 if BUILD_ONLY_SM90:
     CSRCS = [
+        *ATTENTION_PRECISION_CSRCS,
         CSRC / "xattn_extension.cc",
         CSRC / "flash_sca" / "sliding_chunk_attention.cc",
         *CAUSAL_ATTENTION_CSRCS,
@@ -436,6 +455,7 @@ if BUILD_ONLY_SM90:
     ]
 elif BUILD_HAS_SM90:
     CSRCS = [
+        *ATTENTION_PRECISION_CSRCS,
         *FLASH_SCA_CSRCS,
         *CAUSAL_ATTENTION_CSRCS,
         *FLASH_SCA_SM90_CSRCS,
@@ -507,7 +527,7 @@ def main():
     _require_supported_toolchain()
     setup(
         name="xattn",
-        version="1.0.0",
+        version="1.1.0",
         description="Efficient attention modules for xLLM.",
         long_description=(ROOT / "README.md").read_text(encoding="utf-8"),
         long_description_content_type="text/markdown",

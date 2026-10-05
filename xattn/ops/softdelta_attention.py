@@ -1,3 +1,6 @@
+from ._attention_core import validate_sm90_dimensions, validate_attention_scale
+from ._backward_precision import _dispatch_nonpositive_scale
+from ._backward_precision import validate_high_precision_level
 # Author: Shicheng Wen
 
 from dataclasses import dataclass
@@ -8,7 +11,7 @@ from torch import Tensor
 
 from ._sca_segment_alignment import needs_matched_reset
 
-from ._backward_precision import use_high_precision_output
+from ._backward_precision import use_high_precision_level
 from ._attention_core import (
     AttentionBoundary,
     AttentionSemantics,
@@ -252,7 +255,7 @@ def _use_cta_reader_pair_kv_reuse(
     visibility: AttentionVisibility,
     span: int,
     deterministic: bool,
-    high_precision_output: bool,
+    high_precision_level: int,
 ) -> bool:
     """Return whether the runtime identity is in the K/V-reuse allowlist."""
     q_heads = q.shape[2] // 2
@@ -265,7 +268,7 @@ def _use_cta_reader_pair_kv_reuse(
         and (q_heads, k.shape[2]) in _CTA_READER_PAIR_KV_REUSE_HEAD_LAYOUTS
         and _CTA_READER_PAIR_KV_REUSE_SPANS.get(visibility) == span
         and (q.shape[3], value_dim)
-        in _CTA_READER_PAIR_KV_REUSE_SHAPES[high_precision_output].get(
+        in _CTA_READER_PAIR_KV_REUSE_SHAPES[bool(high_precision_level)].get(
             visibility, ()
         )
         and torch.cuda.get_device_name(q.device) == "NVIDIA H200"
@@ -279,13 +282,13 @@ def _use_window_reader_pair_training(
     visibility: AttentionVisibility,
     span: int,
     deterministic: bool,
-    high_precision_output: bool,
+    high_precision_level: int,
 ) -> bool:
     """Select paired window forward for supported training shapes."""
     return (
         visibility is AttentionVisibility.SLIDING_WINDOW
         and span == 255
-        and not high_precision_output
+        and not high_precision_level
         and q.dtype in (torch.float16, torch.bfloat16)
         and q.shape[0] == 1
         and q.shape[2] == 16
@@ -519,7 +522,7 @@ def _prepare_flash_bos_plan(
     deterministic: bool,
     needs_backward: bool,
     api_name: str,
-    high_precision_output: bool = False,
+    high_precision_level: int = 0,
 ) -> Tuple[Optional[Tensor], Optional[Tensor], Optional[_SoftDeltaBosPlan]]:
     validate_bos_mask(bos_mask, q, k_length)
     if not bool(bos_mask[:, 0].all().item()):
@@ -566,7 +569,7 @@ def _prepare_flash_bos_plan(
             ),
             reset_chunk_pos_per_seq=plan.primary.reset_position_per_segment,
             has_previous=k_length > k.shape[1],
-            high_precision_output=high_precision_output,
+            high_precision_level=high_precision_level,
             previous_length=k_length - k.shape[1],
             num_k_runs=num_k_runs,
             max_seqlen_k=max_seqlen_k,
@@ -650,7 +653,7 @@ def _flash_window_strict_past_read(
     q_segment_idx: Optional[Tensor],
     k_segment_idx: Optional[Tensor],
     deterministic: bool,
-    high_precision_output: bool,
+    high_precision_level: int,
 ) -> Tensor:
     if window_size == 0:
         return torch.zeros(
@@ -672,7 +675,7 @@ def _flash_window_strict_past_read(
         q_segment_idx,
         k_segment_idx,
         deterministic,
-        high_precision_output,
+        high_precision_level,
     )
 
 
@@ -688,7 +691,7 @@ def _execute_flash_softdelta_reads(
     k_segment_idx: Optional[Tensor],
     deterministic: bool,
     bos_plan: Optional[_SoftDeltaBosPlan] = None,
-    high_precision_output: bool = False,
+    high_precision_level: int = 0,
 ) -> Tuple[Tensor, Tensor]:
     flat_v = v.flatten(3)
     flat_prev_v = None if prev_v is None else prev_v.flatten(3)
@@ -714,7 +717,7 @@ def _execute_flash_softdelta_reads(
                 bos_plan.bwd_use_varlen,
                 False,
                 deterministic,
-                high_precision_output,
+                high_precision_level,
             )
             past_prediction = flash_chunk_bos_read(
                 q[:, :, 1::2],
@@ -735,7 +738,7 @@ def _execute_flash_softdelta_reads(
                 bos_plan.bwd_use_varlen,
                 True,
                 deterministic,
-                high_precision_output,
+                high_precision_level,
             )
             return read, past_prediction
 
@@ -762,7 +765,7 @@ def _execute_flash_softdelta_reads(
             bos_plan.bwd_use_varlen,
             False,
             deterministic,
-            high_precision_output,
+            high_precision_level,
         )
         if primary_window == 0:
             past_prediction = torch.zeros_like(read)
@@ -785,7 +788,7 @@ def _execute_flash_softdelta_reads(
                 bos_plan.bwd_use_varlen,
                 True,
                 deterministic,
-                high_precision_output,
+                high_precision_level,
             )
         return read, past_prediction
 
@@ -803,7 +806,7 @@ def _execute_flash_softdelta_reads(
             k_segment_idx,
             plan.primary.reset_position_per_segment,
             deterministic,
-            high_precision_output,
+            high_precision_level,
         )
         past_prediction = flash_chunk_strict_past_read(
             q[:, :, 1::2],
@@ -817,7 +820,7 @@ def _execute_flash_softdelta_reads(
             k_segment_idx,
             plan.primary.reset_position_per_segment,
             deterministic,
-            high_precision_output,
+            high_precision_level,
         )
         return read, past_prediction
 
@@ -839,7 +842,7 @@ def _execute_flash_softdelta_reads(
         q_segment_idx,
         k_segment_idx,
         deterministic,
-        high_precision_output,
+        high_precision_level,
     )
     past_prediction = _flash_window_strict_past_read(
         q[:, :, 1::2],
@@ -852,14 +855,14 @@ def _execute_flash_softdelta_reads(
         q_segment_idx,
         k_segment_idx,
         deterministic,
-        high_precision_output,
+        high_precision_level,
     )
     return read, past_prediction
 
 
 def _paired_training_route(
     q, k, v, plan, span, prev_k, prev_v, q_segment_idx, k_segment_idx,
-    bos_plan, deterministic, high_precision_output,
+    bos_plan, deterministic, high_precision_level,
 ):
     """Share the production paired-training predicates with standalone APIs."""
     supports_dense_fused_forward = (
@@ -898,7 +901,7 @@ def _paired_training_route(
             plan.primary.visibility,
             span,
             deterministic,
-            high_precision_output,
+            high_precision_level,
         )
     )
     use_window_reader_pair_training = (
@@ -910,7 +913,7 @@ def _paired_training_route(
             plan.primary.visibility,
             span,
             deterministic,
-            high_precision_output,
+            high_precision_level,
         )
     )
     return supports_dense_fused_forward, (
@@ -935,7 +938,7 @@ def _execute_flash_softdelta(
     q_heads: int,
     groups: int,
     group_dim: int,
-    high_precision_output: bool,
+    high_precision_level: int,
 ) -> Tensor:
     total_k_length = k.shape[1] + (
         0 if prev_k is None else prev_k.shape[1]
@@ -959,7 +962,7 @@ def _execute_flash_softdelta(
             q_segment_idx=q_segment_idx, k_segment_idx=k_segment_idx,
             segment_idx=None, bos_mask=None, backend="sm90",
             reset=plan.primary.reset_position_per_segment, deterministic=deterministic,
-            high_precision_output=high_precision_output, api_name="softdelta_attention"))
+            high_precision_level=high_precision_level, api_name="softdelta_attention"))
     use_composed_backward = (
         bos_plan is None
         or (
@@ -969,7 +972,7 @@ def _execute_flash_softdelta(
     )
     supports_dense_fused_forward, paired_training = _paired_training_route(
         q, k, v, plan, span, prev_k, prev_v, q_segment_idx, k_segment_idx,
-        bos_plan, deterministic, high_precision_output,
+        bos_plan, deterministic, high_precision_level,
     )
     if torch.is_grad_enabled() and paired_training:
         return flash_softdelta_paired_training(
@@ -981,13 +984,13 @@ def _execute_flash_softdelta(
             scale,
             visibility,
             deterministic,
-            high_precision_output,
+            high_precision_level,
         )
     if (
         torch.is_grad_enabled()
         and span > 0
         and use_composed_backward
-        and not high_precision_output
+        and not high_precision_level
     ):
         return flash_softdelta_composed(
             q,
@@ -1007,7 +1010,7 @@ def _execute_flash_softdelta(
     use_fused_forward = (
         supports_dense_fused_forward
         and span > 0
-        and not high_precision_output
+        and not high_precision_level
     )
     if use_fused_forward:
         return flash_softdelta_fwd(
@@ -1031,7 +1034,7 @@ def _execute_flash_softdelta(
         k_segment_idx,
         deterministic,
         bos_plan,
-        high_precision_output,
+        high_precision_level,
     )
     return _combine_flash_softdelta_reads(
         read,
@@ -1058,7 +1061,7 @@ def _execute_softdelta_plan(
     bos_mask: Optional[Tensor],
     backend: str,
     deterministic: bool,
-    high_precision_output: bool,
+    high_precision_level: int,
     api_name: str,
 ) -> Tensor:
     normalized_backend = _normalize_backend(backend)
@@ -1073,21 +1076,26 @@ def _execute_softdelta_plan(
         api_name,
         allow_short_q=True,
     )
-    use_fp32_state = use_high_precision_output(
-        high_precision_output,
+    use_fp32_state = use_high_precision_level(
+        high_precision_level,
         (q, k, v, prev_k, prev_v),
         api_name=api_name,
     )
     k_length = prev_length + k.shape[1]
     use_sm90 = _use_sm90_backend(normalized_backend, q)
-    if use_sm90 and plan.primary.visibility is not AttentionVisibility.CAUSAL_FULL and q.shape[1] != k.shape[1]:
+    if high_precision_level >= 2:
+        if not use_sm90:
+            raise ValueError("high_precision_level >= 2 requires the SM90 backend")
+        from ._precision_backend import _ops as precision_ops
+        precision_ops()
+    if use_sm90 and (high_precision_level >= 2 or (plan.primary.visibility is not AttentionVisibility.CAUSAL_FULL and q.shape[1] != k.shape[1])):
         from ._softdelta_attention import _StandaloneSoftDelta
         return _StandaloneSoftDelta.apply(q, k, v, g, prev_k, prev_v, dict(
             visibility=plan.primary.visibility, span=plan.primary.span, scale=scale,
             q_segment_idx=q_segment_idx, k_segment_idx=k_segment_idx,
             segment_idx=segment_idx, bos_mask=bos_mask, backend="sm90",
             reset=plan.primary.reset_position_per_segment, deterministic=deterministic,
-            high_precision_output=use_fp32_state, api_name=api_name))
+            high_precision_level=use_fp32_state, api_name=api_name))
     bos_plan = None
     if bos_mask is not None and use_sm90:
         if (
@@ -1112,7 +1120,7 @@ def _execute_softdelta_plan(
             deterministic,
             needs_backward,
             api_name,
-            high_precision_output=use_fp32_state,
+            high_precision_level=use_fp32_state,
         )
     else:
         q_segment_idx, k_segment_idx = _prepare_partition(
@@ -1204,7 +1212,7 @@ def softdelta_attention(
     bos_mask: Optional[Tensor] = None,
     backend: str = "auto",
     deterministic: bool = False,
-    high_precision_output: bool = False,
+    high_precision_level: int = 0,
 ) -> Tensor:
     """Run causal full-visibility SoftDelta attention.
 
@@ -1219,9 +1227,14 @@ def softdelta_attention(
     Q/K segment indices may instead be supplied. No previous KV is required
     for unequal current lengths.
 
-    Set ``high_precision_output=True`` to retain FP32 attention output
+    Set ``high_precision_level=1`` to retain FP32 attention output
     state for backward. The public output dtype is unchanged.
     """
+    validate_high_precision_level(high_precision_level, api_name="softdelta_attention")
+    validate_attention_scale(scale)
+    validate_sm90_dimensions(q, v, backend, api_name="softdelta_attention")
+    if scale is not None and float(scale) <= 0:
+        return _dispatch_nonpositive_scale(softdelta_attention, locals())
     plan = _make_plan(AttentionVisibility.CAUSAL_FULL, None, False)
     return _execute_softdelta_plan(
         q,
@@ -1238,7 +1251,7 @@ def softdelta_attention(
         bos_mask,
         backend,
         deterministic,
-        high_precision_output,
+        high_precision_level,
         "softdelta_attention",
     )
 
@@ -1259,16 +1272,21 @@ def sliding_window_softdelta_attention(
     bos_mask: Optional[Tensor] = None,
     backend: str = "auto",
     deterministic: bool = False,
-    high_precision_output: bool = False,
+    high_precision_level: int = 0,
 ) -> Tensor:
     """Run SoftDelta with an inclusive left-radius sliding window.
 
     Q may be shorter than current K/V and aligns to total K/V at the right.
     Both readers return zero for rows with no visible keys.
 
-    ``high_precision_output=True`` retains FP32 attention output state for
+    ``high_precision_level=1`` retains FP32 attention output state for
     backward while leaving the public output dtype unchanged.
     """
+    validate_high_precision_level(high_precision_level, api_name="sliding_window_softdelta_attention")
+    validate_attention_scale(scale)
+    validate_sm90_dimensions(q, v, backend, api_name="sliding_window_softdelta_attention")
+    if scale is not None and float(scale) <= 0:
+        return _dispatch_nonpositive_scale(sliding_window_softdelta_attention, locals())
     plan = _make_plan(AttentionVisibility.SLIDING_WINDOW, window_size, False)
     return _execute_softdelta_plan(
         q,
@@ -1285,7 +1303,7 @@ def sliding_window_softdelta_attention(
         bos_mask,
         backend,
         deterministic,
-        high_precision_output,
+        high_precision_level,
         "sliding_window_softdelta_attention",
     )
 
@@ -1307,7 +1325,7 @@ def sliding_chunk_softdelta_attention(
     backend: str = "auto",
     reset_chunk_pos_per_seq: bool = False,
     deterministic: bool = False,
-    high_precision_output: bool = False,
+    high_precision_level: int = 0,
 ) -> Tensor:
     """Run SoftDelta over the previous and current logical chunks.
 
@@ -1315,9 +1333,14 @@ def sliding_chunk_softdelta_attention(
     is enabled, in which case matching segment IDs align at their ends.
     Both readers return zero for rows with no visible keys.
 
-    ``high_precision_output=True`` retains FP32 attention output state for
+    ``high_precision_level=1`` retains FP32 attention output state for
     backward while leaving the public output dtype unchanged.
     """
+    validate_high_precision_level(high_precision_level, api_name="sliding_chunk_softdelta_attention")
+    validate_attention_scale(scale)
+    validate_sm90_dimensions(q, v, backend, api_name="sliding_chunk_softdelta_attention")
+    if scale is not None and float(scale) <= 0:
+        return _dispatch_nonpositive_scale(sliding_chunk_softdelta_attention, locals())
     if not isinstance(reset_chunk_pos_per_seq, bool):
         raise TypeError(
             "sliding_chunk_softdelta_attention reset_chunk_pos_per_seq "
@@ -1348,7 +1371,7 @@ def sliding_chunk_softdelta_attention(
         bos_mask,
         backend,
         deterministic,
-        high_precision_output,
+        high_precision_level,
         "sliding_chunk_softdelta_attention",
     )
 
@@ -1368,7 +1391,7 @@ def softdelta_attention_fwd(
     bos_mask: Optional[Tensor] = None,
     backend: str = "auto",
     deterministic: bool = False,
-    high_precision_output: bool = False,
+    high_precision_level: int = 0,
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """Return ``(y, readers, lse)`` without an autograd graph.
 
@@ -1377,6 +1400,11 @@ def softdelta_attention_fwd(
     otherwise the input dtype, including under no_grad/inference mode. Reuse forward
     options for backward.
     """
+    validate_high_precision_level(high_precision_level, api_name="softdelta_attention_fwd")
+    validate_attention_scale(scale)
+    validate_sm90_dimensions(q, v, backend, api_name="softdelta_attention_fwd")
+    if scale is not None and float(scale) <= 0:
+        return _dispatch_nonpositive_scale(softdelta_attention_fwd, locals())
     from ._softdelta_attention import _softdelta_fwd
 
     return _softdelta_fwd(
@@ -1386,7 +1414,7 @@ def softdelta_attention_fwd(
         q_segment_idx=q_segment_idx, k_segment_idx=k_segment_idx,
         segment_idx=segment_idx, bos_mask=bos_mask, backend=backend,
         reset=False, deterministic=deterministic,
-        high_precision_output=high_precision_output, api_name="softdelta_attention_fwd",
+        high_precision_level=high_precision_level, api_name="softdelta_attention_fwd",
     )
 
 
@@ -1408,13 +1436,19 @@ def softdelta_attention_bwd(
     bos_mask: Optional[Tensor] = None,
     backend: str = "auto",
     deterministic: bool = False,
+    high_precision_level: int = 0,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Optional[Tensor], Optional[Tensor]]:
-    """Return ``(dq, dk, dv, dg, dprev_k, dprev_v)`` without recomputation.
+    """Return ``(dq, dk, dv, dg, dprev_k, dprev_v)`` using the requested precision level.
 
-    ``readers`` accepts the input dtype or FP32 and automatically selects
-    backward precision. ``y_grad`` must retain the input dtype. Pass the
+    ``high_precision_level`` selects backward precision; ``readers`` must
+    have the matching state dtype. ``y_grad`` must retain the input dtype. Pass the
     matching forward LSE and options; absent previous gradients are None.
     """
+    validate_high_precision_level(high_precision_level, api_name="softdelta_attention_bwd")
+    validate_attention_scale(scale)
+    validate_sm90_dimensions(q, v, backend, api_name="softdelta_attention_bwd")
+    if scale is not None and float(scale) <= 0:
+        return _dispatch_nonpositive_scale(softdelta_attention_bwd, locals())
     from ._softdelta_attention import _softdelta_bwd
 
     return _softdelta_bwd(
@@ -1424,7 +1458,7 @@ def softdelta_attention_bwd(
         q_segment_idx=q_segment_idx, k_segment_idx=k_segment_idx,
         segment_idx=segment_idx, bos_mask=bos_mask, backend=backend,
         reset=False, deterministic=deterministic,
-        high_precision_output=readers.dtype == torch.float32, api_name="softdelta_attention_bwd",
+        high_precision_level=high_precision_level, api_name="softdelta_attention_bwd",
     )
 
 
@@ -1444,7 +1478,7 @@ def sliding_window_softdelta_attention_fwd(
     bos_mask: Optional[Tensor] = None,
     backend: str = "auto",
     deterministic: bool = False,
-    high_precision_output: bool = False,
+    high_precision_level: int = 0,
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """Return ``(y, readers, lse)`` without an autograd graph.
 
@@ -1453,6 +1487,11 @@ def sliding_window_softdelta_attention_fwd(
     otherwise the input dtype, including under no_grad/inference mode. Reuse forward
     options for backward.
     """
+    validate_high_precision_level(high_precision_level, api_name="sliding_window_softdelta_attention_fwd")
+    validate_attention_scale(scale)
+    validate_sm90_dimensions(q, v, backend, api_name="sliding_window_softdelta_attention_fwd")
+    if scale is not None and float(scale) <= 0:
+        return _dispatch_nonpositive_scale(sliding_window_softdelta_attention_fwd, locals())
     from ._softdelta_attention import _softdelta_fwd
 
     return _softdelta_fwd(
@@ -1462,7 +1501,7 @@ def sliding_window_softdelta_attention_fwd(
         q_segment_idx=q_segment_idx, k_segment_idx=k_segment_idx,
         segment_idx=segment_idx, bos_mask=bos_mask, backend=backend,
         reset=False, deterministic=deterministic,
-        high_precision_output=high_precision_output, api_name="sliding_window_softdelta_attention_fwd",
+        high_precision_level=high_precision_level, api_name="sliding_window_softdelta_attention_fwd",
     )
 
 
@@ -1485,13 +1524,19 @@ def sliding_window_softdelta_attention_bwd(
     bos_mask: Optional[Tensor] = None,
     backend: str = "auto",
     deterministic: bool = False,
+    high_precision_level: int = 0,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Optional[Tensor], Optional[Tensor]]:
-    """Return ``(dq, dk, dv, dg, dprev_k, dprev_v)`` without recomputation.
+    """Return ``(dq, dk, dv, dg, dprev_k, dprev_v)`` using the requested precision level.
 
-    ``readers`` accepts the input dtype or FP32 and automatically selects
-    backward precision. ``y_grad`` must retain the input dtype. Pass the
+    ``high_precision_level`` selects backward precision; ``readers`` must
+    have the matching state dtype. ``y_grad`` must retain the input dtype. Pass the
     matching forward LSE and options; absent previous gradients are None.
     """
+    validate_high_precision_level(high_precision_level, api_name="sliding_window_softdelta_attention_bwd")
+    validate_attention_scale(scale)
+    validate_sm90_dimensions(q, v, backend, api_name="sliding_window_softdelta_attention_bwd")
+    if scale is not None and float(scale) <= 0:
+        return _dispatch_nonpositive_scale(sliding_window_softdelta_attention_bwd, locals())
     from ._softdelta_attention import _softdelta_bwd
 
     return _softdelta_bwd(
@@ -1501,7 +1546,7 @@ def sliding_window_softdelta_attention_bwd(
         q_segment_idx=q_segment_idx, k_segment_idx=k_segment_idx,
         segment_idx=segment_idx, bos_mask=bos_mask, backend=backend,
         reset=False, deterministic=deterministic,
-        high_precision_output=readers.dtype == torch.float32, api_name="sliding_window_softdelta_attention_bwd",
+        high_precision_level=high_precision_level, api_name="sliding_window_softdelta_attention_bwd",
     )
 
 
@@ -1522,7 +1567,7 @@ def sliding_chunk_softdelta_attention_fwd(
     backend: str = "auto",
     reset_chunk_pos_per_seq: bool = False,
     deterministic: bool = False,
-    high_precision_output: bool = False,
+    high_precision_level: int = 0,
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """Return ``(y, readers, lse)`` without an autograd graph.
 
@@ -1531,6 +1576,11 @@ def sliding_chunk_softdelta_attention_fwd(
     otherwise the input dtype, including under no_grad/inference mode. Reuse forward
     options for backward.
     """
+    validate_high_precision_level(high_precision_level, api_name="sliding_chunk_softdelta_attention_fwd")
+    validate_attention_scale(scale)
+    validate_sm90_dimensions(q, v, backend, api_name="sliding_chunk_softdelta_attention_fwd")
+    if scale is not None and float(scale) <= 0:
+        return _dispatch_nonpositive_scale(sliding_chunk_softdelta_attention_fwd, locals())
     from ._softdelta_attention import _softdelta_fwd
 
     return _softdelta_fwd(
@@ -1540,7 +1590,7 @@ def sliding_chunk_softdelta_attention_fwd(
         q_segment_idx=q_segment_idx, k_segment_idx=k_segment_idx,
         segment_idx=segment_idx, bos_mask=bos_mask, backend=backend,
         reset=reset_chunk_pos_per_seq, deterministic=deterministic,
-        high_precision_output=high_precision_output, api_name="sliding_chunk_softdelta_attention_fwd",
+        high_precision_level=high_precision_level, api_name="sliding_chunk_softdelta_attention_fwd",
     )
 
 
@@ -1564,13 +1614,19 @@ def sliding_chunk_softdelta_attention_bwd(
     backend: str = "auto",
     reset_chunk_pos_per_seq: bool = False,
     deterministic: bool = False,
+    high_precision_level: int = 0,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Optional[Tensor], Optional[Tensor]]:
-    """Return ``(dq, dk, dv, dg, dprev_k, dprev_v)`` without recomputation.
+    """Return ``(dq, dk, dv, dg, dprev_k, dprev_v)`` using the requested precision level.
 
-    ``readers`` accepts the input dtype or FP32 and automatically selects
-    backward precision. ``y_grad`` must retain the input dtype. Pass the
+    ``high_precision_level`` selects backward precision; ``readers`` must
+    have the matching state dtype. ``y_grad`` must retain the input dtype. Pass the
     matching forward LSE and options; absent previous gradients are None.
     """
+    validate_high_precision_level(high_precision_level, api_name="sliding_chunk_softdelta_attention_bwd")
+    validate_attention_scale(scale)
+    validate_sm90_dimensions(q, v, backend, api_name="sliding_chunk_softdelta_attention_bwd")
+    if scale is not None and float(scale) <= 0:
+        return _dispatch_nonpositive_scale(sliding_chunk_softdelta_attention_bwd, locals())
     from ._softdelta_attention import _softdelta_bwd
 
     return _softdelta_bwd(
@@ -1580,5 +1636,5 @@ def sliding_chunk_softdelta_attention_bwd(
         q_segment_idx=q_segment_idx, k_segment_idx=k_segment_idx,
         segment_idx=segment_idx, bos_mask=bos_mask, backend=backend,
         reset=reset_chunk_pos_per_seq, deterministic=deterministic,
-        high_precision_output=readers.dtype == torch.float32, api_name="sliding_chunk_softdelta_attention_bwd",
+        high_precision_level=high_precision_level, api_name="sliding_chunk_softdelta_attention_bwd",
     )

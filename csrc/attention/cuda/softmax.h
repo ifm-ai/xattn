@@ -84,7 +84,7 @@ __device__ __forceinline__ float attention_reciprocal(float value) {
 
 // Elementwise exponentiation.
 template <bool Scale_max=true, bool Check_inf=true, int Max_offset=0,
-        bool UseFastExp2=false,
+        bool UseFastExp2=false, bool SubtractBeforeScale=false,
         typename Engine0, typename Layout0, typename Engine1, typename Layout1>
 __forceinline__ __device__ void scale_apply_exp2(Tensor<Engine0, Layout0> &tensor, Tensor<Engine1, Layout1> const &max, const float scale) {
     // FP8 range: [0, 256].
@@ -100,9 +100,19 @@ __forceinline__ __device__ void scale_apply_exp2(Tensor<Engine0, Layout0> &tenso
             : (!Scale_max ? max(mi) : max(mi) * scale) - max_offset;
         #pragma unroll
         for (int ni = 0; ni < size<1>(tensor); ++ni)  {
-            // exp2-domain FFMA form.
-            tensor(mi, ni) = attention_exp2f<UseFastExp2>(
-                tensor(mi, ni) * scale - max_scaled);
+            if constexpr (SubtractBeforeScale && Scale_max) {
+                // Keep the maximum subtraction before scaling, including under
+                // compiler FMA contraction. Preserve all-masked-row handling.
+                const float max_unscaled = Check_inf && max(mi) == -INFINITY
+                    ? 0.f : max(mi);
+                const float shifted = __fsub_rn(tensor(mi, ni), max_unscaled);
+                const float scaled = __fmul_rn(shifted, scale);
+                tensor(mi, ni) = attention_exp2f<UseFastExp2>(scaled + max_offset);
+            } else {
+                // Preserve the original LP exp2-domain FFMA arithmetic.
+                tensor(mi, ni) = attention_exp2f<UseFastExp2>(
+                    tensor(mi, ni) * scale - max_scaled);
+            }
         }
     }
 }
@@ -110,14 +120,15 @@ __forceinline__ __device__ void scale_apply_exp2(Tensor<Engine0, Layout0> &tenso
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <int kNRows, int Max_offset=0, bool UseFastExp2=false,
-          bool UseFastReciprocal=false>
+          bool UseFastReciprocal=false, bool SubtractBeforeScale=false>
 struct Softmax {
 
     using TensorT = decltype(make_tensor<float>(Shape<Int<kNRows>>{}));
     TensorT row_max, row_sum;
     float const softmax_scale_log2;
 
-    CUTLASS_DEVICE Softmax(float const softmax_scale_log2_) : softmax_scale_log2(softmax_scale_log2_) {};
+    CUTLASS_DEVICE Softmax(float const softmax_scale_log2_)
+        : softmax_scale_log2(softmax_scale_log2_) {};
 
     template<bool Is_first, bool Check_inf=false, typename Tensor0>
     __forceinline__ __device__ TensorT max_get_scale(Tensor0 &acc_s) {
@@ -153,7 +164,7 @@ struct Softmax {
         static_assert(CUTE_STATIC_V(size<0>(scores)) == kNRows);
         flash::template scale_apply_exp2<
             /*Scale_max=*/true, Check_inf, Max_offset,
-            UseFastExp2>(scores, row_max, softmax_scale_log2);
+            UseFastExp2, SubtractBeforeScale>(scores, row_max, softmax_scale_log2);
         // Deferred cross-thread row-sum reduction.
         flash::reduce_sum</*zero_init=*/Is_first, /*warp_reduce=*/false>(scores, row_sum);
     };

@@ -32,7 +32,7 @@ struct CollectiveEpilogueBwd {
     static constexpr bool Varlen = Varlen_;
     static constexpr bool dKV_swapAB = dKV_swapAB_;
     static constexpr bool Use_TMA = !Varlen && ArchTag::kMinComputeCapability >= 90;
-    static constexpr bool NeedsDQTailBarrier = false;
+    static constexpr bool NeedsDQTailBarrier = sizeof(Element) == 4;
 
     static_assert(ArchTag::kMinComputeCapability >= 80);
 
@@ -109,7 +109,7 @@ struct CollectiveEpilogueBwd {
 
     using SmemCopyAtomdKV = Copy_Atom<
         std::conditional_t<
-            ArchTag::kMinComputeCapability >= 90,
+            ArchTag::kMinComputeCapability >= 90 && sizeof(Element) == 2,
             std::conditional_t<!dKV_swapAB, cute::SM90_U32x4_STSM_N, cute::SM90_U16x8_STSM_T>,
             AutoVectorizingCopyWithAssumedAlignment<128>
         >,

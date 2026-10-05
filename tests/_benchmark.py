@@ -61,7 +61,7 @@ def validate(operation, case, inputs, options, qi, ki, deterministic, high_preci
     prefix = OPERATIONS[operation]
     fwd = getattr(xattn, prefix+'_fwd'); bwd = getattr(xattn, prefix+'_bwd')
     base = inputs[:4 if soft else 3]
-    fwd_options = dict(options, high_precision_output=high_precision)
+    fwd_options = dict(options, high_precision_level=int(high_precision))
     if soft:fwd_options['deterministic'] = deterministic
     low, state, lse = fwd(*base, **fwd_options)
     assert_output(low[:, positions], expected, q.dtype if q.dtype != torch.float64 else inputs[0].dtype,

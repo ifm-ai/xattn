@@ -35,7 +35,7 @@ def _oracle(q, k, v, prev_k, prev_v, segment, *, return_probabilities=False):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("kv_heads", [4, 2, 1])
 @pytest.mark.parametrize("deterministic", [False, True])
-@pytest.mark.parametrize("high_precision_output", [False, True])
+@pytest.mark.parametrize("high_precision_level", [False, True])
 @pytest.mark.parametrize(
     "head_dim,value_dim",
     [
@@ -46,7 +46,7 @@ def _oracle(q, k, v, prev_k, prev_v, segment, *, return_probabilities=False):
     ],
 )
 def test_causal_flash_attn_grouped_gradients_with_padded_kernel_dimension(
-    dtype, kv_heads, deterministic, high_precision_output, head_dim, value_dim
+    dtype, kv_heads, deterministic, high_precision_level, head_dim, value_dim
 ):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is unavailable")
@@ -69,7 +69,7 @@ def test_causal_flash_attn_grouped_gradients_with_padded_kernel_dimension(
     )
     y = causal_flash_attn(
         *inputs, backend="sm90", deterministic=deterministic,
-        high_precision_output=high_precision_output,
+        high_precision_level=int(high_precision_level),
     )
     dy = torch.randn_like(y)
     actual_grads = torch.autograd.grad(y, inputs, dy, retain_graph=deterministic)
@@ -105,7 +105,7 @@ def test_causal_flash_attn_grouped_gradients_with_padded_kernel_dimension(
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("heads,kv_heads", [(2, 2), (4, 2), (4, 1)])
 @pytest.mark.parametrize("deterministic", [False, True])
-@pytest.mark.parametrize("high_precision_output", [False, True])
+@pytest.mark.parametrize("high_precision_level", [False, True])
 @pytest.mark.parametrize(
     "length,prev_length,metadata,head_dim,value_dim",
     [
@@ -125,7 +125,7 @@ def test_causal_flash_attn_matches_fp64_oracle(
     heads,
     kv_heads,
     deterministic,
-    high_precision_output,
+    high_precision_level,
     length,
     prev_length,
     metadata,
@@ -178,7 +178,7 @@ def test_causal_flash_attn_matches_fp64_oracle(
         v,
         **kwargs,
         deterministic=deterministic,
-        high_precision_output=high_precision_output,
+        high_precision_level=int(high_precision_level),
     )
     dy = torch.randn_like(y)
     y.backward(dy)
@@ -240,7 +240,7 @@ def test_causal_flash_attn_matches_fp64_oracle(
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("kv_heads", [4, 1])
-@pytest.mark.parametrize("high_precision_output", [False, True])
+@pytest.mark.parametrize("high_precision_level", [False, True])
 @pytest.mark.parametrize(
     "length,head_dim,value_dim,padded_dim,shifted_storage",
     [(8193, 40, 56, 64, False), (8193, 64, 40, 64, False),
@@ -249,7 +249,7 @@ def test_causal_flash_attn_matches_fp64_oracle(
 )
 @pytest.mark.long
 def test_causal_flash_attn_long_padding_preserves_saved_state_backward(
-    dtype, kv_heads, high_precision_output,
+    dtype, kv_heads, high_precision_level,
     length, head_dim, value_dim, padded_dim, shifted_storage,
 ):
     if not torch.cuda.is_available():
@@ -269,9 +269,9 @@ def test_causal_flash_attn_long_padding_preserves_saved_state_backward(
     q, k, v = make(heads, head_dim, True), make(kv_heads, head_dim, True), make(kv_heads, value_dim)
     dy = make(heads, value_dim)
     scale = head_dim ** -0.5
-    state = torch.empty(batch, length, heads, value_dim, device="cuda", dtype=torch.float32) if high_precision_output else None
+    state = torch.empty(batch, length, heads, value_dim, device="cuda", dtype=torch.float32) if high_precision_level else None
     y, lse = extension.ops.causal_flash_attn_fwd(q, k, v, scale, output_state=state)
-    saved = state if high_precision_output else y
+    saved = state if high_precision_level else y
     if shifted_storage:
         def shift(tensor):
             storage = torch.empty(

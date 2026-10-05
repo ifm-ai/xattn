@@ -14,6 +14,7 @@ void DefineFlashSoftDeltaFwdOps(py::module& m);
 void DefineCausalFlashAttnOps(py::module& m);
 void DefineFlashSWAOps(py::module& m);
 void DefineFlashSCAOps(py::module& m);
+void DefineAttentionPrecisionOps(py::module& m);
 
 }  // namespace ops
 }  // namespace xattn

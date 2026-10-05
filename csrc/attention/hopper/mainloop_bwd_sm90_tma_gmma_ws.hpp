@@ -42,9 +42,11 @@ template <int Stages, int Stages_dO, int Stages_dS, class ClusterShape_, class T
         bool DirectChunkTile_=IsSlidingChunk_,
         bool HeadPairParallel_=false,
         bool HeadPairClusterKVReuse_=false,
-        bool HeadPairPrivateKVGrad_=false, bool SplitDQ_=false>
+        bool HeadPairPrivateKVGrad_=false, bool SplitDQ_=false, int PrecisionLevel_=0>
 struct CollectiveMainloopBwdSm90 {
 
+    static constexpr int PrecisionLevel = PrecisionLevel_;
+    static_assert(PrecisionLevel >= 0 && PrecisionLevel <= 4);
     static constexpr int kStages = Stages;
     static constexpr bool SplitDQ = SplitDQ_;
     static constexpr int kStages_dO = Stages_dO;
@@ -382,7 +384,7 @@ struct CollectiveMainloopBwdSm90 {
         CombinedKVSharedStorage>;
 
     // Separate causal-mask iterations for selected head dimensions.
-    static constexpr bool SeparateMaskingIterations = kHeadDim <= 64;
+    static constexpr bool SeparateMaskingIterations = PrecisionLevel < 2 && kHeadDim <= 64;
     // ShuffleLSE distributes row statistics across eight threads.
     static constexpr bool ShuffleLSE = SdP_swapAB && kHeadDim <= 64;
     static constexpr bool ShuffledPsum = SdP_swapAB && kHeadDim <= 64;
@@ -391,7 +393,7 @@ struct CollectiveMainloopBwdSm90 {
         !Deterministic || dQacc_use_TMA,
         "Deterministic attention BWD must not use unordered dQ atomicAdd");
     // Split hdim256 dQ MMA into two 128-column slices with separate atomic adds.
-    static constexpr bool Slice_dQKV_Mma = kHeadDim == 256 && kHeadDimV == 256 && !dQacc_use_TMA && dQ_swapAB && AtomLayoutMdQ == 1 && NumMmaWarpGroups == 2;
+    static constexpr bool Slice_dQKV_Mma = PrecisionLevel != 4 && kHeadDim == 256 && kHeadDimV == 256 && !dQacc_use_TMA && dQ_swapAB && AtomLayoutMdQ == 1 && NumMmaWarpGroups == 2;
     static_assert(!(Deterministic && Slice_dQKV_Mma), "Deterministic mode not supported with Slice_dQKV_Mma");
 
     static constexpr size_t SmemAlignmentP = cutlass::detail::alignment_for_swizzle(SmemLayoutPdS{});
@@ -464,6 +466,8 @@ struct CollectiveMainloopBwdSm90 {
         int const odd_head_window_right_delta = 0;
         int const dq_slots = 1;
         int64_t const dq_slot_stride = 0;
+        float* hp_rho = nullptr;
+        float* hp_mass = nullptr;
     };
 
     // Device side kernel params
@@ -507,6 +511,8 @@ struct CollectiveMainloopBwdSm90 {
         int const odd_head_window_right_delta = 0;
         int const dq_slots = 1;
         int64_t const dq_slot_stride = 0;
+        float* hp_rho = nullptr;
+        float* hp_mass = nullptr;
 
         CUTLASS_DEVICE
         int get_chunk_position_offset(
@@ -589,7 +595,7 @@ struct CollectiveMainloopBwdSm90 {
                 reset_attention_chunk_divmod,
                 args.deterministic_segment_ranges,
                 args.odd_head_window_right_delta,
-                args.dq_slots, args.dq_slot_stride};
+                args.dq_slots, args.dq_slot_stride, args.hp_rho, args.hp_mass};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -1598,8 +1604,18 @@ struct CollectiveMainloopBwdSm90 {
                 }();
                 #pragma unroll
                 for (int ni = 0; ni < size<1>(scores); ++ni) {
-                    scores(mi, ni) = flash::attention_exp2f<UseFastExp2>(
-                        scores(mi, ni) * params.softmax_scale_log2 - lse_scaled);
+                    if constexpr (PrecisionLevel >= 2) {
+                    // Split maximum/log-normalizer avoids cancellation in reconstructed P.
+                    Tensor hp_coord = thread_mma_SdP.partition_C(make_identity_tensor(select<!SdP_swapAB ? 0 : 1, !SdP_swapAB ? 1 : 0>(TileShape_MNK{})));
+                    Tensor hp_rc = make_tensor(hp_coord.data(), flash::convert_layout_acc_rowcol<SdP_swapAB>(hp_coord.layout()));
+                    int hp_row = (SdP_swapAB ? int(get<1>(hp_rc(mi,0))) : int(get<0>(hp_rc(mi,0)))) + m_block*kBlockM;
+                    float hp_max = hp_row < seqlen_q ? params.hp_mass[(int64_t(bidb)*get<2>(params.shape_Q)+bidh)*seqlen_q+hp_row] : 0.f;
+                    float shifted = __fmul_rn(__fsub_rn(scores(mi,ni), hp_max), params.softmax_scale_log2);
+                    scores(mi, ni) = flash::attention_exp2f<UseFastExp2>(0.5f * (shifted - lse_scaled));
+                    } else {
+                        scores(mi, ni) = flash::attention_exp2f<UseFastExp2>(
+                            scores(mi, ni) * params.softmax_scale_log2 - lse_scaled);
+                    }
                 }
             }
 
@@ -1624,7 +1640,25 @@ struct CollectiveMainloopBwdSm90 {
                 }();
                 #pragma unroll
                 for (int ni = 0; ni < size<1>(dS); ++ni) {
-                    dS(mi, ni) = scores(mi, ni) * (dS(mi, ni) - dP_sum_cur);
+                    if constexpr (PrecisionLevel >= 2) {
+                    Tensor hp_coord = thread_mma_SdP.partition_C(make_identity_tensor(select<!SdP_swapAB ? 0 : 1, !SdP_swapAB ? 1 : 0>(TileShape_MNK{})));
+                    Tensor hp_rc = make_tensor(hp_coord.data(), flash::convert_layout_acc_rowcol<SdP_swapAB>(hp_coord.layout()));
+                    int hp_row = (SdP_swapAB ? int(get<1>(hp_rc(mi,0))) : int(get<0>(hp_rc(mi,0)))) + m_block*kBlockM;
+                    int64_t hp_base = int64_t(params.num_batch)*get<2>(params.shape_Q)*seqlen_q;
+                    float hp_dp_anchor = hp_row < seqlen_q ? params.hp_mass[hp_base+(int64_t(bidb)*get<2>(params.shape_Q)+bidh)*seqlen_q+hp_row] : 0.f;
+                    // Staged sqrt(P) multiplication also protects level 2 tails
+                    // from exp2 underflow before a large dP rescales them.
+                    if constexpr (PrecisionLevel >= 2) {
+                    float row_scale = hp_row < seqlen_q ? params.hp_mass[2*hp_base+(int64_t(bidb)*get<2>(params.shape_Q)+bidh)*seqlen_q+hp_row] : 1.f;
+                    dS(mi, ni) = __fmul_rn(scores(mi, ni), __fmul_rn(scores(mi, ni), (__fsub_rn(__fmul_rn(dS(mi, ni),row_scale), hp_dp_anchor) - dP_sum_cur)));
+                    float scaled_root = __fmul_rn(scores(mi, ni), __int_as_float((__float_as_int(row_scale) >> 1) + 0x1fc00000));
+                    scores(mi, ni) = __fmul_rn(scaled_root, scaled_root);
+                    } else {
+                        dS(mi, ni) = scores(mi, ni) * (__fsub_rn(dS(mi, ni), hp_dp_anchor) - dP_sum_cur);
+                    }
+                    } else {
+                        dS(mi, ni) = scores(mi, ni) * (dS(mi, ni) - dP_sum_cur);
+                    }
                     if constexpr (Has_softcap) { dS(mi, ni) *= dtanh(mi, ni); }
                 }
             }
@@ -1654,6 +1688,70 @@ struct CollectiveMainloopBwdSm90 {
             }
             Tensor rdS = make_tensor_like<Element>(tdPrdP);
             flash::convert_type_out(tdPrdP, rdS);
+            Tensor rdSLo = make_tensor_like<Element>(tdPrdP);
+            if constexpr (PrecisionLevel == 4) {
+                #pragma unroll
+                for (int i = 0; i < size(rdS); ++i) { tdPrdP(i) -= static_cast<float>(rdS(i)); }
+                flash::convert_type_out(tdPrdP, rdSLo);
+            }
+            if constexpr (PrecisionLevel >= 3) {
+            if (params.hp_rho != nullptr) {
+                Tensor coord = thread_mma_SdP.partition_C(make_identity_tensor(select<!SdP_swapAB ? 0 : 1, !SdP_swapAB ? 1 : 0>(TileShape_MNK{})));
+                Tensor rc = make_tensor(coord.data(), flash::convert_layout_acc_rowcol</*Transposed=*/SdP_swapAB>(coord.layout()));
+                Tensor hirow = make_tensor(rdS.data(), scores.layout());
+                Tensor lorow = make_tensor(rdSLo.data(), scores.layout());
+                Tensor prow = make_tensor(rP.data(), scores.layout());
+                Tensor plow = make_tensor(rPResidual.data(), scores.layout());
+                #pragma unroll
+                for (int mi = 0; mi < size<0>(scores); ++mi) {
+                    int row = (SdP_swapAB ? int(get<1>(rc(mi, 0))) : int(get<0>(rc(mi, 0)))) + m_block * kBlockM;
+                    double sr = 0.0, pm = 0.0, pa = 0.0;
+                    int64_t audit_count = int64_t(params.num_batch)*get<2>(params.shape_Q)*seqlen_q;
+                    int64_t audit_idx = (int64_t(bidb)*get<2>(params.shape_Q)+bidh)*seqlen_q+row;
+                    int audit_anchor = row < seqlen_q ? int(params.hp_mass[3*audit_count+audit_idx]) : 0;
+                    #pragma unroll
+                    for (int ni = 0; ni < size<1>(scores); ++ni) {
+                        sr += static_cast<double>(static_cast<float>(hirow(mi, ni)));
+                        if constexpr (PrecisionLevel == 4) {
+                        pm += static_cast<double>(static_cast<float>(prow(mi, ni)));
+                        }
+                        if constexpr (TwoComponentDV) { pm += static_cast<double>(static_cast<float>(plow(mi, ni))); }
+                        if constexpr (PrecisionLevel == 4) { sr += static_cast<double>(static_cast<float>(lorow(mi, ni))); }
+                        if constexpr (PrecisionLevel == 4) {
+                        int col = (SdP_swapAB ? int(get<0>(rc(mi, ni))) : int(get<1>(rc(mi, ni)))) + n_block * kBlockN;
+                        double pv = static_cast<double>(static_cast<float>(prow(mi, ni)));
+                        if constexpr (TwoComponentDV) { pv += static_cast<double>(static_cast<float>(plow(mi, ni))); }
+                        if (col == audit_anchor) { pa += pv; }
+
+                        }
+                    }
+                    // GMMA C row layout: transposed rows share lanes spaced by 4;
+                    // non-transposed rows share groups of 4 consecutive lanes.
+                    #pragma unroll
+                    for (int off = SdP_swapAB ? 4 : 1; off < (SdP_swapAB ? 32 : 4); off <<= 1) {
+                        sr += __shfl_xor_sync(0xffffffff, sr, off);
+                        if constexpr (PrecisionLevel == 4) {
+                        pm += __shfl_xor_sync(0xffffffff, pm, off);
+                        pa += __shfl_xor_sync(0xffffffff, pa, off);
+                        }
+                    }
+                    if ((thread_idx & (SdP_swapAB ? 28 : 3)) == 0 && row < seqlen_q) {
+                        int64_t idx = (int64_t(bidb) * get<2>(params.shape_Q) + bidh) * seqlen_q + row;
+                        atomicAdd(reinterpret_cast<double*>(params.hp_rho) + idx, sr);
+                        if constexpr (PrecisionLevel == 4) {
+                        int64_t count = int64_t(params.num_batch)*get<2>(params.shape_Q)*seqlen_q;
+                        float row_scale = PrecisionLevel == 4 ? params.hp_mass[2*count+idx] : 1.f;
+                        atomicAdd(reinterpret_cast<double*>(params.hp_rho) + count + idx, pm * static_cast<double>(__int_as_float(0x7f000000 - __float_as_int(row_scale))));
+                        double invscale = static_cast<double>(__int_as_float(0x7f000000 - __float_as_int(row_scale)));
+                        atomicAdd(reinterpret_cast<double*>(params.hp_rho) + 3*count + idx, pa*invscale);
+                        }
+
+
+                    }
+                }
+            }
+            }
+
             // Synchronize P writes for !Mma_dKV_is_RS and preceding dS reads
             // for Mma_dKV_is_RS. Double-buffered dS uses the loop-end barrier.
             if constexpr (!Mma_dKV_is_RS || (kStages_dS == 1 && Mma_dKV_is_RS)) {
@@ -1698,6 +1796,25 @@ struct CollectiveMainloopBwdSm90 {
                     Tensor tdKrdS = mma_partition_fragment_AB</*A=*/!dKV_swapAB>(wg_mma_dK, sdSt);
                     Tensor tdKrdS_cur = tdKrdS(_, _, _, cute::conditional_return<kStages_dS==1>(_0{}, smem_pipe_read.index()));
                     flash::gemm</*zero_init=*/false, /*wg_wait=*/1, /*SwapAB=*/dKV_swapAB>(tiled_mma_dK, tdKrdS_cur, tdKrQ(_, _, _, smem_pipe_read.index()), tdKrdK);
+                }
+
+                if constexpr (PrecisionLevel == 4) {
+                static_assert(!Slice_dQKV_Mma, "HP D64/D128 unsliced dK");
+                warpgroup_wait<0>();
+                cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<uint32_t>(AttentionBwdNamedBarrier::PdS));
+                Tensor tdSadSLo = smem_thr_copy_PdS.retile_S(rdSLo);
+                cute::copy(smem_tiled_copy_PdS, tdSadSLo, tdSsdS(_, _, _, cute::conditional_return<kStages_dS==1>(_0{}, smem_pipe_read.index())));
+                cutlass::arch::fence_view_async_shared();
+                cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<uint32_t>(AttentionBwdNamedBarrier::PdS));
+                flash::gemm</*zero_init=*/false, /*wg_wait=*/0, /*SwapAB=*/dQ_swapAB>(tiled_mma_dQ, tdQrdS_cur, tdQrK, tdQrdQ);
+                if constexpr (Mma_dKV_is_RS) {
+                    Tensor tdKrdSLo = make_tensor(rdSLo.data(), convert_layout_acc_Aregs<TiledMmadK>(tdPrdP.layout()));
+                    flash::gemm</*zero_init=*/false, /*wg_wait=*/0>(tiled_mma_dK, tdKrdSLo, tdKrQ(_, _, _, smem_pipe_read.index()), tdKrdK);
+                } else {
+                    Tensor tdKrdSLo = mma_partition_fragment_AB</*A=*/!dKV_swapAB>(wg_mma_dK, sdSt);
+                    Tensor tdKrdSLo_cur = tdKrdSLo(_, _, _, cute::conditional_return<kStages_dS==1>(_0{}, smem_pipe_read.index()));
+                    flash::gemm</*zero_init=*/false, /*wg_wait=*/0, /*SwapAB=*/dKV_swapAB>(tiled_mma_dK, tdKrdSLo_cur, tdKrQ(_, _, _, smem_pipe_read.index()), tdKrdK);
+                }
                 }
                 if constexpr (dQacc_use_TMA) {
                     int const warp_group_idx = flash::canonical_warp_group_idx_nosync() - 1;

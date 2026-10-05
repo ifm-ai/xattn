@@ -105,7 +105,7 @@ def _reader_pair_kv_reuse_training(
     inputs,
     oracle_kwargs,
     deterministic,
-    high_precision_output,
+    high_precision_level,
 ):
     visibility_name = oracle_kwargs["visibility"]
     visibility = {"full": 0, "window": 1, "chunk": 2}[visibility_name]
@@ -120,7 +120,7 @@ def _reader_pair_kv_reuse_training(
         inputs[0].shape[-1] ** -0.5,
         visibility,
         deterministic,
-        high_precision_output,
+        high_precision_level,
     )
 
 
@@ -294,7 +294,7 @@ def test_flash_softdelta_visibility_components_match_fp64_backward(
     )
 
 
-@pytest.mark.parametrize("high_precision_output", [False, True])
+@pytest.mark.parametrize("high_precision_level", [False, True])
 @pytest.mark.parametrize(
     (
         "_case_name,operation,operation_kwargs,oracle_kwargs,length,"
@@ -387,7 +387,7 @@ def test_flash_softdelta_paired_backward_edge_cases(
     groups,
     group_dim,
     dtype,
-    high_precision_output,
+    high_precision_level,
 ):
     _requires_sm90_extension()
     torch.manual_seed(20260828)
@@ -414,7 +414,7 @@ def test_flash_softdelta_paired_backward_edge_cases(
         actual_inputs,
         oracle_kwargs,
         deterministic=True,
-        high_precision_output=high_precision_output,
+        high_precision_level=int(high_precision_level),
     )
     expected, expected_read, expected_past, _, _ = softdelta_fp64_oracle(
         *expected_inputs,
@@ -443,7 +443,7 @@ def test_flash_softdelta_paired_backward_edge_cases(
         )
 
 
-@pytest.mark.parametrize("high_precision_output", [False, True])
+@pytest.mark.parametrize("high_precision_level", [False, True])
 @pytest.mark.parametrize("deterministic", [False, True])
 @pytest.mark.parametrize(
     "_case_name,operation,operation_kwargs,oracle_kwargs",
@@ -469,7 +469,7 @@ def test_flash_softdelta_paired_backward_block_boundaries_match_fp64(
     operation_kwargs,
     oracle_kwargs,
     deterministic,
-    high_precision_output,
+    high_precision_level,
 ):
     _requires_sm90_extension()
     torch.manual_seed(20260829)
@@ -497,7 +497,7 @@ def test_flash_softdelta_paired_backward_block_boundaries_match_fp64(
         actual_inputs,
         oracle_kwargs,
         deterministic=deterministic,
-        high_precision_output=high_precision_output,
+        high_precision_level=int(high_precision_level),
     )
     expected, expected_read, expected_past, _, _ = softdelta_fp64_oracle(
         *expected_inputs,

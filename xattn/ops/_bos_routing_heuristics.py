@@ -21,7 +21,7 @@ def _select_routes(
     num_runs: int, max_seqlen: int, deterministic: bool, needs_backward: bool,
     *, sliding_chunk: bool = False, full_visibility: bool = False,
     softdelta: bool = False, reset_chunk_pos_per_seq: bool = False,
-    has_previous: bool = False, high_precision_output: bool = False,
+    has_previous: bool = False, high_precision_level: int = 0,
     previous_length: int = 0, num_k_runs: Optional[int] = None, standalone: bool = False,
     max_seqlen_k: Optional[int] = None,
 ) -> Tuple[bool, bool]:
@@ -119,7 +119,7 @@ def select_flash_swa_bos_routes(
     q: Tensor, k: Tensor, v: Tensor, window_size: int,
     num_runs: int, max_seqlen: int, deterministic: bool, needs_backward: bool,
     *, full_visibility: bool = False, has_previous: bool = False,
-    high_precision_output: bool = False, previous_length: int = 0,
+    high_precision_level: int = 0, previous_length: int = 0,
     num_k_runs: Optional[int] = None, max_seqlen_k: Optional[int] = None,
 ) -> Tuple[bool, bool]:
     """Return (FWD varlen, BWD varlen) for causal full or sliding-window BOS."""
@@ -128,7 +128,7 @@ def select_flash_swa_bos_routes(
     return _select_routes(
         q, k, v, window_size + 1, num_runs, max_seqlen,
         deterministic, needs_backward, full_visibility=full_visibility,
-        has_previous=has_previous, high_precision_output=high_precision_output,
+        has_previous=has_previous, high_precision_level=high_precision_level,
         previous_length=previous_length, num_k_runs=num_k_runs,
         max_seqlen_k=max_seqlen_k,
     )
@@ -138,7 +138,7 @@ def select_flash_sca_bos_routes(
     q: Tensor, k: Tensor, v: Tensor, chunk_size: int,
     num_runs: int, max_seqlen: int, deterministic: bool, needs_backward: bool,
     reset_chunk_pos_per_seq: bool = False, has_previous: bool = False,
-    *, high_precision_output: bool = False, previous_length: int = 0,
+    *, high_precision_level: int = 0, previous_length: int = 0,
     num_k_runs: Optional[int] = None, max_seqlen_k: Optional[int] = None, standalone: bool = False,
 ) -> Tuple[bool, bool]:
     """Return (FWD varlen, BWD varlen) for sliding-chunk BOS."""
@@ -147,7 +147,7 @@ def select_flash_sca_bos_routes(
     return _select_routes(
         q, k, v, chunk_size, num_runs, max_seqlen, deterministic, needs_backward,
         sliding_chunk=True, reset_chunk_pos_per_seq=reset_chunk_pos_per_seq,
-        has_previous=has_previous, high_precision_output=high_precision_output,
+        has_previous=has_previous, high_precision_level=high_precision_level,
         previous_length=previous_length, num_k_runs=num_k_runs,
         max_seqlen_k=max_seqlen_k, standalone=standalone,
     )
@@ -158,7 +158,7 @@ def select_flash_softdelta_bos_routes(
     num_runs: int, max_seqlen: int, deterministic: bool, needs_backward: bool,
     *, sliding_chunk: bool, full_visibility: bool = False,
     reset_chunk_pos_per_seq: bool = False, has_previous: bool = False,
-    high_precision_output: bool = False, previous_length: int = 0,
+    high_precision_level: int = 0, previous_length: int = 0,
     num_k_runs: Optional[int] = None, max_seqlen_k: Optional[int] = None,
 ) -> Tuple[bool, bool]:
     """Return joint reader routes; Q heads and V width are logical/flattened."""
@@ -169,7 +169,7 @@ def select_flash_softdelta_bos_routes(
         num_runs, max_seqlen, deterministic, needs_backward,
         sliding_chunk=sliding_chunk, full_visibility=full_visibility,
         softdelta=True, reset_chunk_pos_per_seq=reset_chunk_pos_per_seq,
-        has_previous=has_previous, high_precision_output=high_precision_output,
+        has_previous=has_previous, high_precision_level=high_precision_level,
         previous_length=previous_length, num_k_runs=num_k_runs,
         max_seqlen_k=max_seqlen_k,
     )

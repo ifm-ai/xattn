@@ -37,6 +37,14 @@ struct EpilogueUsesFastReciprocal<
     Epilogue, std::void_t<decltype(Epilogue::UseFastReciprocal)>>
     : std::bool_constant<Epilogue::UseFastReciprocal> {};
 
+template <typename Mainloop, typename = void>
+struct MainloopUsesSubtractBeforeScale : std::false_type {};
+
+template <typename Mainloop>
+struct MainloopUsesSubtractBeforeScale<
+    Mainloop, std::void_t<decltype(Mainloop::UseSubtractBeforeScale)>>
+    : std::bool_constant<Mainloop::UseSubtractBeforeScale> {};
+
 template <typename TileScheduler, typename = void>
 struct TileSchedulerHasEpilogueBlockCoord : std::false_type {};
 
@@ -422,7 +430,8 @@ public:
                     !LargeHeadDimV ? 2 * (2 * kBlockM / NumMmaThreads) : 2,
                     /*Max_offset=*/!Is_FP8 ? 0 : 8,
                     CollectiveMainloop::UseFastExp2,
-                    EpilogueUsesFastReciprocal<CollectiveEpilogue>::value>
+                    EpilogueUsesFastReciprocal<CollectiveEpilogue>::value,
+                    MainloopUsesSubtractBeforeScale<CollectiveMainloop>::value>
                     softmax(softmax_scale_log2);
                 // Attention output (GEMM-II) accumulator.
                 Tensor tOrO = partition_fragment_C(tiled_mma_pv, select<0, 1>(TileShape_MNK_PV{}));

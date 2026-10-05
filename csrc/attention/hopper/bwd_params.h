@@ -81,6 +81,12 @@ struct AttentionBwdParams {
   // Optional per-head boundary adjustment for interleaved paired readers.
   // Even heads use window_size_right; odd heads add this delta.
   int odd_head_window_right_delta;
+  // Explicit advanced numerical path. LP and original FP32-state BWD use 0/1.
+  int high_precision_level = 0;
+  const float* hp_delta = nullptr;
+  float* hp_rho = nullptr;  // four planes of FP64 statistics (internal transport)
+  float* hp_mass = nullptr; // max, anchored dP, scale, anchor, left, right
+
 };
 
 }  // namespace ops

@@ -203,3 +203,27 @@ def attention_read(
         v_heads_first.to(accumulation_dtype),
     )
     return output.transpose(1, 2)
+
+
+def validate_sm90_dimensions(q, v, backend: str, *, api_name: str) -> None:
+    """Reject unsupported TMA dimensions before constructing native descriptors."""
+    if not isinstance(q, Tensor) or not isinstance(v, Tensor):
+        return  # The ordinary input validator owns rank/type diagnostics.
+    if not q.is_cuda or str(backend).strip().lower() not in ('', 'auto', 'sm90'):
+        return
+    if q.dim() != 4 or v.dim() not in (4, 5):
+        return
+    width = v.shape[-1] if v.dim() == 4 else v.shape[-2] * v.shape[-1]
+    dim = q.shape[-1]
+    if q.shape[0] <= 0:
+        raise ValueError(f"{api_name} SM90 batch size must be positive")
+    if not (0 < dim <= 256 and 0 < width <= 256 and dim % 8 == 0 and width % 8 == 0):
+        raise ValueError(
+            f"{api_name} SM90 requires Q/K and flattened V dimensions to be "
+            f"multiples of 8 in [8, 256]; got D={dim}, V={width}"
+        )
+
+
+def validate_attention_scale(scale) -> None:
+    if scale is not None and not math.isfinite(float(scale)):
+        raise ValueError("attention scale must be finite")

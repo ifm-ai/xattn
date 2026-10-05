@@ -1,3 +1,6 @@
+from ._backward_precision import validate_backward_precision, validate_attention_saved_state
+from ._backward_precision import require_precision_backward
+from ._backward_precision import validate_high_precision_level
 # Author: Shicheng Wen
 
 """Shared metadata, autograd, and dispatch for causal attention APIs."""
@@ -11,7 +14,7 @@ from torch.autograd.function import FunctionCtx
 
 from ._backward_precision import (
     allocate_backward_output_state,
-    use_high_precision_output,
+    use_high_precision_level,
 )
 from ._bos_metadata import (
     bos_to_segment_idx,
@@ -358,11 +361,12 @@ class _CausalAttentionFunc(torch.autograd.Function):
         k_segment_idx: Optional[Tensor],
         backend: str,
         deterministic: bool,
-        high_precision_output: bool,
+        high_precision_level: int,
     ) -> Tensor:
+        ctx.high_precision_level = high_precision_level
         output_state = (
             allocate_backward_output_state(q, v)
-            if high_precision_output
+            if high_precision_level
             else None
         )
         args = (
@@ -399,6 +403,7 @@ class _CausalAttentionFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx: FunctionCtx, y_grad: Tensor) -> tuple:
+        require_precision_backward(ctx.high_precision_level)
         (
             q,
             k,
@@ -463,11 +468,12 @@ class _CausalAttentionBosFunc(torch.autograd.Function):
         deterministic: bool,
         fwd_use_varlen: bool,
         bwd_use_varlen: bool,
-        high_precision_output: bool,
+        high_precision_level: int,
     ) -> Tensor:
+        ctx.high_precision_level = high_precision_level
         output_state = (
             allocate_backward_output_state(q, v)
-            if high_precision_output
+            if high_precision_level
             else None
         )
         if fwd_use_varlen:
@@ -526,6 +532,7 @@ class _CausalAttentionBosFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx: FunctionCtx, y_grad: Tensor) -> tuple:
+        require_precision_backward(ctx.high_precision_level)
         (
             q,
             k,
@@ -613,11 +620,12 @@ class _FlashSWAVarlenFunc(torch.autograd.Function):
         scale: float,
         backend: str,
         deterministic: bool,
-        high_precision_output: bool,
+        high_precision_level: int,
     ) -> Tensor:
+        ctx.high_precision_level = high_precision_level
         output_state = (
             allocate_backward_output_state(q, v)
-            if high_precision_output
+            if high_precision_level
             else None
         )
         args = (
@@ -655,6 +663,7 @@ class _FlashSWAVarlenFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx: FunctionCtx, y_grad: Tensor) -> tuple:
+        require_precision_backward(ctx.high_precision_level)
         (
             q,
             k,
@@ -738,7 +747,7 @@ def _causal_attention(
     bos_mask: Optional[Tensor] = None,
     backend: str = "auto",
     deterministic: bool = False,
-    high_precision_output: bool = False,
+    high_precision_level: int = 0,
     api_name: str = "flash_swa",
 ) -> Tensor:
     """Shared causal full/window attention dispatch."""
@@ -746,8 +755,8 @@ def _causal_attention(
         q, k, v, prev_k, prev_v, api_name=api_name,
         allow_short_q=True,
     )
-    use_fp32_state = use_high_precision_output(
-        high_precision_output,
+    use_fp32_state = use_high_precision_level(
+        high_precision_level,
         (q, k, v, prev_k, prev_v),
         api_name=api_name,
     )
@@ -795,7 +804,7 @@ def _causal_attention(
                 needs_backward,
                 full_visibility=window_size is None,
                 has_previous=prev_k is not None,
-                high_precision_output=use_fp32_state,
+                high_precision_level=use_fp32_state,
                 previous_length=prev_length,
                 num_k_runs=num_k_runs,
                 max_seqlen_k=max_seqlen_k,
@@ -862,16 +871,15 @@ def _causal_attention_fwd(
     bos_mask: Optional[Tensor] = None,
     backend: str = "auto",
     api_name: str = "flash_swa",
-    high_precision_output: bool = False,
+    high_precision_level: int = 0,
 ) -> Tuple[Tensor, Optional[Tensor], Tensor]:
     """Shared causal full/window attention dispatch."""
-    if not isinstance(high_precision_output, bool):
-        raise TypeError(f"{api_name} high_precision_output must be a bool")
+    validate_high_precision_level(high_precision_level)
     prev_length = _validate_inputs(
         q, k, v, prev_k, prev_v, api_name=api_name,
         allow_short_q=True,
     )
-    output_state = allocate_backward_output_state(q, v) if high_precision_output else None
+    output_state = allocate_backward_output_state(q, v) if high_precision_level else None
     output_options = {"output_state": output_state} if output_state is not None else {}
     _check_bos_exclusive(bos_mask, segment_idx, q_segment_idx, k_segment_idx)
     resolved_scale = _resolve_scale(q, scale)
@@ -899,7 +907,7 @@ def _causal_attention_fwd(
                 False,
                 full_visibility=window_size is None,
                 has_previous=prev_k is not None,
-                high_precision_output=high_precision_output,
+                high_precision_level=high_precision_level,
                 previous_length=prev_length,
                 num_k_runs=num_k_runs,
                 max_seqlen_k=max_seqlen_k,
@@ -982,9 +990,19 @@ def _causal_attention_bwd(
     bos_mask: Optional[Tensor] = None,
     backend: str = "auto",
     deterministic: bool = False,
+    high_precision_level: int = 0,
     api_name: str = "flash_swa",
 ) -> Tuple[Tensor, Tensor, Tensor, Optional[Tensor], Optional[Tensor]]:
     """Shared causal full/window attention dispatch."""
+    validate_backward_precision(high_precision_level, y, q)
+    if high_precision_level >= 2:
+        validate_attention_saved_state(y, lse, q, v)
+        from ._precision_backend import backward as precision_backward
+        return precision_backward(y_grad, q, k, v, level=high_precision_level,
+            visibility=0 if window_size is None else 1, span=window_size, scale=scale, prev_k=prev_k, prev_v=prev_v,
+            q_segment_idx=q_segment_idx, k_segment_idx=k_segment_idx,
+            segment_idx=segment_idx, bos_mask=bos_mask, reset=False,
+            deterministic=deterministic, backend=backend)
     prev_length = _validate_inputs(
         q, k, v, prev_k, prev_v, api_name=api_name,
         allow_short_q=True,
@@ -1015,7 +1033,7 @@ def _causal_attention_bwd(
                 True,
                 full_visibility=window_size is None,
                 has_previous=prev_k is not None,
-                high_precision_output=y.dtype == torch.float32,
+                high_precision_level=int(y.dtype == torch.float32),
                 previous_length=prev_length,
                 num_k_runs=num_k_runs,
                 max_seqlen_k=max_seqlen_k,
@@ -1098,7 +1116,7 @@ def _flash_swa_varlen(
     max_seqlen_k: int,
     backend: str = "auto",
     deterministic: bool = False,
-    high_precision_output: bool = False,
+    high_precision_level: int = 0,
 ) -> Tensor:
     """Run packed varlen FlashSWA with each cu-seqlens entry isolated.
 
@@ -1117,8 +1135,8 @@ def _flash_swa_varlen(
         max_seqlen_k,
         "_flash_swa_varlen",
     )
-    use_fp32_state = use_high_precision_output(
-        high_precision_output,
+    use_fp32_state = use_high_precision_level(
+        high_precision_level,
         (q, k, v),
         api_name="_flash_swa_varlen",
     )

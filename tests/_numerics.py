@@ -216,7 +216,7 @@ def check_case(operation, case, dtype, kv_heads, deterministic, high_precision, 
     base_inputs = inputs[:4 if soft else 3]
     gate = inputs[3] if soft else None
     fn = getattr(xattn, OPERATIONS[operation])
-    actual = fn(*base_inputs, **options, deterministic=deterministic, high_precision_output=high_precision)
+    actual = fn(*base_inputs, **options, deterministic=deterministic, high_precision_level=int(high_precision))
     assert_output(actual, expected, dtype, reads, gate)
     dy = torch.randn_like(actual) / actual.numel() ** 0.5
     expected_grads = torch.autograd.grad(expected, refs, dy.double())
@@ -230,14 +230,14 @@ def check_case(operation, case, dtype, kv_heads, deterministic, high_precision, 
         from xattn.ops._flash_softdelta import flash_softdelta_paired_training
         paired = flash_softdelta_paired_training(
             *base_inputs, case.span, case.dim**-0.5,
-            1 if operation == 'softdelta_window' else 2, deterministic, high_precision,
+            1 if operation == 'softdelta_window' else 2, deterministic, int(high_precision),
         )
         assert_output(paired, expected, dtype, reads, gate)
         assert_gradients(torch.autograd.grad(paired, inputs, dy), expected_grads, dtype)
     if backend != 'torch':
         fwd = getattr(xattn, OPERATIONS[operation] + '_fwd')
         bwd = getattr(xattn, OPERATIONS[operation] + '_bwd')
-        fwd_options = dict(options, high_precision_output=high_precision)
+        fwd_options = dict(options, high_precision_level=int(high_precision))
         if soft:
             fwd_options['deterministic'] = deterministic
         with torch.no_grad():
@@ -247,10 +247,10 @@ def check_case(operation, case, dtype, kv_heads, deterministic, high_precision, 
             if high_precision:
                 assert state.dtype == torch.float32
             explicit_grads = bwd(dy, *base_inputs, saved, lse, **options,
-                                 deterministic=deterministic)[:len(inputs)]
+                                 deterministic=deterministic, high_precision_level=int(high_precision))[:len(inputs)]
             assert_gradients(explicit_grads, expected_grads, dtype)
         with torch.inference_mode():
-            inference = fn(*base_inputs, **options, high_precision_output=high_precision)
+            inference = fn(*base_inputs, **options, high_precision_level=int(high_precision))
             assert_output(inference, expected, dtype, reads, gate)
 
 
@@ -267,7 +267,7 @@ def check_rounding_bias(operation, deterministic):
     for step in range(4):
         v = values.roll(step, 1).detach().requires_grad_()
         y = fn(q, k, v, **options, backend='sm90', deterministic=deterministic,
-               high_precision_output=True)
+               high_precision_level=int(True))
         # Identical K rows imply dQ=0 exactly, independently of V and Q.
         dq = torch.autograd.grad(y, q, dy)[0]
         assert y.dtype == torch.bfloat16
@@ -359,7 +359,7 @@ def check_long(operation, length, dim, value_dim, dtype, kv_heads, high_precisio
     expected = reads[0] - gate.sigmoid()*reads[1] if soft else reads[0]
     options, _, _ = options_and_segments(operation, case, inputs, 'sm90')
     actual = getattr(xattn, OPERATIONS[operation])(
-        *inputs, **options, high_precision_output=high_precision, deterministic=deterministic)
+        *inputs, **options, high_precision_level=int(high_precision), deterministic=deterministic)
     assert torch.isfinite(actual).all()
     selected = actual[:, positions]
     assert_output(selected, expected, dtype, reads if soft else None, gate)

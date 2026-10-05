@@ -1,3 +1,4 @@
+from ._backward_precision import validate_high_precision_level
 """Match independent reset-position segments before calling packed FlashSCA."""
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -128,12 +129,11 @@ def _restore(t, indices, batch, length):
 
 
 def matched_forward(q, k, v, chunk_size, scale, prev_k, prev_v, q_idx, k_idx,
-                    backend, attn_method, high_precision_output, deterministic=False,
+                    backend, attn_method, high_precision_level, deterministic=False,
                     *, autograd=False, strict_past=False):
     sca, plan, packed, opts, scale, _, _ = _prepare(
         q, k, v, chunk_size, scale, prev_k, prev_v, q_idx, k_idx, backend, attn_method)
-    if not isinstance(high_precision_output, bool):
-        raise TypeError("high_precision_output must be a bool")
+    validate_high_precision_level(high_precision_level)
     batch, length, heads = q.shape[:3]
     if not plan.max_q:
         y = q.new_zeros((batch, length, heads, v.shape[-1]))
@@ -143,16 +143,16 @@ def matched_forward(q, k, v, chunk_size, scale, prev_k, prev_v, q_idx, k_idx,
                 if x is not None:
                     y = y + (x.sum(dtype=torch.float32) * 0).to(y.dtype)
             return y
-        state = y.float() if high_precision_output else None
+        state = y.float() if high_precision_level else None
         return y, state, q.new_full((batch, heads, length), float("inf"), dtype=torch.float32)
     if autograd:
         yp = sca._flash_sca_varlen(*packed, chunk_size, scale, **opts,
                                   deterministic=deterministic,
-                                  high_precision_output=high_precision_output)
+                                  high_precision_level=high_precision_level)
         return _restore(yp, plan.q_indices, batch, length)
     state_packed = (torch.empty((*packed[0].shape[:2], v.shape[-1]),
                                device=q.device, dtype=torch.float32)
-                    if high_precision_output else None)
+                    if high_precision_level else None)
     yp, lp = sca._flash_sca_varlen_fwd(*packed, chunk_size, scale, **opts,
                                      output_state=state_packed, strict_past=strict_past)
     y = _restore(yp, plan.q_indices, batch, length)

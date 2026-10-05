@@ -29,7 +29,7 @@ y = sliding_window_softdelta_attention(
     bos_mask=None,
     backend="auto",
     deterministic=False,
-    high_precision_output=False,
+    high_precision_level=0,
 )
 ```
 
@@ -49,6 +49,8 @@ Tensor layouts:
 `prev_seqlen=0` without previous K/V; segment metadata forms are mutually exclusive.
 `scale=None` uses `1 / sqrt(qk_dim)`.
 
+- `high_precision_level` (int, default `0`): `0` disables repairs; `1` saves FP32 backward state and uses subtract-before-scale (SBS) softmax to reduce output-rounding and cancellation error; `2` adds K/V centering and stable softmax-gradient evaluation to reduce common-offset leakage; `3` adds dS row-sum repair (`sum(dS)=0`) for consistent dQ/dK corrections; `4` adds dual-BF16 P/dS operands, range protection and nonnegative probability-mass repair (`sum(P)=1`) to improve dQ/dK/dV. Only integers 0–4 are accepted. Outputs and gradients keep the input dtype; constraints hold up to floating-point rounding.
+
 Standalone forward/backward:
 
 ```python
@@ -66,7 +68,7 @@ y, readers, lse = sliding_window_softdelta_attention_fwd(
     bos_mask=None,
     backend="auto",
     deterministic=False,
-    high_precision_output=True,
+    high_precision_level=1,
 )
 dq, dk, dv, dg, dprev_k, dprev_v = sliding_window_softdelta_attention_bwd(
     dy, q, k, v, g, readers, lse,
@@ -80,6 +82,7 @@ dq, dk, dv, dg, dprev_k, dprev_v = sliding_window_softdelta_attention_bwd(
     bos_mask=None,
     backend="auto",
     deterministic=False,
+    high_precision_level=1,
 )
 ```
 
@@ -93,7 +96,13 @@ Output layouts:
 
 Standalone calls require SM90 and do not build an autograd graph or populate `.grad`.
 Forward always returns `(y, readers, lse)`, including under
-`no_grad`/inference mode. Backward automatically selects precision from
-`readers.dtype`. Reuse forward's options and LSE.
+`no_grad`/inference mode. Pass the same `high_precision_level` to backward;
+`readers.dtype` does not select the algorithm. Reuse forward's other options and LSE.
 Final `y` alone is insufficient for backward: both reader outputs are needed.
 The autograd API returns only `y` and retains high-precision reader state internally.
+
+SM90 requires a positive batch size and Q/K width and flattened V width to be
+multiples of 8 in `[8, 256]`. Unsupported widths are rejected before native
+launch. Finite zero/negative scales use an exact Q zero/sign transform so
+masking remains defined. Shape coverage does not guarantee bounded relative
+error for arbitrary ill-conditioned or overflowing floating-point inputs.
