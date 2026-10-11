@@ -179,7 +179,7 @@ public:
         int const warp_group_thread_idx = threadIdx.x % cutlass::NumThreadsPerWarpGroup;
 
         PipelineParams pipeline_params;
-        pipeline_params.transaction_bytes = CollectiveMainloop::TmaTransactionBytesQ + CollectiveMainloop::TmaTransactionBytesLSE;
+        pipeline_params.transaction_bytes = CollectiveMainloop::TmaTransactionBytesQ + CollectiveMainloop::TmaTransactionBytesLSE + CollectiveMainloop::TmaTransactionBytesHPQ;
         int warp_group_idx = cutlass::canonical_warp_group_idx();
         pipeline_params.role = warp_group_idx == 0
             ? MainloopPipeline::ThreadCategory::Producer
@@ -198,7 +198,7 @@ public:
             ? MainloopPipeline_dO::ThreadCategory::Producer
             : MainloopPipeline_dO::ThreadCategory::Consumer;
         PipelineParams_dO pipeline_params_dO {
-            CollectiveMainloop::TmaTransactionBytesdO + CollectiveMainloop::TmaTransactionBytesLSE,
+            CollectiveMainloop::TmaTransactionBytesdO + CollectiveMainloop::TmaTransactionBytesLSE + CollectiveMainloop::TmaTransactionBytesHPdO,
             role_dO, pipeline_params.is_leader, pipeline_params.num_consumers};
         MainloopPipeline_dO pipeline_do(shared_storage.pipelines.pipeline_do, pipeline_params_dO, ClusterShape{});
         MainloopPipelineK pipeline_k = [&] {

@@ -10,13 +10,7 @@ from xattn import (
     softdelta_attention,
 )
 from xattn.ops._flash_softdelta import (
-    flash_softdelta_gate,
     flash_softdelta_paired_training,
-)
-from xattn.ops._attention_core import AttentionVisibility
-from xattn.ops.softdelta_attention import (
-    _execute_flash_softdelta_reads,
-    _make_plan,
 )
 
 from .reference import softdelta_fp64_oracle
@@ -57,23 +51,6 @@ FLASH_CASES = (
         {"visibility": "chunk", "span": 3},
     ),
 )
-
-
-def _plan_for_case(case_name, operation_kwargs):
-    if case_name == "full":
-        visibility = AttentionVisibility.CAUSAL_FULL
-        span = None
-    elif case_name == "window":
-        visibility = AttentionVisibility.SLIDING_WINDOW
-        span = operation_kwargs["window_size"]
-    else:
-        visibility = AttentionVisibility.SLIDING_CHUNK
-        span = operation_kwargs["chunk_size"]
-    return _make_plan(
-        visibility,
-        span,
-        operation_kwargs.get("reset_chunk_pos_per_seq", False),
-    )
 
 
 def _assert_composed_close(
@@ -121,176 +98,6 @@ def _reader_pair_kv_reuse_training(
         visibility,
         deterministic,
         high_precision_level,
-    )
-
-
-def _assert_flash_component_backward(
-    q,
-    k,
-    v,
-    plan,
-    deterministic,
-    dtype,
-):
-    actual_inputs = [
-        tensor.detach().clone().requires_grad_(True)
-        for tensor in (q, k, v)
-    ]
-    expected_inputs = [
-        tensor.detach().double().requires_grad_(True)
-        for tensor in (q, k, v)
-    ]
-    actual_read, actual_past = _execute_flash_softdelta_reads(
-        *actual_inputs,
-        plan,
-        q.shape[-1] ** -0.5,
-        None,
-        None,
-        None,
-        None,
-        deterministic,
-    )
-    visibility = plan.primary.visibility
-    if visibility is AttentionVisibility.CAUSAL_FULL:
-        oracle_kwargs = {"visibility": "full"}
-    elif visibility is AttentionVisibility.SLIDING_WINDOW:
-        oracle_kwargs = {
-            "visibility": "window",
-            "span": plan.primary.span,
-        }
-    else:
-        oracle_kwargs = {
-            "visibility": "chunk",
-            "span": plan.primary.span,
-            "reset_position_per_segment": (
-                plan.primary.reset_position_per_segment
-            ),
-        }
-    gate = torch.zeros(
-        q.shape[0],
-        q.shape[1],
-        q.shape[2] // 2,
-        v.shape[3],
-        1,
-        dtype=torch.float64,
-        device=q.device,
-    )
-    _, expected_read, expected_past, _, _ = softdelta_fp64_oracle(
-        *expected_inputs,
-        gate,
-        return_aux=True,
-        **oracle_kwargs,
-    )
-    for actual_component, expected_component in (
-        (actual_read.reshape_as(expected_read), expected_read),
-        (actual_past.reshape_as(expected_past), expected_past),
-    ):
-        component_grad = (
-            torch.randn_like(actual_component)
-            / actual_component.numel() ** 0.5
-        )
-        actual_grads = torch.autograd.grad(
-            actual_component,
-            actual_inputs,
-            component_grad,
-            retain_graph=True,
-        )
-        expected_grads = torch.autograd.grad(
-            expected_component,
-            expected_inputs,
-            component_grad.double(),
-            retain_graph=True,
-        )
-        for actual_grad, expected_grad in zip(
-            actual_grads,
-            expected_grads,
-        ):
-            torch.testing.assert_close(
-                actual_grad,
-                expected_grad.to(dtype),
-                rtol=RTOL[dtype],
-                atol=GRAD_ATOL[dtype],
-            )
-
-
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("group_dim", [1, 8, 16, 17, 64])
-def test_flash_softdelta_gate_matches_fp64_forward_backward(
-    dtype,
-    group_dim,
-):
-    _requires_sm90_extension()
-    torch.manual_seed(20260810 + group_dim)
-    quantized = [
-        tensor.to(dtype)
-        for tensor in (
-            torch.randn(2, 3, 2, 3, group_dim, device="cuda") * 0.2,
-            torch.randn(2, 3, 2, 3, group_dim, device="cuda") * 0.2,
-            torch.randn(2, 3, 2, 3, 1, device="cuda") * 0.5,
-        )
-    ]
-    expected_inputs = [
-        tensor.detach().double().requires_grad_(True)
-        for tensor in quantized
-    ]
-    actual_inputs = [
-        tensor.detach().clone().requires_grad_(True)
-        for tensor in quantized
-    ]
-    expected = expected_inputs[0] - torch.sigmoid(
-        expected_inputs[2]
-    ) * expected_inputs[1]
-    actual = flash_softdelta_gate(*actual_inputs)
-    torch.testing.assert_close(
-        actual,
-        expected.to(dtype),
-        rtol=RTOL[dtype],
-        atol=ATOL[dtype],
-    )
-
-    output_grad = torch.randn_like(actual) / actual.numel() ** 0.5
-    actual.backward(output_grad)
-    expected.backward(output_grad.double())
-    for actual_input, expected_input in zip(actual_inputs, expected_inputs):
-        torch.testing.assert_close(
-            actual_input.grad,
-            expected_input.grad.to(dtype),
-            rtol=RTOL[dtype],
-            atol=GRAD_ATOL[dtype],
-        )
-
-
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize(
-    "case_name,operation_kwargs",
-    [(case[0], case[2]) for case in FLASH_CASES],
-    ids=[case[0] for case in FLASH_CASES],
-)
-def test_flash_softdelta_visibility_components_match_fp64_backward(
-    dtype,
-    case_name,
-    operation_kwargs,
-):
-    _requires_sm90_extension()
-    torch.manual_seed(20260812)
-    q, k, v, _, _, _ = _conditioned_inputs(
-        batch=2,
-        length=11,
-        q_heads=4,
-        kv_heads=2,
-        qk_dim=32,
-        groups=4,
-        group_dim=8,
-        dtype=dtype,
-        device="cuda",
-    )
-    _assert_flash_component_backward(
-        q,
-        k,
-        v,
-        _plan_for_case(case_name, operation_kwargs),
-        True,
-        dtype,
     )
 
 

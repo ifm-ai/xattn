@@ -82,6 +82,18 @@ torch::Tensor EmptyLastDimLike(
       tensor.options().memory_format(at::MemoryFormat::Contiguous));
 }
 
+// Views whose rows TMA can address (unit last-dim stride, 16-byte aligned base
+// and strides) are read in place, e.g. one SoftDelta reader's q[:, :, i::2];
+// other layouts are made contiguous.
+torch::Tensor TmaReadable(const torch::Tensor& tensor) {
+  bool readable = tensor.stride(-1) == 1 &&
+      reinterpret_cast<std::uintptr_t>(tensor.data_ptr()) % 16 == 0;
+  for (int64_t i = 0; readable && i + 1 < tensor.dim(); ++i) {
+    readable = tensor.stride(i) * tensor.element_size() % 16 == 0;
+  }
+  return readable ? tensor : tensor.contiguous();
+}
+
 void CheckPreviousKV(
     const torch::Tensor& q, const torch::Tensor& k,
     const torch::Tensor& v, const torch::Tensor& prev_k,
@@ -1256,7 +1268,7 @@ CausalAttentionSM90BwdWithHeadBoundary(
   CheckBackwardTensors(y_grad, q, v, y, lse);
   at::cuda::OptionalCUDAGuard guard(at::device_of(q));
 
-  torch::Tensor q_c = q.contiguous();
+  torch::Tensor q_c = TmaReadable(q);
   torch::Tensor k_c = k.contiguous();
   torch::Tensor v_c = v.contiguous();
   torch::Tensor dy_c = y_grad.contiguous();
@@ -1325,7 +1337,7 @@ CausalAttentionSM90BwdWithHeadBoundary(
     y_c = PadLastDim(y_c, bucket_dim_v);
   }
 
-  torch::Tensor dq_pad = torch::empty_like(q_c);
+  torch::Tensor dq_pad = torch::empty(q_c.sizes(), q_c.options());
   const bool grouped_heads = q.size(2) != k.size(2);
   // Dispatch sees padded input dimensions, not the original public shape.
   // Use those same dimensions when allocating square-template GQA outputs.

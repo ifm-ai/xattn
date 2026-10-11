@@ -427,18 +427,15 @@ FLASH_SOFTDELTA_SM90_CSRCS = [
 ATTENTION_PRECISION_CSRCS = [
     CSRC / "attention" / "precision" / "constant_keys.cu",
     CSRC / "attention" / "precision" / "bindings.cc",
-    CSRC / "attention" / "precision" / "anchor_repair.cu",
+    CSRC / "attention" / "precision" / "zero_sum_repair.cu",
     CSRC / "attention" / "precision" / "preprocess.cu",
     CSRC / "attention" / "precision" / "row_statistics.cu",
     CSRC / "attention" / "precision" / "probability_repair.cu",
     CSRC / "attention" / "precision" / "deterministic.cu",
-    CSRC / "attention" / "precision" / "deterministic_uncached.cu",
     CSRC / "attention" / "precision" / "main.cu",
-    CSRC / "attention" / "precision" / "ordered_level2.cu",
+    CSRC / "attention" / "precision" / "ordered.cu",
     CSRC / "attention" / "precision" / "rectangular.cu",
     CSRC / "attention" / "precision" / "mha_direct.cu",
-    CSRC / "attention" / "precision" / "deterministic_cached.cu",
-    CSRC / "attention" / "precision" / "deterministic_cached_bounds.cu",
     *sorted((CSRC / "attention" / "precision" / "instantiations").glob("*.cu")),
 ]
 
@@ -527,7 +524,7 @@ def main():
     _require_supported_toolchain()
     setup(
         name="xattn",
-        version="1.1.0",
+        version="1.1.1",
         description="Efficient attention modules for xLLM.",
         long_description=(ROOT / "README.md").read_text(encoding="utf-8"),
         long_description_content_type="text/markdown",

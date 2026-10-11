@@ -34,6 +34,7 @@ class Case:
     groups: int = 4
     layout: str = 'contiguous'
     batch: int = 2
+    segment_length: int = 67
 
 
 # Curated combinations replace three overlapping Cartesian short-Q matrices.
@@ -147,7 +148,7 @@ def options_and_segments(operation, case, inputs, backend):
     qi = ki = None
     if case.metadata != 'dense':
         total = case.k_length + case.previous
-        ki = (torch.arange(total, device=inputs[0].device) // 67).expand(case.batch, -1).clone()
+        ki = (torch.arange(total, device=inputs[0].device) // case.segment_length).expand(case.batch, -1).clone()
         ki += torch.arange(case.batch, device=ki.device)[:, None] * 100
         qi = ki[:, -case.q_length:].clone()
         if case.metadata == 'independent':

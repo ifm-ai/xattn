@@ -63,6 +63,14 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr bool Has_segment = HasSegment_;
     static constexpr bool UseFastExp2 = UseFastExp2_;
     static constexpr bool Is_sliding_chunk = IsSlidingChunk_;
+    // Segment kernels masked from per-row key intervals only (no SCA reset,
+    // PackGQA or SoftDelta pairing); the launcher supplies the intervals.
+    static constexpr bool SegmentRowIntervals =
+        HasSegment_ && !PackGQA_ && !SoftDeltaPair_ && !SoftDeltaSingleCTA_ && !IsSlidingChunk_;
+    // Precomputed key spans and full-tile ranges. Wide-V kernels without row
+    // intervals keep the per-tile search: the extra live state spills them.
+    static constexpr bool SegmentTileRanges =
+        SegmentRowIntervals || (HasSegment_ && kHeadDimV <= 128);
     static constexpr bool SoftDeltaPair = SoftDeltaPair_;
     static constexpr bool SoftDeltaSingleCTA = SoftDeltaSingleCTA_;
     static constexpr bool SoftDeltaSplitKVMulticast =
@@ -487,6 +495,9 @@ struct CollectiveMainloopFwdSm90 {
         int const* const q_position_offsets = nullptr;
         int const* const q_chunk_positions = nullptr;
         int const reset_attention_chunk = 0;
+        // Optional per (batch, Q tile) segment key spans (segment forward).
+        int4 const* const segment_spans = nullptr;
+        int2 const* const segment_rows = nullptr;
     };
 
     // Device side kernel params
@@ -550,6 +561,8 @@ struct CollectiveMainloopFwdSm90 {
         int const* const q_position_offsets = nullptr;
         int const* const q_chunk_positions = nullptr;
         cutlass::FastDivmod reset_attention_chunk_divmod;
+        int4 const* const segment_spans = nullptr;
+        int2 const* const segment_rows = nullptr;
 
         CUTLASS_DEVICE
         int get_chunk_position_offset(
@@ -673,7 +686,8 @@ struct CollectiveMainloopFwdSm90 {
                 args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
                 args.seqused_q, args.seqused_k, args.leftpad_k,
                 args.seqlens_rotary, args.q_position_offsets,
-                args.q_chunk_positions, reset_attention_chunk_divmod};
+                args.q_chunk_positions, reset_attention_chunk_divmod,
+                args.segment_spans, args.segment_rows};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -737,11 +751,20 @@ struct CollectiveMainloopFwdSm90 {
             params.get_chunk_position_offset(
                 bidb, seqlen_info.seqlen_q, seqlen_info.seqlen_k));
         if constexpr (Has_segment) {
-            auto segment_n_block_min_max = SegmentPartition::fwd_n_block_range(
-                n_block_min, n_block_max, range_m, seqlen_info.seqlen_q, seqlen_info.seqlen_k,
-                params.q_segment_idx, params.k_segment_idx, params.k_segment_len, bidb);
-            n_block_min = get<0>(segment_n_block_min_max);
-            n_block_max = get<1>(segment_n_block_min_max);
+            if (SegmentTileRanges && params.segment_spans != nullptr) {
+                auto r = xattn::ops::attention::partition::segment_n_block_min_max_full_span<kBlockM, kBlockN>(
+                    n_block_min, n_block_max, range_m, seqlen_info.seqlen_q, seqlen_info.seqlen_k,
+                    params.k_segment_len,
+                    params.segment_spans[bidb * ((seqlen_info.seqlen_q + kBlockM - 1) / kBlockM) + range_m]);
+                n_block_min = get<0>(r);
+                n_block_max = get<1>(r);
+            } else {
+                auto segment_n_block_min_max = SegmentPartition::fwd_n_block_range(
+                    n_block_min, n_block_max, range_m, seqlen_info.seqlen_q, seqlen_info.seqlen_k,
+                    params.q_segment_idx, params.k_segment_idx, params.k_segment_len, bidb);
+                n_block_min = get<0>(segment_n_block_min_max);
+                n_block_max = get<1>(segment_n_block_min_max);
+            }
         }
         // It's possible to have n_block_max <= n_block_min. Loading K can cause illegal memory access.
         if constexpr (Is_causal || Is_local || Varlen || Split) {
@@ -1157,7 +1180,24 @@ struct CollectiveMainloopFwdSm90 {
             params.qhead_per_khead_divmod,
             params.get_chunk_position_offset(
                 bidb, seqlen_info.seqlen_q, seqlen_info.seqlen_k));
-        if constexpr (Has_segment) {
+        int segment_full_min = 0, segment_full_max = 0;
+        if constexpr (SegmentTileRanges) {
+            auto segment_n_block_min_max = params.segment_spans != nullptr
+                ? xattn::ops::attention::partition::segment_n_block_min_max_full_span<kBlockM, kBlockN>(
+                      n_block_min, n_block_max, range_m, seqlen_info.seqlen_q, seqlen_info.seqlen_k,
+                      params.k_segment_len,
+                      params.segment_spans[bidb * ((seqlen_info.seqlen_q + kBlockM - 1) / kBlockM) + range_m])
+                : SegmentPartition::fwd_n_block_range_full(
+                      n_block_min, n_block_max, range_m, seqlen_info.seqlen_q, seqlen_info.seqlen_k,
+                      params.q_segment_idx, params.k_segment_idx, params.k_segment_len, bidb);
+            n_block_min = get<0>(segment_n_block_min_max);
+            n_block_max = get<1>(segment_n_block_min_max);
+            // The full range is in range_m rows; the mask classifies m_block.
+            if (range_m == m_block) {
+                segment_full_min = get<2>(segment_n_block_min_max);
+                segment_full_max = get<3>(segment_n_block_min_max);
+            }
+        } else if constexpr (Has_segment) {
             auto segment_n_block_min_max = SegmentPartition::fwd_n_block_range(
                 n_block_min, n_block_max, range_m, seqlen_info.seqlen_q, seqlen_info.seqlen_k,
                 params.q_segment_idx, params.k_segment_idx, params.k_segment_len, bidb);
@@ -1267,7 +1307,7 @@ struct CollectiveMainloopFwdSm90 {
             Is_sliding_chunk, kBlockM, kBlockN, PackGQA,
             TiledMmaQK, false,
             Has_segment, false, Is_sliding_chunk, Has_segment,
-            SoftDeltaBranchPairMask ? kLogicalBlockM : 0> mask(
+            SoftDeltaBranchPairMask ? kLogicalBlockM : 0, SegmentTileRanges> mask(
             thread_idx, mask_seqlen_q, seqlen_k, params.window_size_left, params.window_size_right, 0 /*sink_token_length*/,
             params.attention_chunk_divmod, params.qhead_per_khead_divmod,
             Has_segment ? params.q_segment_idx : nullptr,
@@ -1279,6 +1319,11 @@ struct CollectiveMainloopFwdSm90 {
             params.reset_attention_chunk_divmod,
             softdelta_branch ? -1 : 0
         );
+        if constexpr (SegmentTileRanges) {
+            mask.segment_full_min = segment_full_min;
+            mask.segment_full_max = segment_full_max;
+            mask.segment_rows = range_m == m_block ? params.segment_rows : nullptr;
+        }
 
         float softcap_val = params.softcap_val;
         if constexpr (Has_softcap && Is_FP8) {
@@ -1379,7 +1424,7 @@ struct CollectiveMainloopFwdSm90 {
                 mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(
                     tSrS, m_block, n_block);
             }
-            if constexpr (Has_segment) { mask.apply_segment(tSrS, m_block, n_block); }
+            if constexpr (SegmentRowIntervals) { mask.apply_segment_rows(tSrS, m_block, n_block); } else if constexpr (Has_segment) { mask.apply_segment(tSrS, m_block, n_block); }
 
             Tensor scores_scale = softmax.template max_get_scale</*Is_first=*/true, /*Check_inf=*/true>(tSrS);
             // WG1 uses an implicit unit scale for LargeHeadDimV.
@@ -1451,7 +1496,7 @@ struct CollectiveMainloopFwdSm90 {
                         mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>(
                             tSrS, m_block, n_block);
                     }
-                    if constexpr (Has_segment) { mask.apply_segment(tSrS, m_block, n_block); }
+                    if constexpr (SegmentRowIntervals) { mask.apply_segment_rows(tSrS, m_block, n_block); } else if constexpr (Has_segment) { mask.apply_segment(tSrS, m_block, n_block); }
                 };
                 int const n_block_min_causal_local_mask = AttentionRange::right_boundary_n_block_min(
                     seqlen_info, m_block, n_block_min, params.window_size_right,
@@ -1472,7 +1517,7 @@ struct CollectiveMainloopFwdSm90 {
                 params.get_chunk_position_offset(
                     bidb, seqlen_q, seqlen_k));
             auto no_mask_fn = [&](auto& tSrS, int n_block) {
-                if constexpr (Has_segment) { mask.apply_segment(tSrS, m_block, n_block); }
+                if constexpr (SegmentRowIntervals) { mask.apply_segment_rows(tSrS, m_block, n_block); } else if constexpr (Has_segment) { mask.apply_segment(tSrS, m_block, n_block); }
             };
             #pragma unroll 1
             for (; n_block >= n_block_min_before_local_mask; --n_block) {
@@ -1492,7 +1537,7 @@ struct CollectiveMainloopFwdSm90 {
                         mask.template apply<false /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(
                             tSrS, m_block, n_block);
                     }
-                    if constexpr (Has_segment) { mask.apply_segment(tSrS, m_block, n_block); }
+                    if constexpr (SegmentRowIntervals) { mask.apply_segment_rows(tSrS, m_block, n_block); } else if constexpr (Has_segment) { mask.apply_segment(tSrS, m_block, n_block); }
                 };
                 #pragma unroll 1
                 for (; n_block >= n_block_min; --n_block) {
@@ -1583,7 +1628,7 @@ struct CollectiveMainloopFwdSm90 {
                     mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(
                         tSrS, m_block, n_block);
                 }
-                if constexpr (Has_segment) { mask.apply_segment(tSrS, m_block, n_block); }
+                if constexpr (SegmentRowIntervals) { mask.apply_segment_rows(tSrS, m_block, n_block); } else if constexpr (Has_segment) { mask.apply_segment(tSrS, m_block, n_block); }
             };
             fwd_step(n_block, first_iter_mask_fn, cute::true_type{} /*is_first_iter*/, cute::true_type{} /*check_inf*/);
             --n_block;
@@ -1601,7 +1646,7 @@ struct CollectiveMainloopFwdSm90 {
                         mask.template apply<false /*Seqlenk_mask*/, Is_causal, Is_local>(
                             tSrS, m_block, n_block);
                     }
-                    if constexpr (Has_segment) { mask.apply_segment(tSrS, m_block, n_block); }
+                    if constexpr (SegmentRowIntervals) { mask.apply_segment_rows(tSrS, m_block, n_block); } else if constexpr (Has_segment) { mask.apply_segment(tSrS, m_block, n_block); }
                 };
                 int const n_block_min_causal_local_mask = AttentionRange::right_boundary_n_block_min(
                     seqlen_info, m_block, n_block_min, params.window_size_right,
@@ -1621,7 +1666,7 @@ struct CollectiveMainloopFwdSm90 {
                 params.get_chunk_position_offset(
                     bidb, seqlen_q, seqlen_k));
             auto no_mask_fn = [&](auto& tSrS, int n_block) {
-                if constexpr (Has_segment) { mask.apply_segment(tSrS, m_block, n_block); }
+                if constexpr (SegmentRowIntervals) { mask.apply_segment_rows(tSrS, m_block, n_block); } else if constexpr (Has_segment) { mask.apply_segment(tSrS, m_block, n_block); }
             };
             #pragma unroll 1
             for (; n_block >= n_block_min_before_local_mask; --n_block) {
@@ -1641,7 +1686,7 @@ struct CollectiveMainloopFwdSm90 {
                         mask.template apply<false /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(
                             tSrS, m_block, n_block);
                     }
-                    if constexpr (Has_segment) { mask.apply_segment(tSrS, m_block, n_block); }
+                    if constexpr (SegmentRowIntervals) { mask.apply_segment_rows(tSrS, m_block, n_block); } else if constexpr (Has_segment) { mask.apply_segment(tSrS, m_block, n_block); }
                 };
                 #pragma unroll 1
                 for (; n_block >= n_block_min; --n_block) {

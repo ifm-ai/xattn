@@ -33,6 +33,47 @@ namespace flash {
 
 using namespace cute;
 
+// Vector butterfly: each lane holds R per-row partials; L lanes (bits
+// First, 2*First, ...) share every row. After the call slot k < max(R/L, 1)
+// holds the complete sum of row hp_butterfly_index(lane, k).
+template <int Count, int Offset, int End, int R, class T>
+CUTLASS_DEVICE void hp_butterfly(T (&v)[R], int lane) {
+    if constexpr (Offset < End) {
+        bool const upper = lane & Offset;
+        if constexpr (Count > 1) {
+            constexpr int H = Count / 2;
+            #pragma unroll
+            for (int i = 0; i < H; ++i) {
+                T const send = upper ? v[i] : v[i + H];
+                T const keep = upper ? v[i + H] : v[i];
+                v[i] = keep + __shfl_xor_sync(0xffffffffu, send, Offset);
+            }
+            hp_butterfly<H, Offset * 2, End>(v, lane);
+        } else {
+            v[0] += __shfl_xor_sync(0xffffffffu, v[0], Offset);
+            hp_butterfly<1, Offset * 2, End>(v, lane);
+        }
+    }
+}
+template <int Count, int Offset, int End>
+CUTLASS_DEVICE int hp_butterfly_index(int lane, int k) {
+    if constexpr (Offset < End && Count > 1) {
+        return (lane & Offset ? Count / 2 : 0) + hp_butterfly_index<Count / 2, Offset * 2, End>(lane, k);
+    } else {
+        return k;
+    }
+}
+// Lanes past the halving levels hold duplicate sums; only bit-0 lanes own them.
+template <int Count, int Offset, int End>
+CUTLASS_DEVICE bool hp_butterfly_owner(int lane) {
+    if constexpr (Offset < End) {
+        if constexpr (Count > 1) return hp_butterfly_owner<Count / 2, Offset * 2, End>(lane);
+        else return !(lane & Offset) && hp_butterfly_owner<1, Offset * 2, End>(lane);
+    } else {
+        return true;
+    }
+}
+
 template <int Stages, int Stages_dO, int Stages_dS, class ClusterShape_, class TileShape_MNK_, int kHeadDimV_, class Element_, class ElementAccum_, class ArchTag_,
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool Deterministic, bool HasSegment_,
         bool IsSlidingChunk_, bool SdP_swapAB_, bool dKV_swapAB_, bool dQ_swapAB_,
@@ -42,7 +83,8 @@ template <int Stages, int Stages_dO, int Stages_dS, class ClusterShape_, class T
         bool DirectChunkTile_=IsSlidingChunk_,
         bool HeadPairParallel_=false,
         bool HeadPairClusterKVReuse_=false,
-        bool HeadPairPrivateKVGrad_=false, bool SplitDQ_=false, int PrecisionLevel_=0>
+        bool HeadPairPrivateKVGrad_=false, bool SplitDQ_=false, int PrecisionLevel_=0,
+        bool StageDqExp_=true>
 struct CollectiveMainloopBwdSm90 {
 
     static constexpr int PrecisionLevel = PrecisionLevel_;
@@ -65,6 +107,32 @@ struct CollectiveMainloopBwdSm90 {
     static constexpr bool Varlen = Varlen_;
     static constexpr bool Has_segment = HasSegment_;
     static constexpr bool Is_sliding_chunk = IsSlidingChunk_;
+    // Segment kernels without SCA reset mask from the launcher's interval
+    // pre-pass instead of loading int64 ids per element.
+    static constexpr bool SegmentIntervals = HasSegment_ && !IsSlidingChunk_;
+
+    // Segment interval kernels: m blocks [lo, hi) that are full tiles for this
+    // key tile (all keys and all queries in one segment); empty otherwise.
+    template <class ParamsT>
+    CUTLASS_DEVICE static cute::tuple<int, int> segment_full_m_range(
+            ParamsT const& params, int const n_block, int const bidb,
+            int const seqlen_q, int const seqlen_k) {
+        if constexpr (SegmentIntervals) {
+            constexpr int kBM = get<0>(TileShape_MNK{});
+            constexpr int kBN = get<1>(TileShape_MNK{});
+            int const k_segment_offset = params.k_segment_len == seqlen_k ? 0 : params.k_segment_len - seqlen_q;
+            int const k_start = n_block * kBN;
+            int const k_end = k_start + kBN < seqlen_k ? k_start + kBN : seqlen_k;
+            int const s0 = k_segment_offset + k_start, s1 = k_segment_offset + k_end - 1;
+            if (k_start >= k_end || s0 < 0 || s1 >= params.k_segment_len) { return {0, 0}; }
+            int64_t const* const k_base = params.k_segment_idx + int64_t(bidb) * params.k_segment_len;
+            if (k_base[s0] != k_base[s1]) { return {0, 0}; }
+            int2 const r = params.segment_key_intervals[int64_t(bidb) * seqlen_k + k_start];
+            return {(r.x + kBM - 1) / kBM, r.y == seqlen_q ? (seqlen_q + kBM - 1) / kBM : r.y / kBM};
+        } else {
+            return {0, 0};
+        }
+    }
     static constexpr bool TwoComponentDV = TwoComponentDV_;
     static constexpr bool ReaderPairKVReuse = ReaderPairKVReuse_;
     static constexpr bool HeadPairParallel = HeadPairParallel_;
@@ -354,6 +422,15 @@ struct CollectiveMainloopBwdSm90 {
     static constexpr uint32_t TmaTransactionBytesK = static_cast<uint32_t>(size(SmemLayoutK{}) * cutlass::sizeof_bits_v<Element> / 8);
     static constexpr uint32_t TmaTransactionBytesV = static_cast<uint32_t>(size(SmemLayoutV{}) * cutlass::sizeof_bits_v<Element> / 8);
     static constexpr uint32_t TmaTransactionBytesLSE = static_cast<uint32_t>(size(select<0>(SmemLayoutLSE{})) * cutlass::sizeof_bits_v<ElementAccum> / 8);
+    // Advanced precision stages each row's raw maximum with Q, and its
+    // anchored dP (plus the level-4 dO scale) with dO, via the LSE bulk copy.
+    static constexpr bool HPStageRows = PrecisionLevel >= 2;
+    // Low-precision deterministic dQ (D <= 128, D = V = 192; must match the
+    // launcher): order-free int32 sums on a per-row grid.
+    static constexpr bool kFixedDQ = Deterministic && PrecisionLevel < 2 &&
+        (kHeadDim <= 128 || (kHeadDim == 192 && kHeadDimV_ == 192));
+    static constexpr uint32_t TmaTransactionBytesHPdO =
+        HPStageRows ? (PrecisionLevel == 4 ? 2 : 1) * TmaTransactionBytesLSE : 0;
 
     // Clustered paired readers keep one K/V tile per CTA and use one pipeline
     // stage. Owner-ranked K and V pipelines arm every multicast destination
@@ -410,7 +487,7 @@ struct CollectiveMainloopBwdSm90 {
         Mma_dKV_is_RS || !TwoComponentDV,
         cute::array<Element, 0>,
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutPdS>, SmemAlignmentP>>;
-    struct TensorStorage : cute::aligned_struct<cute::max(SmemAlignmentP, SmemAlignmentdS, SmemAlignmentQKVdO)> {
+    struct TensorStorageLP : cute::aligned_struct<cute::max(SmemAlignmentP, SmemAlignmentdS, SmemAlignmentQKVdO)> {
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutK>, SmemAlignmentQKVdO> smem_k;
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutV>, SmemAlignmentV> smem_v;
         SmemdQacc_t smem_dqacc;
@@ -422,6 +499,25 @@ struct CollectiveMainloopBwdSm90 {
         SmemPResidual_t smem_p_residual;
         cute::array_aligned<Element, cute::cosize_v<SmemLayoutPdS>, SmemAlignmentdS> smem_ds;
     };
+    struct TensorStorageHP : TensorStorageLP {
+        cute::array_aligned<ElementAccum, cute::cosize_v<SmemLayoutLSE>, 128> smem_hpmax;
+        cute::array_aligned<ElementAccum, cute::cosize_v<SmemLayoutLSE>, 128> smem_hpanchor;
+        cute::array_aligned<ElementAccum, PrecisionLevel == 4 ? cute::cosize_v<SmemLayoutLSE> : 1, 128> smem_hpscale;
+        cute::array_aligned<ElementAccum, PrecisionLevel == 4 ? cute::cosize_v<SmemLayoutLSE> : 1, 128> smem_hpanchoridx;
+    };
+    // Low-precision deterministic dQ: one staged row array (fixed-point exponents).
+    struct TensorStorageFixedDQ : TensorStorageLP {
+        cute::array_aligned<ElementAccum, cute::cosize_v<SmemLayoutLSE>, 128> smem_hpmax;
+    };
+    // Fixed-point dQ row exponents are staged with Q unless the launcher
+    // finds that the kernel's shared storage would exceed the opt-in limit;
+    // then each MMA thread prefetches its rows from global memory at the
+    // start of the step.
+    static constexpr bool kStageDqExp = kFixedDQ && StageDqExp_;
+    using TensorStorage = std::conditional_t<HPStageRows, TensorStorageHP,
+        std::conditional_t<kStageDqExp, TensorStorageFixedDQ, TensorStorageLP>>;
+    static constexpr uint32_t TmaTransactionBytesHPQ = HPStageRows ? (PrecisionLevel == 4 ? 2 : 1) * TmaTransactionBytesLSE
+        : (kStageDqExp ? TmaTransactionBytesLSE : 0);
 
     // Host side kernel arguments
     struct Arguments {
@@ -468,6 +564,14 @@ struct CollectiveMainloopBwdSm90 {
         int64_t const dq_slot_stride = 0;
         float* hp_rho = nullptr;
         float* hp_mass = nullptr;
+        float const* hp_row_max = nullptr;
+        float const* hp_row_anchor = nullptr;
+        float const* hp_row_scale = nullptr;
+        float const* hp_row_anchor_index = nullptr;
+        int const* hp_rho_exponent = nullptr;
+        int const* dq_exponent = nullptr;
+        int2 const* segment_query_intervals = nullptr;
+        int2 const* segment_key_intervals = nullptr;
     };
 
     // Device side kernel params
@@ -513,6 +617,14 @@ struct CollectiveMainloopBwdSm90 {
         int64_t const dq_slot_stride = 0;
         float* hp_rho = nullptr;
         float* hp_mass = nullptr;
+        float const* hp_row_max = nullptr;
+        float const* hp_row_anchor = nullptr;
+        float const* hp_row_scale = nullptr;
+        float const* hp_row_anchor_index = nullptr;
+        int const* hp_rho_exponent = nullptr;
+        int const* dq_exponent = nullptr;
+        int2 const* segment_query_intervals = nullptr;
+        int2 const* segment_key_intervals = nullptr;
 
         CUTLASS_DEVICE
         int get_chunk_position_offset(
@@ -565,7 +677,7 @@ struct CollectiveMainloopBwdSm90 {
             TileShape_MNK_V{},
             TmaCopyClusterShape{});
         if constexpr (Deterministic) { assert(args.dq_semaphore != nullptr); }
-        if constexpr (Deterministic && Has_segment) {
+        if constexpr (Deterministic && !kFixedDQ && Has_segment) {
             assert(args.deterministic_segment_ranges != nullptr);
         }
         // Avoid dividing by zero
@@ -595,7 +707,10 @@ struct CollectiveMainloopBwdSm90 {
                 reset_attention_chunk_divmod,
                 args.deterministic_segment_ranges,
                 args.odd_head_window_right_delta,
-                args.dq_slots, args.dq_slot_stride, args.hp_rho, args.hp_mass};
+                args.dq_slots, args.dq_slot_stride, args.hp_rho, args.hp_mass,
+                args.hp_row_max, args.hp_row_anchor, args.hp_row_scale, args.hp_row_anchor_index,
+                args.hp_rho_exponent, args.dq_exponent,
+                args.segment_query_intervals, args.segment_key_intervals};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -820,6 +935,23 @@ struct CollectiveMainloopBwdSm90 {
                              *pipeline_q.producer_get_barrier(smem_pipe_write)),
                          gLSE(_, m_block),
                          sLSE(_, smem_pipe_write.index()));
+                    if constexpr (kStageDqExp) {
+                        Tensor mExp = make_tensor(
+                            make_gmem_ptr(reinterpret_cast<float const*>(params.dq_exponent)),
+                            params.shape_LSE, params.stride_LSE_log2)(
+                                _, q_head, !is_varlen_q ? bidb : 0);
+                        Tensor gExp = local_tile(
+                            domain_offset(
+                                make_coord(seqlen_info.offset_q_padded), mExp),
+                            select<0>(TileShape_MNK{}), make_coord(_));
+                        Tensor sExp = make_tensor(
+                            make_smem_ptr(shared_storage.tensors.mainloop.smem_hpmax.data()),
+                            SmemLayoutLSE{});
+                        copy(bulk_copy.with(
+                                 *pipeline_q.producer_get_barrier(smem_pipe_write)),
+                             gExp(_, m_block),
+                             sExp(_, smem_pipe_write.index()));
+                    }
 
                     PipelineState_dO smem_pipe_write_do_cur =
                         cute::conditional_return<Q_dO_same_stages>(
@@ -943,6 +1075,33 @@ struct CollectiveMainloopBwdSm90 {
             params.tma_load_V, _0{}, Layout<_1>{},
             group_modes<0, 2>(sV_x), group_modes<0, 2>(gV_x));
         auto bulk_copy = Copy_Traits<SM90_BULK_COPY_AUTO>{};
+        auto hp_rows = [&](float const* ptr) {
+            Tensor m = make_tensor(make_gmem_ptr(ptr), params.shape_LSE, params.stride_LSE_log2)(_, bidh, !is_varlen_q ? bidb : 0);
+            return local_tile(domain_offset(make_coord(seqlen_info.offset_q_padded), m), select<0>(TileShape_MNK{}), make_coord(_));
+        };
+        auto copy_hp_q = [&](auto& barrier, int m_block_, int stage) {
+            if constexpr (HPStageRows) {
+                Tensor sHP = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_hpmax.data()), SmemLayoutLSE{});
+                copy(bulk_copy.with(barrier), hp_rows(params.hp_row_max)(_, m_block_), sHP(_, stage));
+                if constexpr (PrecisionLevel == 4) {
+                    Tensor sIdx = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_hpanchoridx.data()), SmemLayoutLSE{});
+                    copy(bulk_copy.with(barrier), hp_rows(params.hp_row_anchor_index)(_, m_block_), sIdx(_, stage));
+                }
+            } else if constexpr (kStageDqExp) {
+                Tensor sExp = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_hpmax.data()), SmemLayoutLSE{});
+                copy(bulk_copy.with(barrier), hp_rows(reinterpret_cast<float const*>(params.dq_exponent))(_, m_block_), sExp(_, stage));
+            }
+        };
+        auto copy_hp_do = [&](auto& barrier, int m_block_, int stage) {
+            if constexpr (HPStageRows) {
+                Tensor sHP = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_hpanchor.data()), SmemLayoutLSE{});
+                copy(bulk_copy.with(barrier), hp_rows(params.hp_row_anchor)(_, m_block_), sHP(_, stage));
+                if constexpr (PrecisionLevel == 4) {
+                    Tensor sScale = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_hpscale.data()), SmemLayoutLSE{});
+                    copy(bulk_copy.with(barrier), hp_rows(params.hp_row_scale)(_, m_block_), sScale(_, stage));
+                }
+            }
+        };
 
         uint16_t mcast_mask_qdo = 0;
         if constexpr (cute::is_same_v<GmemTiledCopyQdO, SM90_TMA_LOAD_MULTICAST>) {
@@ -970,6 +1129,7 @@ struct CollectiveMainloopBwdSm90 {
                  tQgQ(_, m_block), tQsQ(_, smem_pipe_write.index()));
             copy(bulk_copy.with(*pipeline_q.producer_get_barrier(smem_pipe_write)),
                  gLSE(_, m_block), sLSE(_, smem_pipe_write.index()));
+            copy_hp_q(*pipeline_q.producer_get_barrier(smem_pipe_write), m_block, smem_pipe_write.index());
         }
 
         if (lane_predicate) {
@@ -1018,6 +1178,7 @@ struct CollectiveMainloopBwdSm90 {
                      tdOgdO(_, m_block), tdOsdO(_, smem_pipe_write_do_cur.index()));
                 copy(bulk_copy.with(*pipeline_do.producer_get_barrier(smem_pipe_write_do_cur)),
                      gdPsum(_, m_block), sdPsum(_, smem_pipe_write_do_cur.index()));
+                copy_hp_do(*pipeline_do.producer_get_barrier(smem_pipe_write_do_cur), m_block, smem_pipe_write_do_cur.index());
                 if constexpr (!Q_dO_same_stages) { ++smem_pipe_write_do; }
                 ++smem_pipe_write;
                 pipeline_q.producer_acquire(smem_pipe_write);
@@ -1025,6 +1186,7 @@ struct CollectiveMainloopBwdSm90 {
                      tQgQ(_, m_block + 1), tQsQ(_, smem_pipe_write.index()));
                 copy(bulk_copy.with(*pipeline_q.producer_get_barrier(smem_pipe_write)),
                      gLSE(_, m_block + 1), sLSE(_, smem_pipe_write.index()));
+                copy_hp_q(*pipeline_q.producer_get_barrier(smem_pipe_write), m_block + 1, smem_pipe_write.index());
             }
         }
         scheduler_prefetch();
@@ -1035,6 +1197,7 @@ struct CollectiveMainloopBwdSm90 {
                  tdOgdO(_, m_block), tdOsdO(_, smem_pipe_write_do_cur.index()));
             copy(bulk_copy.with(*pipeline_do.producer_get_barrier(smem_pipe_write_do_cur)),
                  gdPsum(_, m_block), sdPsum(_, smem_pipe_write_do_cur.index()));
+            copy_hp_do(*pipeline_do.producer_get_barrier(smem_pipe_write_do_cur), m_block, smem_pipe_write_do_cur.index());
             if constexpr (!Q_dO_same_stages) { ++smem_pipe_write_do; }
             ++smem_pipe_write;
         }
@@ -1102,7 +1265,7 @@ struct CollectiveMainloopBwdSm90 {
         // n-block range, but the segment path compresses that order below and
         // can skip empty ranges entirely.
         if constexpr ((Is_causal || Is_local || Varlen) &&
-                      !(Is_local && Deterministic && !Has_segment)) {
+                      !(Is_local && Deterministic && !kFixedDQ && !Has_segment)) {
             if (m_block_max <= m_block_min) { return; }
         }
 
@@ -1131,7 +1294,7 @@ struct CollectiveMainloopBwdSm90 {
                 cute::ceil_div(seqlen_info.seqlen_k, kBlockNStore);
             #pragma unroll 2
             for (int m_block = m_block_min; m_block < m_block_max; ++m_block) {
-                if constexpr (Deterministic) {
+                if constexpr (Deterministic && !kFixedDQ) {
                     if constexpr(Is_causal) {
                         int const n_block_max_for_m_block = std::min(
                             n_block_global_max,
@@ -1159,7 +1322,7 @@ struct CollectiveMainloopBwdSm90 {
                         static_cast<uint32_t>(AttentionBwdNamedBarrier::dQFullWG1) +
                             warpgroup_idx);
                     if (lane_predicate) {
-                        SM90_BULK_REDUCE_ADD::copy(
+                        std::conditional_t<kFixedDQ, SM90_BULK_REDUCE_ADD_S32, SM90_BULK_REDUCE_ADD>::copy(
                             raw_pointer_cast(sdQ(_, warpgroup_idx).data()),
                             raw_pointer_cast(
                                 gdQaccum(_, warpgroup_idx, m_block).data()),
@@ -1183,7 +1346,7 @@ struct CollectiveMainloopBwdSm90 {
                                 AttentionBwdNamedBarrier::dQEmptyWG1) +
                                 warpgroup_idx);
                     });
-                if constexpr (Deterministic) {
+                if constexpr (Deterministic && !kFixedDQ) {
                     Barrier::arrive_inc(
                         lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp,
                         m_block * num_batch * num_head);
@@ -1206,8 +1369,15 @@ struct CollectiveMainloopBwdSm90 {
                     bidb, seqlen_info.seqlen_q, seqlen_info.seqlen_k),
                 Has_segment ? params.q_chunk_positions : nullptr,
                 params.reset_attention_chunk_divmod);
+        auto const seg_full_range = segment_full_m_range(
+            params, n_block, bidb, seqlen_info.seqlen_q, seqlen_info.seqlen_k);
+        int const seg_full_lo = get<0>(seg_full_range);
+        int const seg_full_hi = get<1>(seg_full_range);
         auto segment_relation_for_m_block = [&](int const m_block_cur) {
             if constexpr (Has_segment) {
+                if (m_block_cur >= seg_full_lo && m_block_cur < seg_full_hi) {
+                    return int(SegmentPartition::kFull);
+                }
                 return segment_mask.segment_tile_relation_valid(
                     m_block_cur, n_block);
             } else {
@@ -1216,8 +1386,11 @@ struct CollectiveMainloopBwdSm90 {
         };
         constexpr int kBlockMStore = get<0>(TileShape_MNK{});
         constexpr int kBlockNStore = get<1>(TileShape_MNK{});
+        // Deterministic segment tiles arrive in ascending n_block order (the
+        // segment scheduler), so the dQ order comes from the per-m_block
+        // segment range for every visibility.
         auto deterministic_order_count_for_m_block = [&](int const m_block_cur) {
-            if constexpr (Is_local && Deterministic && Has_segment) {
+            if constexpr (Deterministic && Has_segment) {
                 int const num_m_blocks =
                     cute::ceil_div(seqlen_info.seqlen_q, kBlockMStore);
                 int const range_idx =
@@ -1273,7 +1446,7 @@ struct CollectiveMainloopBwdSm90 {
             }
             int deterministic_order = 0;
             int deterministic_count = 0;
-            if constexpr (Deterministic) {
+            if constexpr (Deterministic && !kFixedDQ) {
                 auto deterministic_order_count =
                     deterministic_order_count_for_m_block(m_block);
                 deterministic_order = get<0>(deterministic_order_count);
@@ -1289,7 +1462,7 @@ struct CollectiveMainloopBwdSm90 {
                     (!SplitDQ || params.dq_slots == 1) &&
                     !(Has_segment && deterministic_count <= 1);
                 if (needs_deterministic_sync) {
-                    if constexpr(Is_causal) {
+                    if constexpr (Is_causal && !Has_segment) {
                         int n_block_max_for_m_block = std::min(
                             n_block_global_max,
                             cute::ceil_div(
@@ -1313,7 +1486,7 @@ struct CollectiveMainloopBwdSm90 {
                 for (int warpgroup_idx = 0; warpgroup_idx < NumMmaWarpGroups; ++warpgroup_idx) {
                     cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(AttentionBwdNamedBarrier::dQFullWG1) + warpgroup_idx /*id*/);  // sdQ full, to be written to gmem
                     if (lane_predicate) {
-                        SM90_BULK_REDUCE_ADD::copy(raw_pointer_cast(sdQ(_, warpgroup_idx).data()), raw_pointer_cast(gdQaccum(_, warpgroup_idx, m_block).data()), dQ_TMA_num_bytes, static_cast<uint64_t>(TMA::CacheHintSm90::EVICT_LAST));
+                        std::conditional_t<kFixedDQ, SM90_BULK_REDUCE_ADD_S32, SM90_BULK_REDUCE_ADD>::copy(raw_pointer_cast(sdQ(_, warpgroup_idx).data()), raw_pointer_cast(gdQaccum(_, warpgroup_idx, m_block).data()), dQ_TMA_num_bytes, static_cast<uint64_t>(TMA::CacheHintSm90::EVICT_LAST));
                         tma_store_arrive();
                     }
                 }
@@ -1323,7 +1496,7 @@ struct CollectiveMainloopBwdSm90 {
                     cutlass::arch::NamedBarrier::arrive(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(AttentionBwdNamedBarrier::dQEmptyWG1) + warpgroup_idx /*id*/);  // sdQ empty, ready to be written to
                 });
             }
-            if constexpr (Deterministic) {
+            if constexpr (Deterministic && !kFixedDQ) {
                 bool const needs_deterministic_sync =
                     (!SplitDQ || params.dq_slots == 1) &&
                     !(Has_segment && deterministic_count <= 1);
@@ -1493,6 +1666,28 @@ struct CollectiveMainloopBwdSm90 {
             group_modes<0, 3>(thread_mma_SdP.partition_C(sdPsumMma)(make_coord(_, _0{}, _), _0{}, _, _)));
         // Distribute row statistics across eight threads.
         static constexpr int kStatsPerThread = cute::ceil_div(decltype(size(tLSEsLSE))::value, 8);
+        auto hp_stage = [&](auto ptr) {
+            Tensor sRows = make_tensor(make_smem_ptr(ptr), SmemLayoutLSEMma{});
+            return cute::conditional_return<!SdP_swapAB>(
+                group_modes<0, 2>(thread_mma_SdP.partition_C(sRows)(make_coord(_0{}, _, _0{}), _, _0{}, _)),
+                group_modes<0, 3>(thread_mma_SdP.partition_C(sRows)(make_coord(_, _0{}, _), _0{}, _, _)));
+        };
+        // Copy one staged row array into the LSE-shaped register fragment.
+        auto hp_read = [&](auto ptr, int stage) {
+            Tensor tS = hp_stage(ptr);
+            Tensor tR = cute::conditional_return<!ShuffleLSE>(make_fragment_like(tS(_, _0{})), make_tensor<ElementAccum>(Int<kStatsPerThread>{}));
+            if constexpr (!ShuffleLSE) {
+                cute::copy(tS(_, stage), tR);
+            } else {
+                #pragma unroll
+                for (int i = 0; i < kStatsPerThread; ++i) { tR(i) = tS((thread_idx % 32) / 4 + i * 8, stage); }
+            }
+            return tR;
+        };
+        auto hp_value = [&](auto const& tR, int mi) -> float {
+            if constexpr (!ShuffleLSE) return tR(mi);
+            else return __shfl_sync(0xffffffff, tR(mi / 8), (mi % 8) * 4 + (thread_idx % 4));
+        };
 
         auto consumer_wait = [](auto& pipeline, auto& smem_pipe_read) {
             auto barrier_token = pipeline.consumer_try_wait(smem_pipe_read);
@@ -1514,7 +1709,7 @@ struct CollectiveMainloopBwdSm90 {
             UseDirectChunkMask, kBlockM, kBlockN,
             false /*PackGQA*/, TiledMmaSdP,
             SdP_swapAB, Has_segment,
-            !Varlen && !Has_segment && !Deterministic &&
+            !Varlen && !Has_segment && (!Deterministic || kFixedDQ) &&
                 !SeparateMaskingIterations,
             UseDirectChunkTile> mask(
             thread_idx, seqlen_q, seqlen_k, params.window_size_left,
@@ -1529,6 +1724,14 @@ struct CollectiveMainloopBwdSm90 {
             Has_segment ? params.q_chunk_positions : nullptr,
             params.reset_attention_chunk_divmod
         );
+        if constexpr (SegmentIntervals) {
+            mask.segment_rows = params.segment_query_intervals;
+            mask.segment_key_rows = params.segment_key_intervals;
+        }
+        auto const seg_full_range = segment_full_m_range(
+            params, n_block, bidb, seqlen_q, seqlen_k);
+        int const seg_full_lo = get<0>(seg_full_range);
+        int const seg_full_hi = get<1>(seg_full_range);
 
         int m_block = m_block_min;
 
@@ -1556,10 +1759,39 @@ struct CollectiveMainloopBwdSm90 {
         }
 
         auto bwd_step = [&](int m_block, auto mask_fn) {
+            // Fixed-point dQ: accumulator rows of this thread (row factors are
+            // read from the Q-staged exponents at the conversion).
+            auto dq_row_coord = [&] {
+                if constexpr (kFixedDQ) {
+                    static_assert(!dQ_swapAB, "fixed-point dQ assumes the unswapped dQ accumulator");
+                    auto thr_mma_dQ = tiled_mma_dQ.get_thread_slice(thread_idx);
+                    Tensor cdQ = thr_mma_dQ.partition_C(make_identity_tensor(select<0, 2>(TileShape_MNK{})));
+                    return make_tensor(cdQ.data(), flash::convert_layout_acc_rowcol(cdQ.layout()));
+                } else {
+                    return 0;
+                }
+            }();
+            static constexpr int kDqRows = [] {
+                if constexpr (kFixedDQ) { return int(decltype(size<0>(dq_row_coord))::value); } else { return 1; }
+            }();
+            // Unstaged exponents: issue the global loads now so their latency
+            // hides behind the GEMMs.
+            [[maybe_unused]] int dq_exp_rows[kDqRows];
+            if constexpr (kFixedDQ && !kStageDqExp) {
+                int const rounded = get<0>(params.shape_dQaccum) / kHeadDim;
+                int const* const exp_row = params.dq_exponent
+                    + (int64_t(!(Varlen && params.cu_seqlens_q) ? bidb : 0) * get<1>(params.shape_dQaccum) + bidh) * rounded
+                    + seqlen_info.offset_q_padded + m_block * kBlockM;
+                #pragma unroll
+                for (int mi = 0; mi < kDqRows; ++mi) {
+                    asm volatile("ld.global.nc.b32 %0, [%1];" : "=r"(dq_exp_rows[mi]) : "l"(exp_row + int(get<0>(dq_row_coord(mi, 0)))));
+                }
+            }
             int segment_relation = SegmentPartition::kFull;
             if constexpr (Has_segment) {
-                segment_relation = mask.segment_tile_relation_valid(
-                    m_block, n_block);
+                segment_relation = m_block >= seg_full_lo && m_block < seg_full_hi
+                    ? int(SegmentPartition::kFull)
+                    : mask.segment_tile_relation_valid(m_block, n_block);
                 if (segment_relation == SegmentPartition::kNoOverlap) {
                     consumer_wait(pipeline_q, smem_pipe_read);
                     PipelineState_dO smem_pipe_read_do_cur = cute::conditional_return<Q_dO_same_stages>(smem_pipe_read, smem_pipe_read_do);
@@ -1596,20 +1828,24 @@ struct CollectiveMainloopBwdSm90 {
             // Apply dtanh before masking.
             auto dtanh = [&] { if constexpr (Has_softcap) return flash::calculate_dtanh(scores); else return nullptr; }();
             mask_fn(tSrS, m_block, segment_relation);
+            auto tHPrMax = [&] {
+                if constexpr (HPStageRows) return hp_read(shared_storage.tensors.mainloop.smem_hpmax.data(), smem_pipe_read.index());
+                else return 0;
+            }();
             #pragma unroll
             for (int mi = 0; mi < size<0>(scores); ++mi) {
                 float const lse_scaled = [&] {
                     if constexpr (!ShuffleLSE) return tLSErLSE(mi);
                     else return __shfl_sync(0xffffffff, tLSErLSE(mi / 8), (mi % 8) * 4 + (thread_idx % 4));
                 }();
+                float const hp_max = [&] {
+                    if constexpr (HPStageRows) return hp_value(tHPrMax, mi);
+                    else return 0.f;
+                }();
                 #pragma unroll
                 for (int ni = 0; ni < size<1>(scores); ++ni) {
                     if constexpr (PrecisionLevel >= 2) {
                     // Split maximum/log-normalizer avoids cancellation in reconstructed P.
-                    Tensor hp_coord = thread_mma_SdP.partition_C(make_identity_tensor(select<!SdP_swapAB ? 0 : 1, !SdP_swapAB ? 1 : 0>(TileShape_MNK{})));
-                    Tensor hp_rc = make_tensor(hp_coord.data(), flash::convert_layout_acc_rowcol<SdP_swapAB>(hp_coord.layout()));
-                    int hp_row = (SdP_swapAB ? int(get<1>(hp_rc(mi,0))) : int(get<0>(hp_rc(mi,0)))) + m_block*kBlockM;
-                    float hp_max = hp_row < seqlen_q ? params.hp_mass[(int64_t(bidb)*get<2>(params.shape_Q)+bidh)*seqlen_q+hp_row] : 0.f;
                     float shifted = __fmul_rn(__fsub_rn(scores(mi,ni), hp_max), params.softmax_scale_log2);
                     scores(mi, ni) = flash::attention_exp2f<UseFastExp2>(0.5f * (shifted - lse_scaled));
                     } else {
@@ -1632,24 +1868,35 @@ struct CollectiveMainloopBwdSm90 {
             warpgroup_wait<0>();
             // Reshape tdPrdP from ((2, 2, V), MMA_N, MMA_M) to (nrow=(2, V, MMA_M), ncol=(2, MMA_N))
             Tensor dS = make_tensor(tdPrdP.data(), scores.layout());
+            auto tHPrAnchor = [&] {
+                if constexpr (HPStageRows) return hp_read(shared_storage.tensors.mainloop.smem_hpanchor.data(), smem_pipe_read_do_cur.index());
+                else return 0;
+            }();
+            auto tHPrScale = [&] {
+                if constexpr (PrecisionLevel == 4) return hp_read(shared_storage.tensors.mainloop.smem_hpscale.data(), smem_pipe_read_do_cur.index());
+                else return 0;
+            }();
             #pragma unroll
             for (int mi = 0; mi < size<0>(dS); ++mi) {
                 float const dP_sum_cur = [&] {
                     if constexpr (!ShuffledPsum) return tLSErdPsum(mi);
                     else return __shfl_sync(0xffffffff, tLSErdPsum(mi / 8), (mi % 8) * 4 + (thread_idx % 4));
                 }();
+                float const hp_dp_anchor = [&] {
+                    if constexpr (HPStageRows) return hp_value(tHPrAnchor, mi);
+                    else return 0.f;
+                }();
+                // Levels 2/3 receive the exact unit scale; level 4 stages it.
+                float const row_scale = [&] {
+                    if constexpr (PrecisionLevel == 4) return hp_value(tHPrScale, mi);
+                    else return 1.f;
+                }();
                 #pragma unroll
                 for (int ni = 0; ni < size<1>(dS); ++ni) {
                     if constexpr (PrecisionLevel >= 2) {
-                    Tensor hp_coord = thread_mma_SdP.partition_C(make_identity_tensor(select<!SdP_swapAB ? 0 : 1, !SdP_swapAB ? 1 : 0>(TileShape_MNK{})));
-                    Tensor hp_rc = make_tensor(hp_coord.data(), flash::convert_layout_acc_rowcol<SdP_swapAB>(hp_coord.layout()));
-                    int hp_row = (SdP_swapAB ? int(get<1>(hp_rc(mi,0))) : int(get<0>(hp_rc(mi,0)))) + m_block*kBlockM;
-                    int64_t hp_base = int64_t(params.num_batch)*get<2>(params.shape_Q)*seqlen_q;
-                    float hp_dp_anchor = hp_row < seqlen_q ? params.hp_mass[hp_base+(int64_t(bidb)*get<2>(params.shape_Q)+bidh)*seqlen_q+hp_row] : 0.f;
                     // Staged sqrt(P) multiplication also protects level 2 tails
                     // from exp2 underflow before a large dP rescales them.
                     if constexpr (PrecisionLevel >= 2) {
-                    float row_scale = hp_row < seqlen_q ? params.hp_mass[2*hp_base+(int64_t(bidb)*get<2>(params.shape_Q)+bidh)*seqlen_q+hp_row] : 1.f;
                     dS(mi, ni) = __fmul_rn(scores(mi, ni), __fmul_rn(scores(mi, ni), (__fsub_rn(__fmul_rn(dS(mi, ni),row_scale), hp_dp_anchor) - dP_sum_cur)));
                     float scaled_root = __fmul_rn(scores(mi, ni), __int_as_float((__float_as_int(row_scale) >> 1) + 0x1fc00000));
                     scores(mi, ni) = __fmul_rn(scaled_root, scaled_root);
@@ -1696,57 +1943,103 @@ struct CollectiveMainloopBwdSm90 {
             }
             if constexpr (PrecisionLevel >= 3) {
             if (params.hp_rho != nullptr) {
+                // Row sums of the actual dS operand (level 4: hi+lo, P mass and
+                // anchor probability, unscaled) in FP64: each element is exact
+                // in FP32 (hi+lo, P hi+residual), so the FP64 sums are exact.
+                // Level 3 also sums dS^2, the rounding-variance weight of its
+                // zero-sum repair. A vector butterfly reduces all rows across
+                // the lanes sharing them in log2(L) levels.
                 Tensor coord = thread_mma_SdP.partition_C(make_identity_tensor(select<!SdP_swapAB ? 0 : 1, !SdP_swapAB ? 1 : 0>(TileShape_MNK{})));
                 Tensor rc = make_tensor(coord.data(), flash::convert_layout_acc_rowcol</*Transposed=*/SdP_swapAB>(coord.layout()));
                 Tensor hirow = make_tensor(rdS.data(), scores.layout());
                 Tensor lorow = make_tensor(rdSLo.data(), scores.layout());
                 Tensor prow = make_tensor(rP.data(), scores.layout());
                 Tensor plow = make_tensor(rPResidual.data(), scores.layout());
+                constexpr int R = decltype(size<0>(scores))::value;
+                constexpr int L = SdP_swapAB ? 8 : 4;
+                constexpr int First = SdP_swapAB ? 4 : 1;
+                static_assert((R & (R - 1)) == 0, "row partial count must be a power of two");
+                auto tHPrAnchorIdx = [&] {
+                    if constexpr (PrecisionLevel == 4) return hp_read(shared_storage.tensors.mainloop.smem_hpanchoridx.data(), smem_pipe_read.index());
+                    else return 0;
+                }();
+                double sr[R];
+                [[maybe_unused]] double s2[PrecisionLevel == 3 ? R : 1];
+                [[maybe_unused]] double pm[PrecisionLevel == 4 ? R : 1], pa[PrecisionLevel == 4 ? R : 1];
                 #pragma unroll
-                for (int mi = 0; mi < size<0>(scores); ++mi) {
-                    int row = (SdP_swapAB ? int(get<1>(rc(mi, 0))) : int(get<0>(rc(mi, 0)))) + m_block * kBlockM;
-                    double sr = 0.0, pm = 0.0, pa = 0.0;
-                    int64_t audit_count = int64_t(params.num_batch)*get<2>(params.shape_Q)*seqlen_q;
-                    int64_t audit_idx = (int64_t(bidb)*get<2>(params.shape_Q)+bidh)*seqlen_q+row;
-                    int audit_anchor = row < seqlen_q ? int(params.hp_mass[3*audit_count+audit_idx]) : 0;
+                for (int mi = 0; mi < R; ++mi) {
+                    sr[mi] = 0.0;
+                    if constexpr (PrecisionLevel == 3) { s2[mi] = 0.0; }
+                    if constexpr (PrecisionLevel == 4) { pm[mi] = 0.0; pa[mi] = 0.0; }
+                    [[maybe_unused]] float anchor_col = 0.f;
+                    if constexpr (PrecisionLevel == 4) { anchor_col = hp_value(tHPrAnchorIdx, mi); }
                     #pragma unroll
                     for (int ni = 0; ni < size<1>(scores); ++ni) {
-                        sr += static_cast<double>(static_cast<float>(hirow(mi, ni)));
+                        float h = static_cast<float>(hirow(mi, ni));
                         if constexpr (PrecisionLevel == 4) {
-                        pm += static_cast<double>(static_cast<float>(prow(mi, ni)));
+                            // hi + lo is exact in FP32, as is P hi + P residual.
+                            h += static_cast<float>(lorow(mi, ni));
+                            float pv = static_cast<float>(prow(mi, ni));
+                            if constexpr (TwoComponentDV) { pv += static_cast<float>(plow(mi, ni)); }
+                            pm[mi] += static_cast<double>(pv);
+                            int col = (SdP_swapAB ? int(get<0>(rc(mi, ni))) : int(get<1>(rc(mi, ni)))) + n_block * kBlockN;
+                            if (float(col) == anchor_col) { pa[mi] += static_cast<double>(pv); }
                         }
-                        if constexpr (TwoComponentDV) { pm += static_cast<double>(static_cast<float>(plow(mi, ni))); }
-                        if constexpr (PrecisionLevel == 4) { sr += static_cast<double>(static_cast<float>(lorow(mi, ni))); }
-                        if constexpr (PrecisionLevel == 4) {
-                        int col = (SdP_swapAB ? int(get<0>(rc(mi, ni))) : int(get<1>(rc(mi, ni)))) + n_block * kBlockN;
-                        double pv = static_cast<double>(static_cast<float>(prow(mi, ni)));
-                        if constexpr (TwoComponentDV) { pv += static_cast<double>(static_cast<float>(plow(mi, ni))); }
-                        if (col == audit_anchor) { pa += pv; }
-
-                        }
+                        sr[mi] += static_cast<double>(h);
+                        if constexpr (PrecisionLevel == 3) { s2[mi] += static_cast<double>(h) * static_cast<double>(h); }
                     }
-                    // GMMA C row layout: transposed rows share lanes spaced by 4;
-                    // non-transposed rows share groups of 4 consecutive lanes.
+                    if constexpr (PrecisionLevel == 4) {
+                        // Power-of-two inverse dO scale: exact unless underflow.
+                        double const inv_scale = __int_as_float(0x7f000000 - __float_as_int(hp_value(tHPrScale, mi)));
+                        pm[mi] *= inv_scale; pa[mi] *= inv_scale;
+                    }
+                }
+                int const lane = thread_idx % cutlass::NumThreadsPerWarp;
+                hp_butterfly<R, First, First * L>(sr, lane);
+                if constexpr (PrecisionLevel == 3) { hp_butterfly<R, First, First * L>(s2, lane); }
+                if constexpr (PrecisionLevel == 4) {
+                    hp_butterfly<R, First, First * L>(pm, lane);
+                    hp_butterfly<R, First, First * L>(pa, lane);
+                }
+                if (hp_butterfly_owner<R, First, First * L>(lane)) {
+                    int64_t const count = int64_t(params.num_batch) * get<2>(params.shape_Q) * seqlen_q;
+                    int64_t const base = (int64_t(bidb) * get<2>(params.shape_Q) + bidh) * seqlen_q;
+                    double* const rho = reinterpret_cast<double*>(params.hp_rho);
                     #pragma unroll
-                    for (int off = SdP_swapAB ? 4 : 1; off < (SdP_swapAB ? 32 : 4); off <<= 1) {
-                        sr += __shfl_xor_sync(0xffffffff, sr, off);
-                        if constexpr (PrecisionLevel == 4) {
-                        pm += __shfl_xor_sync(0xffffffff, pm, off);
-                        pa += __shfl_xor_sync(0xffffffff, pa, off);
+                    for (int k = 0; k < (R >= L ? R / L : 1); ++k) {
+                        int const target = hp_butterfly_index<R, First, First * L>(lane, k);
+                        int row = 0;
+                        #pragma unroll
+                        for (int mi = 0; mi < R; ++mi) {
+                            if (mi == target) { row = SdP_swapAB ? int(get<1>(rc(mi, 0))) : int(get<0>(rc(mi, 0))); }
                         }
-                    }
-                    if ((thread_idx & (SdP_swapAB ? 28 : 3)) == 0 && row < seqlen_q) {
-                        int64_t idx = (int64_t(bidb) * get<2>(params.shape_Q) + bidh) * seqlen_q + row;
-                        atomicAdd(reinterpret_cast<double*>(params.hp_rho) + idx, sr);
-                        if constexpr (PrecisionLevel == 4) {
-                        int64_t count = int64_t(params.num_batch)*get<2>(params.shape_Q)*seqlen_q;
-                        float row_scale = PrecisionLevel == 4 ? params.hp_mass[2*count+idx] : 1.f;
-                        atomicAdd(reinterpret_cast<double*>(params.hp_rho) + count + idx, pm * static_cast<double>(__int_as_float(0x7f000000 - __float_as_int(row_scale))));
-                        double invscale = static_cast<double>(__int_as_float(0x7f000000 - __float_as_int(row_scale)));
-                        atomicAdd(reinterpret_cast<double*>(params.hp_rho) + 3*count + idx, pa*invscale);
+                        row += m_block * kBlockM;
+                        if (row < seqlen_q) {
+                            if constexpr (Deterministic) {
+                                // Integer sums commute: each tile partial rounds once to
+                                // a fixed per-row grid (2^(e-62) for dS, 2^(2e-68) for
+                                // dS^2, 2^-60 for the P masses, which are at most ~1),
+                                // so the totals are bitwise reproducible under any CTA
+                                // order.
+                                auto* fixed = reinterpret_cast<unsigned long long*>(rho);
+                                int const e = params.hp_rho_exponent[base + row];
+                                atomicAdd(fixed + base + row, static_cast<unsigned long long>(__double2ll_rn(scalbn(sr[k], 62 - e))));
+                                if constexpr (PrecisionLevel == 3) {
+                                    atomicAdd(fixed + 2 * count + base + row, static_cast<unsigned long long>(__double2ll_rn(scalbn(s2[k], 68 - 2 * e))));
+                                }
+                                if constexpr (PrecisionLevel == 4) {
+                                    atomicAdd(fixed + count + base + row, static_cast<unsigned long long>(__double2ll_rn(scalbn(pm[k], 60))));
+                                    atomicAdd(fixed + 3 * count + base + row, static_cast<unsigned long long>(__double2ll_rn(scalbn(pa[k], 60))));
+                                }
+                            } else {
+                                atomicAdd(rho + base + row, sr[k]);
+                                if constexpr (PrecisionLevel == 3) { atomicAdd(rho + 2 * count + base + row, s2[k]); }
+                                if constexpr (PrecisionLevel == 4) {
+                                    atomicAdd(rho + count + base + row, pm[k]);
+                                    atomicAdd(rho + 3 * count + base + row, pa[k]);
+                                }
+                            }
                         }
-
-
                     }
                 }
             }
@@ -1817,6 +2110,30 @@ struct CollectiveMainloopBwdSm90 {
                 }
                 }
                 if constexpr (dQacc_use_TMA) {
+                    if constexpr (kFixedDQ) {
+                        // Round once onto the row grid 2^(e-30): |partial| < 2^e.
+                        Tensor dq_rc = make_tensor(tdQrdQ.data(), flash::convert_layout_acc_rowcol(tdQrdQ.layout()));
+                        float dq_factor[kDqRows];
+                        #pragma unroll
+                        for (int mi = 0; mi < kDqRows; ++mi) {
+                            int const e = [&] {
+                                if constexpr (kStageDqExp) {
+                                    Tensor sExp = make_tensor(make_smem_ptr(reinterpret_cast<int const*>(shared_storage.tensors.mainloop.smem_hpmax.data())), SmemLayoutLSE{});
+                                    return sExp(int(get<0>(dq_row_coord(mi, 0))), smem_pipe_read.index());
+                                } else {
+                                    return dq_exp_rows[mi];
+                                }
+                            }();
+                            dq_factor[mi] = __int_as_float((157 - e) << 23);
+                        }
+                        #pragma unroll
+                        for (int mi = 0; mi < kDqRows; ++mi) {
+                            #pragma unroll
+                            for (int ni = 0; ni < size<1>(dq_rc); ++ni) {
+                                dq_rc(mi, ni) = __int_as_float(__float2int_rn(dq_rc(mi, ni) * dq_factor[mi]));
+                            }
+                        }
+                    }
                     int const warp_group_idx = flash::canonical_warp_group_idx_nosync() - 1;
                     cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(AttentionBwdNamedBarrier::dQEmptyWG1) + warp_group_idx /*id*/);  // sdQ full, to be written to gmem
                     Tensor taccdQrdQ = r2s_thr_copy_dQaccum.retile_S(tdQrdQ);
@@ -1884,8 +2201,11 @@ struct CollectiveMainloopBwdSm90 {
             auto mask_fn = [&](auto& tSrS, int m_block, int segment_relation) {
                 mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block);
                 if constexpr (Has_segment) {
-                    mask.apply_segment(tSrS, m_block, n_block,
-                                       segment_relation);
+                    if constexpr (SegmentIntervals) {
+                        mask.apply_segment_intervals(tSrS, m_block, n_block, segment_relation);
+                    } else {
+                        mask.apply_segment(tSrS, m_block, n_block, segment_relation);
+                    }
                 }
             };
             static constexpr int kBlockM = get<0>(TileShape_MNK{});
@@ -1938,8 +2258,11 @@ struct CollectiveMainloopBwdSm90 {
         auto mask_fn = [&](auto& tSrS, int m_block, int segment_relation) {
             mask.template apply<true /*Seqlenk_mask*/, Is_causal && !SeparateMaskingIterations, Is_local && !SeparateMaskingIterations>(tSrS, m_block, n_block);
             if constexpr (Has_segment) {
-                mask.apply_segment(tSrS, m_block, n_block,
-                                   segment_relation);
+                if constexpr (SegmentIntervals) {
+                    mask.apply_segment_intervals(tSrS, m_block, n_block, segment_relation);
+                } else {
+                    mask.apply_segment(tSrS, m_block, n_block, segment_relation);
+                }
             }
         };
         CUTLASS_PRAGMA_NO_UNROLL
@@ -1951,8 +2274,11 @@ struct CollectiveMainloopBwdSm90 {
             auto mask_fn = [&](auto& tSrS, int m_block, int segment_relation) {
                 mask.template apply<true /*Seqlenk_mask*/, false /*Causal_mask*/, Is_local>(tSrS, m_block, n_block);
                 if constexpr (Has_segment) {
-                    mask.apply_segment(tSrS, m_block, n_block,
-                                       segment_relation);
+                    if constexpr (SegmentIntervals) {
+                        mask.apply_segment_intervals(tSrS, m_block, n_block, segment_relation);
+                    } else {
+                        mask.apply_segment(tSrS, m_block, n_block, segment_relation);
+                    }
                 }
             };
             CUTLASS_PRAGMA_NO_UNROLL

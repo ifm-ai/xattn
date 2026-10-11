@@ -1,4 +1,4 @@
-from typing import Dict, Optional, Sequence, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -196,88 +196,4 @@ def softdelta_fp64_oracle(
     output = read - torch.sigmoid(g) * past
     if return_aux:
         return output, read, past, inclusive, strict_past
-    return output
-
-
-def softdelta_causal_sampled_rows_fp64_oracle(
-    q: Tensor,
-    k: Tensor,
-    v: Tensor,
-    g: Tensor,
-    query_indices: Sequence[int],
-    *,
-    scale: Optional[float] = None,
-    return_aux: bool = False,
-):
-    """FP64 full-causal SoftDelta oracle for selected query rows."""
-    assert q.dtype == k.dtype == v.dtype == g.dtype
-    assert q.dim() == k.dim() == 4
-    assert v.dim() == g.dim() == 5
-    assert q.shape[0] == k.shape[0] == v.shape[0] == g.shape[0]
-    assert q.shape[1] == k.shape[1] == v.shape[1] == g.shape[1]
-    assert q.shape[2] % 2 == 0
-    logical_q_heads = q.shape[2] // 2
-    kv_heads = k.shape[2]
-    assert logical_q_heads % kv_heads == 0
-    assert v.shape[2] == kv_heads
-    assert g.shape[2] == logical_q_heads
-    assert g.shape[3] == v.shape[3] and g.shape[4] == 1
-
-    indices = tuple(int(index) for index in query_indices)
-    assert indices
-    assert len(indices) == len(set(indices))
-    assert all(0 <= index < q.shape[1] for index in indices)
-    resolved_scale = q.shape[-1] ** -0.5 if scale is None else float(scale)
-    flat_v = v.flatten(3)
-    read = torch.empty(
-        q.shape[0],
-        len(indices),
-        logical_q_heads,
-        flat_v.shape[-1],
-        dtype=torch.float64,
-        device=q.device,
-    )
-    past = torch.zeros_like(read)
-    q_heads_per_kv_head = logical_q_heads // kv_heads
-
-    for batch_index in range(q.shape[0]):
-        for q_head in range(logical_q_heads):
-            kv_head = q_head // q_heads_per_kv_head
-            k_head = k[batch_index, :, kv_head].double()
-            v_head = flat_v[batch_index, :, kv_head].double()
-            for sampled_row, query_index in enumerate(indices):
-                primary_scores = torch.mv(
-                    k_head[: query_index + 1],
-                    q[batch_index, query_index, 2 * q_head].double(),
-                ) * resolved_scale
-                primary_probability = torch.softmax(primary_scores, dim=0)
-                read[batch_index, sampled_row, q_head] = torch.mv(
-                    v_head[: query_index + 1].transpose(0, 1),
-                    primary_probability,
-                )
-                if query_index > 0:
-                    past_scores = torch.mv(
-                        k_head[:query_index],
-                        q[batch_index, query_index, 2 * q_head + 1].double(),
-                    ) * resolved_scale
-                    past_probability = torch.softmax(past_scores, dim=0)
-                    past[batch_index, sampled_row, q_head] = torch.mv(
-                        v_head[:query_index].transpose(0, 1),
-                        past_probability,
-                    )
-
-    output_shape = (
-        q.shape[0],
-        len(indices),
-        logical_q_heads,
-        v.shape[3],
-        v.shape[4],
-    )
-    read = read.reshape(output_shape)
-    past = past.reshape(output_shape)
-    index_tensor = torch.tensor(indices, device=g.device, dtype=torch.long)
-    sampled_gate = g.index_select(1, index_tensor).double()
-    output = read - torch.sigmoid(sampled_gate) * past
-    if return_aux:
-        return output, read, past
     return output

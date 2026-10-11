@@ -10,132 +10,10 @@ from ._segment_metadata import resolve_segment_indices, validate_segment_indices
 from ._attention_core import resolve_scale
 
 
-# Exact measured dense B1/N4096/Hq=Hkv4 cases where the original cache-free
-# owner kernel beats the padded cache by >3%. Other shapes retain the default.
-_UNCACHED_DETERMINISTIC_CASES = frozenset({
-    ('bf16', 32, 160, 1, 256, 3),
-    ('bf16', 32, 160, 1, 256, 4),
-    ('bf16', 32, 160, 1, 1024, 3),
-    ('bf16', 32, 160, 1, 1024, 4),
-    ('bf16', 32, 160, 2, 256, 3),
-    ('bf16', 32, 160, 2, 256, 4),
-    ('bf16', 32, 160, 2, 1024, 3),
-    ('bf16', 32, 160, 2, 1024, 4),
-    ('bf16', 32, 192, 1, 256, 3),
-    ('bf16', 32, 192, 1, 256, 4),
-    ('bf16', 32, 192, 1, 1024, 3),
-    ('bf16', 32, 192, 1, 1024, 4),
-    ('bf16', 32, 192, 2, 256, 3),
-    ('bf16', 32, 192, 2, 256, 4),
-    ('bf16', 32, 192, 2, 1024, 4),
-    ('bf16', 32, 256, 1, 256, 3),
-    ('bf16', 32, 256, 1, 256, 4),
-    ('bf16', 32, 256, 1, 1024, 4),
-    ('bf16', 64, 160, 1, 256, 3),
-    ('bf16', 64, 160, 1, 256, 4),
-    ('bf16', 64, 160, 1, 1024, 3),
-    ('bf16', 64, 160, 1, 1024, 4),
-    ('bf16', 64, 160, 2, 256, 3),
-    ('bf16', 64, 160, 2, 256, 4),
-    ('bf16', 64, 160, 2, 1024, 4),
-    ('bf16', 64, 192, 1, 256, 3),
-    ('bf16', 64, 192, 1, 256, 4),
-    ('bf16', 64, 192, 1, 1024, 3),
-    ('bf16', 64, 192, 1, 1024, 4),
-    ('bf16', 64, 192, 2, 256, 4),
-    ('bf16', 64, 256, 1, 256, 4),
-    ('bf16', 96, 160, 1, 256, 3),
-    ('bf16', 96, 160, 1, 256, 4),
-    ('bf16', 96, 160, 1, 1024, 3),
-    ('bf16', 96, 160, 1, 1024, 4),
-    ('bf16', 96, 160, 2, 256, 4),
-    ('bf16', 96, 192, 1, 256, 3),
-    ('bf16', 96, 192, 1, 256, 4),
-    ('bf16', 96, 192, 1, 1024, 4),
-    ('bf16', 128, 160, 1, 256, 4),
-    ('bf16', 128, 160, 1, 1024, 4),
-    ('bf16', 160, 32, 1, 256, 3),
-    ('bf16', 160, 32, 1, 256, 4),
-    ('bf16', 160, 32, 1, 1024, 3),
-    ('bf16', 160, 32, 1, 1024, 4),
-    ('bf16', 160, 32, 2, 256, 3),
-    ('bf16', 160, 32, 2, 256, 4),
-    ('bf16', 160, 32, 2, 1024, 4),
-    ('bf16', 160, 64, 1, 256, 3),
-    ('bf16', 160, 64, 1, 256, 4),
-    ('bf16', 160, 64, 1, 1024, 3),
-    ('bf16', 160, 64, 1, 1024, 4),
-    ('bf16', 160, 64, 2, 256, 3),
-    ('bf16', 160, 64, 2, 256, 4),
-    ('bf16', 160, 96, 1, 256, 3),
-    ('bf16', 160, 96, 1, 256, 4),
-    ('bf16', 160, 96, 1, 1024, 3),
-    ('bf16', 160, 96, 1, 1024, 4),
-    ('bf16', 160, 96, 2, 256, 4),
-    ('bf16', 160, 128, 1, 256, 4),
-    ('bf16', 160, 128, 1, 1024, 4),
-    ('bf16', 160, 160, 1, 256, 4),
-    ('bf16', 192, 32, 1, 256, 3),
-    ('bf16', 192, 32, 1, 256, 4),
-    ('bf16', 192, 32, 1, 1024, 3),
-    ('bf16', 192, 32, 1, 1024, 4),
-    ('bf16', 192, 32, 2, 256, 4),
-    ('bf16', 192, 64, 1, 256, 3),
-    ('bf16', 192, 64, 1, 256, 4),
-    ('bf16', 192, 64, 1, 1024, 4),
-    ('bf16', 192, 96, 1, 256, 4),
-    ('bf16', 192, 96, 1, 1024, 4),
-    ('bf16', 192, 128, 1, 256, 4),
-    ('bf16', 256, 32, 1, 256, 4),
-    ('bf16', 256, 32, 1, 1024, 4),
-    ('fp16', 32, 160, 1, 256, 3),
-    ('fp16', 32, 160, 1, 256, 4),
-    ('fp16', 32, 160, 1, 1024, 3),
-    ('fp16', 32, 160, 1, 1024, 4),
-    ('fp16', 32, 160, 2, 256, 3),
-    ('fp16', 32, 160, 2, 256, 4),
-    ('fp16', 32, 160, 2, 1024, 3),
-    ('fp16', 32, 160, 2, 1024, 4),
-    ('fp16', 32, 192, 1, 256, 3),
-    ('fp16', 32, 192, 1, 256, 4),
-    ('fp16', 32, 192, 1, 1024, 3),
-    ('fp16', 32, 192, 1, 1024, 4),
-    ('fp16', 32, 192, 2, 256, 3),
-    ('fp16', 32, 192, 2, 256, 4),
-    ('fp16', 32, 256, 1, 256, 4),
-    ('fp16', 64, 160, 1, 256, 3),
-    ('fp16', 64, 160, 1, 256, 4),
-    ('fp16', 64, 160, 1, 1024, 3),
-    ('fp16', 64, 160, 1, 1024, 4),
-    ('fp16', 64, 160, 2, 256, 3),
-    ('fp16', 64, 160, 2, 256, 4),
-    ('fp16', 64, 192, 1, 256, 3),
-    ('fp16', 64, 192, 1, 256, 4),
-    ('fp16', 64, 192, 1, 1024, 3),
-    ('fp16', 64, 192, 1, 1024, 4),
-    ('fp16', 96, 160, 1, 256, 3),
-    ('fp16', 96, 160, 1, 256, 4),
-    ('fp16', 96, 160, 1, 1024, 3),
-    ('fp16', 96, 160, 1, 1024, 4),
-    ('fp16', 96, 192, 1, 256, 4),
-    ('fp16', 160, 32, 1, 256, 3),
-    ('fp16', 160, 32, 1, 256, 4),
-    ('fp16', 160, 32, 1, 1024, 3),
-    ('fp16', 160, 32, 1, 1024, 4),
-    ('fp16', 160, 32, 2, 256, 3),
-    ('fp16', 160, 32, 2, 256, 4),
-    ('fp16', 160, 64, 1, 256, 3),
-    ('fp16', 160, 64, 1, 256, 4),
-    ('fp16', 160, 64, 1, 1024, 3),
-    ('fp16', 160, 64, 1, 1024, 4),
-    ('fp16', 160, 64, 2, 256, 4),
-    ('fp16', 160, 96, 1, 256, 4),
-    ('fp16', 160, 96, 1, 1024, 4),
-    ('fp16', 192, 32, 1, 256, 3),
-    ('fp16', 192, 32, 1, 256, 4),
-    ('fp16', 192, 32, 1, 1024, 4),
-    ('fp16', 192, 64, 1, 256, 4),
-})
+# Level 3/4 zero-sum repair spreads the non-anchor share of each row's dS
+# operand residual over its last ZERO_SUM_WINDOW admitted keys.
+ZERO_SUM_WINDOW = 64
+_PRESCALE_TARGET = 2.0 ** 13
 
 
 def _ops():
@@ -143,9 +21,8 @@ def _ops():
     ops = xattn_cuda.ops
     if not all(hasattr(ops, name) for name in (
             '_attention_precision_main_backward',
-            '_attention_precision_ordered_level2_backward',
-            '_attention_precision_uncached_deterministic_backward',
-            '_attention_precision_deterministic_backward',
+            '_attention_precision_zero_sum_repair',
+            '_attention_precision_ordered_backward',
             '_attention_precision_key_runs',
             '_attention_precision_enforce_constant_keys')):
         raise RuntimeError('high_precision_level >= 2 requires rebuilding the xattn SM90 CUDA extension')
@@ -236,43 +113,61 @@ def backward(dy, q, k, v, *, level, visibility, span=None, scale=None,
         right = torch.minimum(klo + local - int(strict), khi - 1).to(torch.int32)
     else:
         left = ((position // span - 1) * span).clamp_min(0)
+    exact = None
+    if qi is not None and q_positions is None:
+        # With nondecreasing key runs (always true for BOS masks) a query's
+        # segment support is the key run [first, last]; intersecting it with
+        # the visibility bounds makes them exact, so the row scans skip other
+        # segments and per-key segment tests. Other layouts keep the
+        # visibility bounds and the segment test. No host sync.
+        runs = (ki[:, 1:] >= ki[:, :-1]).all(dim=1, keepdim=True)
+        first = torch.searchsorted(ki, qi).to(torch.int32)
+        last = torch.searchsorted(ki, qi, right=True).to(torch.int32) - 1
+        left = torch.where(runs, torch.maximum(left, first), left)
+        right = torch.where(runs, torch.minimum(right, last), right)
+        exact = runs.to(torch.int32).reshape(b).contiguous()
     left, right = left.contiguous(), right.contiguous()
     ops = _ops()
     kc, _ = ops._attention_precision_center(kt)
     vc, _ = ops._attention_precision_center(vt)
-    delta, logz, metadata = ops._attention_precision_row_statistics(q, kc, vc, dy, left, right, qi, ki, scale)
+    dy, inverse_prescale = _prescale_fp16(dy, vc)
+    delta, logz, metadata = ops._attention_precision_row_statistics(q, kc, vc, dy, left, right, qi, ki, scale, exact)
     if level == 4:
         scaled_dy, factors = ops._attention_precision_scale_do(dy)
         metadata[2].copy_(factors)
     else:
         scaled_dy = dy
+    # Row statistics of the dS operand: sum (rho), P mass, sum of squares
+    # (level 3 only: the rounding-variance weight of the anchor share) and
+    # anchor probability mass.
     stats = torch.zeros((4, b, h, nq), dtype=torch.float64, device=q.device)
-    # Plane 2 stays reserved for workspace compatibility; no kernel consumes it.
-    if deterministic and level != 2:
-        det_backward = ops._attention_precision_deterministic_backward
-        if (b == 1 and nq == nk == 4096 and h == kt.shape[2] == 4
-                and previous == 0 and qi is None and not strict and not reset
-                and ('bf16' if q.dtype == torch.bfloat16 else 'fp16',
-                     q.shape[3], vt.shape[3], visibility, span, level)
-                in _UNCACHED_DETERMINISTIC_CASES):
-            det_backward = ops._attention_precision_uncached_deterministic_backward
-        dq, dk, dv = det_backward(
-            q, kc, vc, scaled_dy, delta, logz, stats, metadata, left, right,
-            qi, ki, scale, level)
+    variance = (stats[2], delta) if level == 3 else (None, None)
+    if deterministic:
+        # dS is in unscaled dO units: level 4's row scale cancels in-kernel.
+        exponent = _rho_exponent(dy, vc) if level >= 3 else None
+        dq, dk, dv = ops._attention_precision_ordered_backward(
+            q, kc, vc, scaled_dy, delta, logz, stats, metadata, qi, ki, q_positions,
+            scale, level, visibility, span or 0, strict, reset, exponent)
         if level >= 3:
+            _decode_fixed_statistics(stats, exponent, level)
+            # The uniform shares need no atomics; the anchor share left in
+            # stats[0] goes through the ordered repair below.
+            ops._attention_precision_zero_sum_repair(
+                q, kc, stats[0], metadata, logz, ki, ZERO_SUM_WINDOW, False, stats[0], dq, dk, scale,
+                *variance)
             # Stable order within each KV head makes anchor scatter reductions
             # independent of CTA scheduling without an N² workspace.
             order = torch.argsort(metadata[3].reshape(b, kt.shape[2], -1), dim=-1, stable=True)
             flags = ops._attention_precision_deterministic_repair(
                 q, kc, dy, stats, metadata, order, dq, dk, dv, scale, level)
     else:
-        main_backward = (ops._attention_precision_ordered_level2_backward
-                         if deterministic else ops._attention_precision_main_backward)
-        dq, dk, dv = main_backward(
+        dq, dk, dv = ops._attention_precision_main_backward(
             q, kc, vc, scaled_dy, delta, logz, stats, metadata, qi, ki, q_positions,
             scale, level, visibility, span or 0, strict, reset)
         if level >= 3:
-            ops._attention_precision_anchor_repair(q, kc, stats[0], metadata[3].to(torch.int32), dq, dk, scale)
+            ops._attention_precision_zero_sum_repair(
+                q, kc, stats[0], metadata, logz, ki, ZERO_SUM_WINDOW, True,
+                torch.empty_like(stats[0]), dq, dk, scale, *variance)
         if level == 4:
             flags = ops._attention_precision_probability_repair(dy, stats, metadata, dv)
     if level == 4:
@@ -284,8 +179,69 @@ def backward(dy, q, k, v, *, level, visibility, span=None, scale=None,
     # extra attention contraction or a guessed small-gradient threshold.
     key_runs = ops._attention_precision_key_runs(kt)
     ops._attention_precision_enforce_constant_keys(key_runs, metadata, dq)
+    if inverse_prescale is not None:
+        for x in (dq, dk, dv):
+            x.mul_(inverse_prescale)
     outputs = _restore_scale_gradients((dq, dk, dv), original_scale)
     return _finish(outputs, q.dtype, previous, return_fp32)
+
+
+def _power_of_two(exponent):
+    """Exact FP64 2**exponent for int64 exponents in the normal range."""
+    return ((exponent + 1023) << 52).view(torch.float64)
+
+
+def _rho_exponent(dy, vc):
+    """Per-row int32 [B,H,N] exponent e with sum_j |dS_ij| < 2^(e-3).
+
+    |dS_ij| <= P_ij (|dP_ij - dP_ia| + |D'_i|) <= 4 P_ij |dO_i| max_j |V_j|, and
+    2^(e-5) exceeds |dO_i| max|V_j|, so the deterministic kernel's int64 sums on
+    the 2^(e-62) grid (2^(2e-68) for sum_j dS_ij^2) cannot overflow. Finite
+    16-bit inputs give |e| < 300; the clamp keeps both grids normal FP64.
+    """
+    g = torch.linalg.vector_norm(dy, dim=-1, dtype=torch.float32).double()
+    w = torch.linalg.vector_norm(vc, dim=-1, dtype=torch.float32).amax().double() if vc.numel() else 0.0
+    bound = g * w
+    e = torch.frexp(bound)[1].long() + 5
+    e = torch.where(torch.isfinite(bound), e, torch.full_like(e, 300)).clamp(-300, 300)
+    return e.to(torch.int32).transpose(1, 2).contiguous()
+
+
+def _decode_fixed_statistics(stats, exponent, level):
+    """Convert the deterministic kernel's int64 planes back to FP64 in place."""
+    fixed = stats.view(torch.int64)
+    rho = fixed[0].double() * _power_of_two(exponent.long() - 62)
+    if level == 3:
+        stats[2].copy_(fixed[2].double() * _power_of_two(2 * exponent.long() - 68))
+    if level == 4:
+        stats[1].copy_(fixed[1].double().mul_(2.0 ** -60))
+        stats[3].copy_(fixed[3].double().mul_(2.0 ** -60))
+    stats[0].copy_(rho)
+
+
+def _prescale_fp16(dy, vc):
+    """Exact power-of-two dO scaling for FP16 operands.
+
+    Gradients are linear in dO, so dO * 2^e followed by output * 2^-e is
+    exact. The scale keeps dS = P(dP - D), bounded by 2 max|dO_i| max|Vc_j|,
+    near 2^13 so small entries stay out of FP16 subnormals; it only scales
+    down when that bound risks FP16 overflow. BF16 shares FP32's exponent
+    range and is returned unchanged. The scale stays on the device.
+    """
+    if dy.dtype != torch.float16 or not dy.numel() or not vc.numel():
+        return dy, None
+    g = torch.linalg.vector_norm(dy, dim=-1, dtype=torch.float32).amax()
+    w = torch.linalg.vector_norm(vc, dim=-1, dtype=torch.float32).amax()
+    bound = 2 * g * w
+    e = torch.floor(torch.log2(_PRESCALE_TARGET / bound))
+    # dO itself must stay finite in FP16.
+    e = torch.minimum(e, torch.floor(torch.log2(30000.0 / dy.abs().amax().float())))
+    e = torch.where(bound > 32768.0, e, e.clamp_min(0))
+    e = torch.where(torch.isfinite(e), e, torch.zeros_like(e)).clamp(-60, 60).to(torch.int32)
+    # Build 2^e and 2^-e exactly from FP32 exponent bits.
+    factor = ((e + 127) << 23).view(torch.float32)
+    # Scale in FP32: an FP16 product would round factors above 2^15 to inf.
+    return (dy.float() * factor).to(dy.dtype), ((127 - e) << 23).view(torch.float32)
 
 
 def _restore_scale_gradients(outputs, original_scale):

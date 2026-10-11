@@ -69,7 +69,8 @@ def validate(operation, case, inputs, options, qi, ki, deterministic, high_preci
     sparse_dy = torch.zeros_like(low)
     sparse_dy[:, positions] = torch.randn_like(low[:, positions]) / expected.numel()**0.5
     saved = state if soft or high_precision else low
-    grads = bwd(sparse_dy, *base, saved, lse, **options, deterministic=deterministic)[:len(inputs)]
+    grads = bwd(sparse_dy, *base, saved, lse, **options, deterministic=deterministic,
+                high_precision_level=int(high_precision))[:len(inputs)]
     reference = torch.autograd.grad(expected, refs, sparse_dy[:, positions].double())
     assert_gradients(grads, reference, inputs[0].dtype)
     return fwd, bwd, base, fwd_options, low, saved, lse
@@ -109,7 +110,7 @@ def main(operations):
         raise RuntimeError('SM90 GPU required')
     root=Path(__file__).resolve().parents[1]
     stamp=datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
-    output=args.output or Path.home()/'codex_logs/xattn/benchmarks'/f'{stamp}-{operations[0]}.json'
+    output=args.output or root/'logs/benchmarks'/f'{stamp}-{operations[0]}.json'
     output.parent.mkdir(parents=True,exist_ok=True)
     dims=[(d,v) for d in HEAD_DIMS for v in HEAD_DIMS] if args.full_matrix else [tuple(args.dims)]
     records=[]
@@ -144,7 +145,7 @@ def main(operations):
             fwd,bwd,base,fwd_options,low,saved,lse=validate(op,case,inputs,options,qi,ki,det,args.high_precision)
             dy=torch.randn_like(low)
             forward=lambda:fwd(*base,**fwd_options)
-            backward=lambda:bwd(dy,*base,saved,lse,**options,deterministic=det)
+            backward=lambda:bwd(dy,*base,saved,lse,**options,deterministic=det,high_precision_level=int(args.high_precision))
             with torch.no_grad():
                 fwd_result=measure(forward,args.warmup,args.iterations,args.repeats)
                 bwd_result=measure(backward,args.warmup,args.iterations,args.repeats)

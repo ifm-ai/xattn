@@ -122,6 +122,7 @@ public:
         int const* seqused = nullptr;
         int const dq_slots = 1;
         int64_t const dq_slot_stride = 0;
+        int const* dq_exponent = nullptr;  // fixed-point deterministic dQ
     };
 
     // Kernel entry point API
@@ -139,6 +140,7 @@ public:
         int const* seqused = nullptr;
         int const dq_slots = 1;
         int64_t const dq_slot_stride = 0;
+        int const* dq_exponent = nullptr;  // fixed-point deterministic dQ
     };
 
     // Convert to underlying arguments. In this case, a simple copy for the aliased type.
@@ -158,7 +160,8 @@ public:
             args.cu_seqlens,
             args.seqused,
             args.dq_slots,
-            args.dq_slot_stride
+            args.dq_slot_stride,
+            args.dq_exponent
         };
     }
 
@@ -253,8 +256,23 @@ public:
         CUTE_STATIC_ASSERT_V(size(taccdQrdQaccum) == size(tdQsdQaccum));
         Tensor tdQrdQaccum = s2r_thr_copy_dQaccum.retile_D(taccdQrdQaccum);
         cute::copy(s2r_tiled_copy_dQaccum, tdQsdQaccum, tdQrdQaccum);
-        #pragma unroll
-        for (int i = 0; i < size(taccdQrdQaccum); ++i) { taccdQrdQaccum(i) *= params.softmax_scale; }
+        if (params.dq_exponent != nullptr) {
+            // int32 sums on the row grid 2^(e-30); rows index like dPsum.
+            auto thr_mma_dQ = tiled_mma_dQ.get_thread_slice(thread_idx);
+            Tensor cdQ = thr_mma_dQ.partition_C(cute::make_identity_tensor(select<!dQ_swapAB ? 0 : 1, !dQ_swapAB ? 1 : 0>(TileShape_MK{})));
+            int const rounded = get<0>(params.shape_dQaccum) / kHeadDim;
+            int const* const exp_row = params.dq_exponent
+                + (int64_t(!is_varlen ? bidb : 0) * get<1>(params.shape_dQaccum) + bidh) * rounded
+                + seqlen_info.offset_padded + m_block * kBlockM;
+            #pragma unroll
+            for (int i = 0; i < size(taccdQrdQaccum); ++i) {
+                int const row = !dQ_swapAB ? int(get<0>(cdQ(i))) : int(get<1>(cdQ(i)));
+                taccdQrdQaccum(i) = float(__float_as_int(taccdQrdQaccum(i))) * __int_as_float((97 + exp_row[row]) << 23) * params.softmax_scale;
+            }
+        } else {
+            #pragma unroll
+            for (int i = 0; i < size(taccdQrdQaccum); ++i) { taccdQrdQaccum(i) *= params.softmax_scale; }
+        }
         // Convert tdQrdQ from fp32 to fp16
         Tensor rdQ = make_tensor_like<Element>(taccdQrdQaccum);
         flash::convert_type_out(taccdQrdQaccum, rdQ);

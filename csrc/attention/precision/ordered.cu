@@ -1,9 +1,9 @@
-#include "attention/precision/ordered_level2.h"
+#include "attention/precision/ordered.h"
 #include "attention/hopper/bwd_params.h"
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <cmath>
-namespace xattn::ops::attention::precision::ordered_level2 {
+namespace xattn::ops::attention::precision::ordered {
 #define DECL(D,T,V) void Main_##D##_##T##_##V(AttentionBwdParams,cudaStream_t);
 #define VIS(D,T) DECL(D,T,0) DECL(D,T,1) DECL(D,T,2)
 VIS(64,bf16) VIS(128,bf16) VIS(256,bf16)
@@ -15,8 +15,9 @@ std::tuple<torch::Tensor,torch::Tensor,torch::Tensor> MainBackward(
  const torch::Tensor& g,const torch::Tensor& delta,const torch::Tensor& logz,
  const torch::Tensor& stats,const torch::Tensor& meta,
  const c10::optional<torch::Tensor>& qs,const c10::optional<torch::Tensor>& ks,
- const c10::optional<torch::Tensor>& qp,double scale,int level,int visibility,int span,bool strict,bool reset) {
- TORCH_CHECK(level==2,"ordered precision mainloop requires level 2");
+ const c10::optional<torch::Tensor>& qp,double scale,int level,int visibility,int span,bool strict,bool reset,
+ const c10::optional<torch::Tensor>& rho_exponent) {
+ TORCH_CHECK(level>=2 && level<=4,"ordered precision mainloop requires level 2, 3 or 4");
  TORCH_CHECK(visibility>=0 && visibility<=2,"invalid attention visibility");
  TORCH_CHECK(q.is_cuda() && q.dim()==4,"Q must be CUDA [B,N,H,D]");
  TORCH_CHECK(q.scalar_type()==at::kHalf || q.scalar_type()==at::kBFloat16,"precision mainloop requires FP16/BF16");
@@ -35,6 +36,9 @@ std::tuple<torch::Tensor,torch::Tensor,torch::Tensor> MainBackward(
   const auto& t=side ? *ks : *qs;int64_t n=side ? k.size(1) : q.size(1);
   TORCH_CHECK(t.is_cuda() && t.device()==q.device() && t.is_contiguous() && t.scalar_type()==at::kLong && t.dim()==2 && t.size(0)==q.size(0) && t.size(1)==n,"invalid mainloop segments");
  }
+ // Levels 3/4 accumulate the statistics planes as int64 on a per-row grid
+ // 2^(e-62) (2^-60 for the P masses); the caller converts them back to FP64.
+ TORCH_CHECK(level==2 || (rho_exponent && rho_exponent->is_cuda() && rho_exponent->device()==q.device() && rho_exponent->is_contiguous() && rho_exponent->scalar_type()==at::kInt && rho_exponent->numel()==count),"ordered levels 3/4 require an int32 exponent per row");
  if(qp)TORCH_CHECK(qp->is_cuda() && qp->device()==q.device() && qp->is_contiguous() && qp->scalar_type()==at::kInt && qp->numel()==q.size(0)*q.size(1),"invalid reset query positions");
  TORCH_CHECK(!reset || visibility==2,"reset positions only apply to sliding chunks");
  c10::cuda::CUDAGuard guard(q.device());
@@ -49,6 +53,7 @@ std::tuple<torch::Tensor,torch::Tensor,torch::Tensor> MainBackward(
  AttentionBwdParams p{};p.q_ptr=q.data_ptr();p.k_ptr=k.data_ptr();p.v_ptr=v.data_ptr();p.dy_ptr=g.data_ptr();
  p.lse_ptr=logz.data_ptr();p.dq_ptr=dq.data_ptr();p.dk_ptr=dk.data_ptr();p.dv_ptr=dv.data_ptr();
  p.hp_delta=delta.data_ptr<float>();p.hp_rho=reinterpret_cast<float*>(stats.data_ptr());p.hp_mass=meta.data_ptr<float>();p.high_precision_level=level;
+ p.hp_rho_exponent=level>=3 ? rho_exponent->data_ptr<int>() : nullptr;
  p.b=q.size(0);p.num_sequences=p.b;p.seqlen_q=q.size(1);p.seqlen_k=k.size(1);p.max_seqlen_q=p.seqlen_q;p.max_seqlen_k=p.seqlen_k;
  p.d=q.size(3);p.dv=v.size(3);p.h=q.size(2);p.h_k=k.size(2);p.scale_softmax=float(scale);
  p.window_size_left=visibility==0 ? p.seqlen_k : visibility==1 ? span : 2*span-1;

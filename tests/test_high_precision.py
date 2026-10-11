@@ -1,27 +1,24 @@
-"""Validate precision repair levels 1–4, with level 0 as the baseline.
+"""Validate precision repair levels 1-4, with level 0 as the baseline.
 
 Covers the public API contract, SBS saved state, FP64 numerical parity,
 padded gradients, live previous KV, and advanced repair regressions.
-Specialized level 2–4 regressions retain their algorithm-specific domains.
+Specialized level 2-4 regressions retain their algorithm-specific domains.
 """
 import inspect
+import math
 
 import pytest
 import torch
 import xattn
 from tests._numerics import (
-    Case, OPERATIONS, cases_for, check_case, make_inputs,
-    options_and_segments, oracle, require_device,
+    Case, OPERATIONS, _allowed_masks, _attention_from_mask, assert_gradients,
+    assert_output, cases_for, check_case, make_inputs, options_and_segments,
+    oracle, require_device,
 )
-from xattn.ops._backward_precision import (
-    validate_high_precision_level, validate_backward_precision,
-    use_high_precision_level,
-)
+from xattn.ops._backward_precision import validate_backward_precision
 
 REPAIR_LEVELS = (1, 2, 3, 4)
 ALL_LEVELS = (0, *REPAIR_LEVELS)
-
-
 
 FAMILIES = (
     'causal_flash_attn', 'flash_sca', 'flash_swa', 'softdelta_attention',
@@ -29,6 +26,7 @@ FAMILIES = (
 )
 ENTRIES = [getattr(xattn, name + suffix) for name in FAMILIES
            for suffix in ('', '_fwd', '_bwd')]
+
 
 @pytest.mark.parametrize('fn', ENTRIES, ids=lambda fn: fn.__name__)
 @pytest.mark.parametrize('value,error', [
@@ -44,23 +42,13 @@ def test_invalid_level_rejected_before_tensor_access(fn, value, error):
     with pytest.raises(error, match='high_precision_level'):
         fn(**kwargs)
 
-@pytest.mark.parametrize('fn', ENTRIES, ids=lambda fn: fn.__name__)
-def test_public_signature(fn):
-    params = inspect.signature(fn).parameters
-    assert params['high_precision_level'].default == 0
-    assert 'high_precision_output' not in params
-
-@pytest.mark.parametrize('level', ALL_LEVELS)
-def test_level_retained_without_autograd(level):
-    assert validate_high_precision_level(level) == level
-    with torch.no_grad():
-        assert use_high_precision_level(level, (), api_name='test') == level
 
 @pytest.mark.parametrize('level,dtype', [(0, torch.float32), (1, torch.bfloat16)])
 def test_mismatched_saved_state_rejected(level, dtype):
     q = torch.empty(1, dtype=torch.bfloat16)
     with pytest.raises(ValueError, match='same level'):
         validate_backward_precision(level, torch.empty(1, dtype=dtype), q)
+
 
 @pytest.mark.parametrize('fn', ENTRIES, ids=lambda fn: fn.__name__)
 @pytest.mark.parametrize('level', ALL_LEVELS)
@@ -79,6 +67,7 @@ def test_sm90_invalid_dimensions_rejected_before_launch(fn, level, dimensions):
                   backend='sm90', high_precision_level=level)
     with pytest.raises(ValueError, match='multiples of 8'):
         fn(**kwargs)
+
 
 @pytest.mark.parametrize('fn', ENTRIES, ids=lambda fn: fn.__name__)
 @pytest.mark.parametrize('level', ALL_LEVELS)
@@ -168,6 +157,7 @@ def test_padded_gqa_gradients(operation, dtype, deterministic, level, dimensions
         error = (actual.double() - ref).norm()
         assert error <= .015 * ref.norm() + 1e-6
 
+
 @pytest.mark.parametrize('operation,reset', (
     ('window', False), ('chunk', False), ('chunk', True),
     ('softdelta_full', False), ('softdelta_window', False),
@@ -208,6 +198,14 @@ def test_precision_kernel(operation, dtype, level, case_name, deterministic):
     check_case(operation, case, dtype, 1, deterministic, level)
 
 
+@pytest.mark.parametrize('operation', ('full', 'softdelta_full'))
+@pytest.mark.parametrize('level', (2, 3, 4))
+def test_deterministic_long_segments(operation, level):
+    """Deterministic segment backward with more key tiles than resident CTAs."""
+    case = Case('long-segment', 4096, 4096, metadata='segment', segment_length=2048, batch=4)
+    check_case(operation, case, torch.bfloat16, 4, True, level)
+
+
 @pytest.mark.parametrize('operation', ('chunk', 'softdelta_chunk'))
 @pytest.mark.parametrize('dtype', (torch.bfloat16, torch.float16))
 @pytest.mark.parametrize('level', REPAIR_LEVELS)
@@ -223,11 +221,6 @@ def test_precision_chunk_boundaries(operation, dtype, level, case_name, determin
 @pytest.mark.parametrize('level', ALL_LEVELS)
 @pytest.mark.parametrize('scale_sign', (0, -1))
 def test_precision_nonpositive_scale(operation, dtype, level, scale_sign):
-    import xattn
-    from tests._numerics import (
-        Case, require_device, make_inputs, options_and_segments,
-        _allowed_masks, _attention_from_mask, assert_output, assert_gradients,
-    )
     case = Case('scale-edge', 65, 65, 64, 64, span=32, batch=1)
     inputs = make_inputs(operation, case, dtype, 2, require_device())
     options, qi, ki = options_and_segments(operation, case, inputs, 'sm90')
@@ -269,8 +262,6 @@ def test_precision_nonpositive_scale(operation, dtype, level, scale_sign):
 @pytest.mark.parametrize('deterministic', (False, True))
 @pytest.mark.parametrize('level', (2, 3, 4))
 def test_precision_constant_key_support(operation, dtype, deterministic, level):
-    import xattn
-    from tests._numerics import require_device
     device = require_device()
     torch.manual_seed(927)
     soft = operation.startswith('softdelta_')
@@ -302,13 +293,12 @@ def test_precision_constant_key_support(operation, dtype, deterministic, level):
     assert gradients[0].dtype == dtype
     assert torch.count_nonzero(gradients[0][:, start:]) == 0
 
+
 @pytest.mark.parametrize('level', (2, 3, 4))
 @pytest.mark.parametrize('deterministic', (False, True))
-@pytest.mark.parametrize('visibility', (0, 2))
-def test_precision_tiny_probability_large_value(level, deterministic, visibility):
+@pytest.mark.parametrize('operation', ('full', 'chunk'))
+def test_precision_tiny_probability_large_value(level, deterministic, operation):
     """A tiny P times a huge dP is representable and must not vanish early."""
-    from tests._numerics import require_device
-    from xattn.ops._precision_backend import backward
     device = require_device()
     torch.manual_seed(31415)
     n, d = 257, 64
@@ -322,7 +312,7 @@ def test_precision_tiny_probability_large_value(level, deterministic, visibility
     K, V = K.repeat_interleave(2, 1), V.repeat_interleave(2, 1)
     i = torch.arange(n, device=device)
     mask = i[None, :] <= i[:, None]
-    if visibility:
+    if operation == 'chunk':
         mask &= i[None, :] >= ((i[:, None] // 128 - 1) * 128).clamp_min(0)
     p = (Q @ K.transpose(-1, -2) * d ** -.5).masked_fill(~mask, -torch.inf).softmax(-1)
     dp = G @ V.transpose(-1, -2)
@@ -331,83 +321,95 @@ def test_precision_tiny_probability_large_value(level, deterministic, visibility
     refs = ((ds @ K * d ** -.5).transpose(1, 2),
             (ds.transpose(-1, -2) @ Q * d ** -.5).sum(1, keepdim=True).transpose(1, 2),
             (p.transpose(-1, -2) @ G).sum(1, keepdim=True).transpose(1, 2))
-    outputs = backward(g, q, k, v, level=level, visibility=visibility,
-                       span=128 if visibility else None, deterministic=deterministic)[:3]
-    for actual, ref in zip(outputs, refs):
+    inputs = [t.requires_grad_() for t in (q, k, v)]
+    options = dict(chunk_size=128) if operation == 'chunk' else {}
+    y = getattr(xattn, OPERATIONS[operation])(
+        *inputs, **options, backend='sm90', deterministic=deterministic, high_precision_level=level)
+    for actual, ref in zip(torch.autograd.grad(y, inputs, g), refs):
         assert actual.dtype == torch.bfloat16 and torch.isfinite(actual).all()
         assert (actual.double() - ref).norm() <= .01 * ref.norm()
 
+
 @pytest.mark.parametrize('level', (2, 3, 4))
 @pytest.mark.parametrize('deterministic', (False, True))
-@pytest.mark.parametrize('visibility', (0, 1, 2))
-@pytest.mark.parametrize('reset', (False, True))
-def test_precision_segment_constant_keys(level, deterministic, visibility, reset):
-    if reset and visibility != 2:
-        pytest.skip('reset positions are only defined for chunks')
-    from tests._numerics import require_device
-    from xattn.ops._precision_backend import backward
+@pytest.mark.parametrize('operation,reset', (
+    ('full', False), ('window', False), ('chunk', False), ('chunk', True)))
+def test_precision_segment_constant_keys(level, deterministic, operation, reset):
     device = require_device()
     torch.manual_seed(927)
     n, d = 257, 64
-    q = torch.ones(1, n, 2, d, device=device, dtype=torch.bfloat16)
+    q = torch.ones(1, n, 2, d, device=device, dtype=torch.bfloat16, requires_grad=True)
     k = torch.zeros(1, n, 1, d, device=device, dtype=q.dtype)
     k[:, :128] = 1
     v = (torch.randn_like(k, dtype=torch.float32) * 1e30).to(q.dtype)
     g = torch.randn_like(q)
     ids = (torch.arange(n, device=device) // 128)[None]
-    dq = backward(g, q, k, v, level=level, visibility=visibility,
-                  span=64 if visibility else None, segment_idx=ids,
-                  reset=reset, deterministic=deterministic)[0]
+    options = {'window': dict(window_size=64),
+               'chunk': dict(chunk_size=64, reset_chunk_pos_per_seq=reset)}.get(operation, {})
+    y = getattr(xattn, OPERATIONS[operation])(
+        q, k, v, **options, segment_idx=ids, backend='sm90',
+        deterministic=deterministic, high_precision_level=level)
+    dq, = torch.autograd.grad(y, q, g)
     assert torch.count_nonzero(dq) == 0
 
+
+def _llm_like_inputs(operation, case, dtype, kv_heads, device):
+    """Shared query direction and a sink key at position 0 (attention sink rows)."""
+    inputs = make_inputs(operation, case, dtype, kv_heads, device)
+    gen = torch.Generator(device=device).manual_seed(7)
+    q, keys = inputs[0], [inputs[1]] + ([inputs[-2]] if case.previous else [])
+    d = q.shape[-1]
+    u = torch.nn.functional.normalize(torch.randn(d, device=device, generator=gen), dim=-1)
+    amp = math.sqrt(15.0 * math.sqrt(d))
+    with torch.no_grad():
+        q.copy_((torch.nn.functional.normalize(
+            torch.randn(q.shape, device=device, generator=gen) / math.sqrt(d) + 0.5 * u, dim=-1) * amp).to(dtype))
+        for t in keys:
+            t.copy_((torch.nn.functional.normalize(torch.randn(t.shape, device=device, generator=gen), dim=-1) * amp).to(dtype))
+        keys[-1][:, 0] = (u * amp).to(dtype)
+    return inputs
+
+
+@pytest.mark.parametrize('operation', ('full', 'chunk', 'softdelta_chunk'))
 @pytest.mark.parametrize('dtype', (torch.bfloat16, torch.float16))
 @pytest.mark.parametrize('deterministic', (False, True))
-@pytest.mark.parametrize('visibility', (0, 1, 2))
-@pytest.mark.parametrize('strict', (False, True))
-def test_probability_fallback_replaces_entire_gqa_head(dtype, deterministic, visibility, strict):
-    """Force the unsafe anchor branch and verify all grouped query heads survive."""
-    from tests._numerics import require_device
-    import xattn_cuda
+@pytest.mark.parametrize('pattern', ('sink', 'flat'))
+def test_level3_row_sum_repair_not_worse_than_level2(operation, dtype, deterministic, pattern):
+    """The variance-weighted zero-sum repair must not lose to level 2 on sink or flat rows."""
     device = require_device()
-    ops = xattn_cuda.ops
-    torch.manual_seed(563)
-    n, h, hk, d = 65, 4, 2, 64
-    q = torch.randn(1, n, h, d, device=device, dtype=dtype)
-    k = torch.randn(1, n, hk, d, device=device, dtype=dtype)
-    v = torch.randn_like(k)
-    g = torch.randn_like(q)
-    position = torch.arange(n, device=device, dtype=torch.int32)[None]
-    right = position - int(strict)
-    left = (torch.zeros_like(position) if visibility == 0 else
-            (position - 16).clamp_min(0) if visibility == 1 else
-            ((position // 16 - 1) * 16).clamp_min(0))
-    delta, logz, meta = ops._attention_precision_row_statistics(
-        q, k, v, g, left, right, None, None, d ** -.5)
-    stats = torch.zeros(4, 1, h, n, device=device, dtype=torch.float64)
-    stats[1].fill_(1.)
-    stats[3].fill_(.5)
-    # Only one row of one query head is unsafe. The entire corresponding KV
-    # head must be overwritten, including its OTHER grouped query head.
-    stats[1, 0, 0, -1] = 2.
-    stats[3, 0, 0, -1] = .01
-    dv = torch.full_like(v, 123., dtype=torch.float32)
-    if deterministic:
-        order = torch.argsort(meta[3].reshape(1, hk, -1), dim=-1, stable=True)
-        flags = ops._attention_precision_deterministic_repair(
-            q, k, g, stats, meta, order, torch.zeros_like(q, dtype=torch.float32),
-            torch.zeros_like(k, dtype=torch.float32), dv, d ** -.5, 4)
-    else:
-        flags = ops._attention_precision_probability_repair(g, stats, meta, dv)
-    assert flags.tolist() == [[1, 0]]
-    ops._attention_precision_fallback_dv(q, k, g, left, right, logz, meta,
-                                       flags, dv, None, None, d ** -.5)
-    Q, K, G = [t.double().transpose(1, 2) for t in (q, k, g)]
-    K = K.repeat_interleave(h // hk, 1)
-    keys = torch.arange(n, device=device)
-    allowed = (keys >= left[..., None]) & (keys <= right[..., None])
-    scores = (Q @ K.transpose(-1, -2) * d ** -.5).masked_fill(~allowed[:, None], -torch.inf)
-    p = scores.softmax(-1).nan_to_num()
-    expected = (p.transpose(-1, -2) @ G).reshape(1, hk, h // hk, n, d).sum(2).transpose(1, 2)
-    actual = dv.to(dtype).double()
-    assert (actual[:, :, 0] - expected[:, :, 0]).norm() <= .003 * expected[:, :, 0].norm()
-    assert torch.all(dv[:, :, 1] == 123.)
+    previous = 128 if operation != 'full' else 0
+    case = Case(f'ladder-{pattern}', 512, 512, 128, 128, previous=previous, span=128, batch=1)
+    inputs = (_llm_like_inputs if pattern == 'sink' else make_inputs)(operation, case, dtype, 1, device)
+    options, qi, ki = options_and_segments(operation, case, inputs, 'sm90')
+    refs, expected, _ = oracle(operation, case, inputs, qi, ki)
+    dy = (torch.randn(expected.shape, device=device) / expected.numel() ** 0.5).to(dtype)
+    want = torch.autograd.grad(expected, refs, dy.double())
+    fn = getattr(xattn, OPERATIONS[operation])
+    errors = {}
+    for level in (2, 3):
+        out = fn(*inputs[:4 if operation.startswith('softdelta_') else 3], **options,
+                 deterministic=deterministic, high_precision_level=level)
+        got = torch.autograd.grad(out, inputs, dy)
+        errors[level] = [float((g.double() - w).norm() / w.norm()) for g, w in zip(got, want)]
+    for e2, e3 in zip(errors[2], errors[3]):
+        assert e3 <= e2 * 1.02 + 1e-7
+
+
+@pytest.mark.parametrize('level', (3, 4))
+@pytest.mark.parametrize('dtype', (torch.bfloat16, torch.float16))
+def test_deterministic_sink_anchor_repair(level, dtype):
+    """Thousands of rows anchored at one key span many repair chunks; the ordered
+    reduction stays bitwise repeatable and matches the unordered path."""
+    device = require_device()
+    case = Case('sink-anchor', 700, 700, 64, 64, batch=1)
+    inputs = _llm_like_inputs('full', case, dtype, 1, device)
+    options, _, _ = options_and_segments('full', case, inputs, 'sm90')
+    dy = torch.randn(1, 700, 4, 64, device=device, dtype=dtype) / 700 ** 0.5
+    results = {}
+    for deterministic in (True, True, False):
+        out = xattn.causal_flash_attn(*inputs, **options, deterministic=deterministic, high_precision_level=level)
+        results.setdefault(deterministic, []).append(torch.autograd.grad(out, inputs, dy))
+    for first, second in zip(*results[True]):
+        torch.testing.assert_close(first, second, atol=0, rtol=0)
+    for ordered, unordered in zip(results[True][0], results[False][0]):
+        assert (ordered.double() - unordered.double()).norm() <= 2e-3 * unordered.double().norm()

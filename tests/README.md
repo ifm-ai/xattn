@@ -71,6 +71,6 @@ python -m tests.softdelta.benchmark --full-matrix --high-precision
 ```
 
 Use `--output` for an explicit report path; otherwise reports go to
-`~/codex_logs/xattn/benchmarks/`. `--warmup`, `--iterations`, `--repeats`,
+`logs/benchmarks/` under the checkout root. `--warmup`, `--iterations`, `--repeats`,
 `--kv-heads`, `--span` and `--dims D V` select the measurement setup.
 Validate completed benchmark manifests with the same validator and `--kind speed`.

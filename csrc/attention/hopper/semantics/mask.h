@@ -83,12 +83,13 @@ template <
     bool DenseTileFastPath = false,
     bool DirectChunkTileFastPath = IsSlidingChunk,
     bool AllowReset = HasSegment,
-    int BranchPairLogicalBlockM = 0>
+    int BranchPairLogicalBlockM = 0,
+    bool SegmentTileRanges = true>
 using AttentionMaskAdapter =
     flash::Mask<
         kBlockM, kBlockN, PackGQA, TiledMma, SwapAB, HasSegment,
         DenseTileFastPath, IsSlidingChunk, DirectChunkTileFastPath,
-        AllowReset, BranchPairLogicalBlockM>;
+        AllowReset, BranchPairLogicalBlockM, SegmentTileRanges>;
 
 }  // namespace semantics
 }  // namespace hopper

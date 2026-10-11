@@ -34,6 +34,81 @@ static __global__ void HPInit(const float* lse, const float* delta, float* log2l
  int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=H*R)return;
  int h=i/R, r=i%R; log2lse[i]=r<N?lse[h*N+r]*float(M_LOG2E):INFINITY; dpsum[i]=r<N?delta[h*N+r]:0.f;
 }
+// Fixed-point dQ bounds: max_j |V_j| (row L2 norm) and max |K|. Eight lanes
+// share one key row, so each row is read as contiguous 128-byte segments; the
+// fixed shuffle tree keeps the bounds (and the dQ grids) run-to-run identical.
+template <typename Element, int kMaxChunksK, int kMaxChunksV>
+__global__ void __launch_bounds__(256) FixedPointBoundsKernel(
+    Element const* k, Element const* v, int64_t kb, int64_t kr, int64_t kh,
+    int64_t vb, int64_t vr, int64_t vh, int seqlen_k, int64_t rows, int hk,
+    int d, int dv, float* bounds) {
+  constexpr int kLanes = 8, kRowsPerWarp = 32 / kLanes;
+  // Non-negative floats compare as ints (atomicMax below). Varlen passes all
+  // packed key rows with seqlen_k = 0.
+  int64_t const total = rows * hk;
+  int const lane = threadIdx.x % 32, sub = lane % kLanes;
+  int64_t const warp = (int64_t(blockIdx.x) * blockDim.x + threadIdx.x) / 32;
+  int64_t const num_warps = int64_t(gridDim.x) * blockDim.x / 32;
+  int const ck = d / 8, cv = dv / 8;
+  float vmax = 0.f, kmax = 0.f;
+  for (int64_t base = warp * kRowsPerWarp; base < total; base += num_warps * kRowsPerWarp) {
+    int64_t const w = base + lane / kLanes;
+    float sq = 0.f;
+    if (w < total) {
+      int64_t const row = w / hk; int const head = int(w % hk);
+      int64_t const b = seqlen_k > 0 ? row / seqlen_k : 0, j = seqlen_k > 0 ? row % seqlen_k : row;
+      uint4 const* kp = reinterpret_cast<uint4 const*>(k + b * kb + j * kr + head * kh);
+      uint4 const* vp = reinterpret_cast<uint4 const*>(v + b * vb + j * vr + head * vh);
+      uint4 xv[(kMaxChunksV + kLanes - 1) / kLanes], xk[(kMaxChunksK + kLanes - 1) / kLanes];
+      #pragma unroll
+      for (int i = 0; i < (kMaxChunksV + kLanes - 1) / kLanes; ++i) {
+        int const c = sub + i * kLanes;
+        xv[i] = c < cv ? vp[c] : make_uint4(0, 0, 0, 0);
+      }
+      #pragma unroll
+      for (int i = 0; i < (kMaxChunksK + kLanes - 1) / kLanes; ++i) {
+        int const c = sub + i * kLanes;
+        xk[i] = c < ck ? kp[c] : make_uint4(0, 0, 0, 0);
+      }
+      #pragma unroll
+      for (int i = 0; i < (kMaxChunksV + kLanes - 1) / kLanes; ++i) {
+        Element const* e = reinterpret_cast<Element const*>(&xv[i]);
+        #pragma unroll
+        for (int t = 0; t < 8; ++t) { float f = float(e[t]); sq += f * f; }
+      }
+      #pragma unroll
+      for (int i = 0; i < (kMaxChunksK + kLanes - 1) / kLanes; ++i) {
+        Element const* e = reinterpret_cast<Element const*>(&xk[i]);
+        #pragma unroll
+        for (int t = 0; t < 8; ++t) kmax = fmaxf(kmax, fabsf(float(e[t])));
+      }
+    }
+    #pragma unroll
+    for (int o = 1; o < kLanes; o *= 2) { sq += __shfl_xor_sync(0xffffffffu, sq, o); }
+    vmax = fmaxf(vmax, sqrtf(sq));
+  }
+  for (int o = 16; o > 0; o /= 2) {
+    vmax = fmaxf(vmax, __shfl_xor_sync(0xffffffffu, vmax, o));
+    kmax = fmaxf(kmax, __shfl_xor_sync(0xffffffffu, kmax, o));
+  }
+  __shared__ float part[2][8];
+  int const warp_in_block = threadIdx.x / 32;
+  if (lane == 0) { part[0][warp_in_block] = vmax; part[1][warp_in_block] = kmax; }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    for (int i = 1; i < int(blockDim.x / 32); ++i) { vmax = fmaxf(vmax, part[0][i]); kmax = fmaxf(kmax, part[1][i]); }
+    atomicMax(reinterpret_cast<int*>(bounds), __float_as_int(vmax));
+    atomicMax(reinterpret_cast<int*>(bounds) + 1, __float_as_int(kmax));
+  }
+}
+// Padded per-row staging planes: raw max, anchored dP, dO scale. Padding
+// rows hold (0, 0, 1).
+static __global__ void HPInitRows(const float* mass, float* rows, int N, int R, int H) {
+ int i=blockIdx.x*blockDim.x+threadIdx.x; if(i>=H*R)return;
+ int h=i/R, r=i%R; int64_t count=int64_t(H)*N, src=int64_t(h)*N+r, plane=int64_t(H)*R;
+ rows[i]=r<N?mass[src]:0.f; rows[plane+i]=r<N?mass[count+src]:0.f; rows[2*plane+i]=r<N?mass[2*count+src]:1.f;
+ rows[3*plane+i]=r<N?mass[3*count+src]:0.f;
+}
 
 
 template <int kBlockM, int kBlockN, typename Visibility>
@@ -139,6 +214,27 @@ __global__ void AttentionBuildBwdDeterministicSegmentRangesKernel(
           q_segment_idx, k_segment_idx, k_segment_len, bidb);
   range_ptr[2 * range_idx] = segment_n_block_min;
   range_ptr[2 * range_idx + 1] = segment_n_block_max;
+}
+
+// Segment backward pre-pass: key interval of each (batch, query) and query
+// interval of each (batch, key).
+static __global__ void AttentionSegmentBwdIntervalKernel(
+    int num_batch, int seqlen_q, int seqlen_k,
+    int64_t const* q_segment_idx, int64_t const* k_segment_idx,
+    int k_segment_len, int2* query_intervals, int2* key_intervals) {
+  int const i = int(blockIdx.x) * int(blockDim.x) + int(threadIdx.x);
+  if (i < num_batch * seqlen_q) {
+    int const bidb = i / seqlen_q;
+    query_intervals[i] = attention::partition::segment_row_interval(
+        i - bidb * seqlen_q, seqlen_q, q_segment_idx, k_segment_idx,
+        k_segment_len, bidb);
+  }
+  if (i < num_batch * seqlen_k) {
+    int const bidb = i / seqlen_k;
+    key_intervals[i] = attention::partition::segment_key_interval(
+        i - bidb * seqlen_k, seqlen_q, seqlen_k, q_segment_idx,
+        k_segment_idx, k_segment_len, bidb);
+  }
 }
 
 template <typename Element>
@@ -398,9 +494,13 @@ void RunAttentionBwdSm90Kernel(
       size_t(StagesDS) * kBlockM * kBlockN * sizeof(Element) *
           (1 + int(!MmaDKvIsRS) +
            int(!MmaDKvIsRS && kTwoComponentDV));
+  // D/V 128/256 (BN 128) estimates 225 KB; with the MHA epilogue the real
+  // shared storage still fits the 227 KB opt-in limit, with the GQA one not.
+  static constexpr size_t DenseStage2Limit =
+      kHeadDim == 128 && kHeadDimV == 256 && !kGQA ? 225 * 1024 : 224 * 1024;
   static constexpr bool UseDenseStage2 =
       !kDeterministic && !kVarlen && !kHasSegment &&
-      Stage2TensorStorageEstimate <= 224 * 1024;
+      Stage2TensorStorageEstimate <= DenseStage2Limit;
   static constexpr bool UseDenseDetStage2 =
       kDeterministic && Visibility::kIsSlidingChunk && !kVarlen &&
       !kHasSegment && !kGQA &&
@@ -495,8 +595,14 @@ void RunAttentionBwdSm90Kernel(
   const int logical_batch = kVarlen ? params.num_sequences : params.b;
   // Varlen workspace batch: 1; launch and scheduling batch: num_sequences.
   const int workspace_batch = kVarlen ? 1 : logical_batch;
+  // Low-precision deterministic dQ uses order-free fixed-point sums for
+  // D <= 128 and D = V = 192; other dimensions keep ordered or slot-split
+  // FP32 accumulation.
+  static constexpr bool kFixedDQ =
+      kDeterministic && kPrecisionLevel < 2 &&
+      (kHeadDim <= 128 || (kHeadDim == 192 && kHeadDimV == 192));
   static constexpr bool SplitDQ =
-      kDeterministic && Visibility::kIsSlidingChunk &&
+      kDeterministic && !kFixedDQ && Visibility::kIsSlidingChunk &&
       !kVarlen && !kHasSegment;
   const int64_t dq_slot_stride =
       int64_t(workspace_batch) * params.h * seqlen_q_rounded * kHeadDim;
@@ -547,6 +653,28 @@ void RunAttentionBwdSm90Kernel(
     }
   }
   torch::Tensor dq_semaphore;
+  torch::Tensor hp_rows;
+  torch::Tensor fixed_bounds, dq_exponent;
+  if constexpr (kFixedDQ) {
+    fixed_bounds = torch::zeros({2}, dq_options);
+    dq_exponent = torch::empty({workspace_batch, params.h, seqlen_q_rounded},
+                               dq_options.dtype(at::kInt));
+    // Varlen scans every packed key row (params.seqlen_k = k.size(0));
+    // row-aligned SCA varlen metadata has a different number of key runs
+    // than queries.
+    const int64_t key_rows = kVarlen ? int64_t(params.seqlen_k)
+                                     : int64_t(params.b) * params.seqlen_k;
+    const int64_t warps = key_rows * params.h_k;
+    if (warps > 0) {
+      FixedPointBoundsKernel<Element, kHeadDim / 8, kHeadDimV / 8><<<int(std::min<int64_t>((warps + 31) / 32, int64_t(params.num_sm) * 8)), 256, 0, stream>>>(
+          static_cast<Element const*>(params.k_ptr), static_cast<Element const*>(params.v_ptr),
+          params.k_batch_stride, params.k_row_stride, params.k_head_stride,
+          params.v_batch_stride, params.v_row_stride, params.v_head_stride,
+          kVarlen ? 0 : params.seqlen_k, key_rows, params.h_k, params.d, params.dv,
+          fixed_bounds.data_ptr<float>());
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+  }
   params.dpsum_ptr = dpsum.data_ptr<float>();
   params.lse_log2_ptr = lse_log2.data_ptr<float>();
   params.dq_accum_ptr = dq_accum.data_ptr<float>();
@@ -573,6 +701,8 @@ void RunAttentionBwdSm90Kernel(
                                   dq_semaphore.numel() * sizeof(int), stream));
   }
   HPInit<<<(workspace_batch*params.h*seqlen_q_rounded+255)/256,256,0,stream>>>(static_cast<float const*>(params.lse_ptr),params.hp_delta,static_cast<float*>(params.lse_log2_ptr),static_cast<float*>(params.dpsum_ptr),params.seqlen_q,seqlen_q_rounded,workspace_batch*params.h);
+  hp_rows = torch::empty({4, workspace_batch, params.h, seqlen_q_rounded}, dpsum.options());
+  HPInitRows<<<(workspace_batch*params.h*seqlen_q_rounded+255)/256,256,0,stream>>>(params.hp_mass,hp_rows.data_ptr<float>(),params.seqlen_q,seqlen_q_rounded,workspace_batch*params.h);
   C10_CUDA_CHECK(cudaMemsetAsync(params.dq_accum_ptr,0,dq_accum.numel()*sizeof(float),stream));
   } else {
   auto launch_preprocess = [&](auto output_state_tag) {
@@ -607,7 +737,9 @@ void RunAttentionBwdSm90Kernel(
         kVarlen ? params.cu_seqlens_q : nullptr,
         nullptr,
         OutputStateFp32 ? static_cast<float const*>(params.y_ptr)
-                        : nullptr};
+                        : nullptr,
+        kFixedDQ ? fixed_bounds.data_ptr<float>() : nullptr,
+        kFixedDQ ? dq_exponent.data_ptr<int>() : nullptr};
     typename PreprocessKernel::Params preprocess_params =
         PreprocessKernel::to_underlying_arguments(preprocess_args);
     return cutlass::kernel_launch<PreprocessKernel>(
@@ -628,7 +760,10 @@ void RunAttentionBwdSm90Kernel(
       cute::Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
   using ClusterShape = cute::Shape<
       Int<kHeadPairClusterKVReuse ? 2 : 1>, _1, _1>;
-  using CollectiveMainloop = flash::CollectiveMainloopBwdSm90<
+  // Fixed-point dQ stages its row exponents in shared memory when the whole
+  // kernel storage still fits; the staged variant also sizes the epilogue and
+  // scheduler below (both independent of the staging).
+  using CollectiveMainloopStaged = flash::CollectiveMainloopBwdSm90<
       Stages, StagesDO, StagesDS, ClusterShape, TileShapeMNK, kHeadDimV,
       Element, ElementAccum, ArchTag, IsCausal, IsLocal, HasSoftcap, Varlen,
       kDeterministic, kHasSegment, kDirectChunkRange,
@@ -637,22 +772,32 @@ void RunAttentionBwdSm90Kernel(
       NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ,
       MmaDPIsRS, kTwoComponentDV, kReaderPairKVReuse, kDirectChunkTile,
       kHeadPairParallel, kHeadPairClusterKVReuse,
-      kHeadPairPrivateKVGrad, SplitDQ, kPrecisionLevel>;
+      kHeadPairPrivateKVGrad, SplitDQ, kPrecisionLevel, true>;
+  using CollectiveMainloopUnstaged = flash::CollectiveMainloopBwdSm90<
+      Stages, StagesDO, StagesDS, ClusterShape, TileShapeMNK, kHeadDimV,
+      Element, ElementAccum, ArchTag, IsCausal, IsLocal, HasSoftcap, Varlen,
+      kDeterministic, kHasSegment, kDirectChunkRange,
+      SdPSwapAB, DKvSwapAB,
+      DqSwapAB,
+      NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ,
+      MmaDPIsRS, kTwoComponentDV, kReaderPairKVReuse, kDirectChunkTile,
+      kHeadPairParallel, kHeadPairClusterKVReuse,
+      kHeadPairPrivateKVGrad, SplitDQ, kPrecisionLevel, false>;
   using CollectiveEpilogueDirect = flash::CollectiveEpilogueBwd<
       TileShapeMNK, kHeadDimV, HPOut, ArchTag,
-      CollectiveMainloop::NumMmaThreads, Varlen, DKvSwapAB,
+      CollectiveMainloopStaged::NumMmaThreads, Varlen, DKvSwapAB,
       NumMmaWarpGroups / AtomLayoutNdKV>;
   using CollectiveEpilogueSplitDestinations =
       flash::CollectiveEpilogueBwdSplitBatchDestinations<
           TileShapeMNK, kHeadDimV, Element, ArchTag,
-          CollectiveMainloop::NumMmaThreads, Varlen, DKvSwapAB,
+          CollectiveMainloopStaged::NumMmaThreads, Varlen, DKvSwapAB,
           NumMmaWarpGroups / AtomLayoutNdKV>;
   using CollectiveEpilogueMHA = std::conditional_t<
       kHeadPairPrivateKVGrad, CollectiveEpilogueSplitDestinations,
       CollectiveEpilogueDirect>;
   using CollectiveEpilogueGQA = flash::CollectiveEpilogueBwdGQA<
       TileShapeMNK, kHeadDimV, ElementAccum, ArchTag,
-      CollectiveMainloop::NumMmaThreads, Varlen, kDeterministic, DKvSwapAB>;
+      CollectiveMainloopStaged::NumMmaThreads, Varlen, kDeterministic, DKvSwapAB>;
   using CollectiveEpilogue = std::conditional_t<
       kGQA && !kReaderPairKVReuse && !kHeadPairPrivateKVGrad,
       CollectiveEpilogueGQA, CollectiveEpilogueMHA>;
@@ -669,7 +814,7 @@ void RunAttentionBwdSm90Kernel(
       flash::SingleTileBwdLPTScheduler<false, kBlockN, true /*SPT*/>;
   static constexpr int VarlenSchedulerProducerThreads =
       cutlass::NumThreadsPerWarp *
-      (CollectiveMainloop::dQacc_use_TMA ? 2 : 1);
+      (CollectiveMainloopStaged::dQacc_use_TMA ? 2 : 1);
   static constexpr bool UseDensePersistentScheduler =
       kPersistentScheduler && kDeterministic && !kVarlen &&
       !kHasSegment && !kGQA;
@@ -681,13 +826,17 @@ void RunAttentionBwdSm90Kernel(
           flash::DeterministicDenseBwdTileScheduler<IsCausal>>;
   using DeterministicDensePersistentScheduler =
       flash::DeterministicDensePersistentBwdTileScheduler<
-          CollectiveMainloop::NumMmaThreads,
+          CollectiveMainloopStaged::NumMmaThreads,
           VarlenSchedulerProducerThreads>;
+  // Fixed-point dQ needs no ordering; grouped heads keep ordered dK/dV
+  // semaphores and therefore the deterministic varlen/segment schedulers.
+  static constexpr bool UseDeterministicSchedule =
+      kDeterministic && !(kFixedDQ && (!kGQA || (!kVarlen && !kHasSegment)));
   static constexpr bool UseVarlenPersistentScheduler =
-      kVarlen && kDeterministic;
+      kVarlen && UseDeterministicSchedule;
   using VarlenPersistentScheduler =
       flash::VarlenSequencePersistentTileScheduler<
-          kBlockN, CollectiveMainloop::NumMmaThreads,
+          kBlockN, CollectiveMainloopStaged::NumMmaThreads,
           VarlenSchedulerProducerThreads, true /*WaitForWorkCompletion*/>;
   using SegmentScheduler = flash::StaticSegmentBwdTileScheduler;
   using DeterministicSegmentScheduler =
@@ -695,26 +844,56 @@ void RunAttentionBwdSm90Kernel(
   using Scheduler =
       std::conditional_t<
           kHasSegment,
-          std::conditional_t<kDeterministic,
+          std::conditional_t<UseDeterministicSchedule,
                              DeterministicSegmentScheduler,
                              SegmentScheduler>,
                          std::conditional_t<
                              UseVarlenPersistentScheduler,
                              VarlenPersistentScheduler,
                              std::conditional_t<
-                                 kDeterministic && !kVarlen && !kHasSegment,
+                                 UseDeterministicSchedule && !kVarlen && !kHasSegment,
                                  std::conditional_t<
                                      UseDensePersistentScheduler,
                                      DeterministicDensePersistentScheduler,
                                      DeterministicDenseScheduler>,
                                  std::conditional_t<kVarlen, DenseScheduler,
                                                     DenseLPTScheduler>>>>;
+  // SM90 opt-in shared memory per block: 227 KB.
+  static constexpr bool kStageDqExpFits =
+      flash::enable_sm90<BwdKernel<CollectiveMainloopStaged, CollectiveEpilogue,
+                                   Scheduler>>::SharedStorageSize <= 232448;
+  using CollectiveMainloop = std::conditional_t<
+      !kFixedDQ || kStageDqExpFits, CollectiveMainloopStaged,
+      CollectiveMainloopUnstaged>;
   using AttnKernel = flash::enable_sm90<BwdKernel<
       CollectiveMainloop, CollectiveEpilogue, Scheduler>>;
 
+  torch::Tensor segment_intervals;
+  int2 const* segment_query_intervals = nullptr;
+  int2 const* segment_key_intervals = nullptr;
+  if constexpr (CollectiveMainloop::SegmentIntervals) {
+    TORCH_CHECK(params.q_segment_idx != nullptr && params.k_segment_idx != nullptr &&
+                    params.k_segment_len > 0,
+                "attention SM90 BWD segment masks need q/k segment ids");
+    int64_t const q_count = int64_t(params.b) * params.seqlen_q;
+    int64_t const k_count = int64_t(params.b) * params.seqlen_k;
+    segment_intervals = torch::empty(
+        {q_count + k_count, 2},
+        torch::TensorOptions().device(torch::kCUDA).dtype(at::kInt));
+    int2* base = reinterpret_cast<int2*>(segment_intervals.data_ptr<int>());
+    int64_t const count = std::max(q_count, k_count);
+    if (count > 0) {
+      AttentionSegmentBwdIntervalKernel<<<int(cutlass::ceil_div(count, int64_t(256))), 256, 0, stream>>>(
+          params.b, params.seqlen_q, params.seqlen_k, params.q_segment_idx,
+          params.k_segment_idx, params.k_segment_len, base, base + q_count);
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    segment_query_intervals = base;
+    segment_key_intervals = base + q_count;
+  }
   torch::Tensor deterministic_segment_ranges;
   int const* deterministic_segment_ranges_ptr = nullptr;
-  if constexpr (kHasSegment && kDeterministic) {
+  if constexpr (kHasSegment && kDeterministic && !kFixedDQ) {
     deterministic_segment_ranges = torch::empty(
         {params.b, num_m_block, 2},
         torch::TensorOptions()
@@ -783,7 +962,14 @@ void RunAttentionBwdSm90Kernel(
       kHasSegment ? params.reset_attention_chunk : 0,
       deterministic_segment_ranges_ptr,
       params.odd_head_window_right_delta,
-      dq_slots, dq_slot_stride, params.hp_rho, params.hp_mass};
+      dq_slots, dq_slot_stride, params.hp_rho, params.hp_mass,
+      hp_rows.defined() ? hp_rows.data_ptr<float>() : nullptr,
+      hp_rows.defined() ? hp_rows.data_ptr<float>() + hp_rows.numel() / 4 : nullptr,
+      hp_rows.defined() ? hp_rows.data_ptr<float>() + 2 * (hp_rows.numel() / 4) : nullptr,
+      hp_rows.defined() ? hp_rows.data_ptr<float>() + 3 * (hp_rows.numel() / 4) : nullptr,
+      params.hp_rho_exponent,
+      kFixedDQ ? dq_exponent.data_ptr<int>() : nullptr,
+      segment_query_intervals, segment_key_intervals};
 
   int num_blocks_n = cutlass::ceil_div(
       kVarlen ? params.max_seqlen_k : params.seqlen_k, kBlockN);
@@ -1017,7 +1203,7 @@ void RunAttentionBwdSm90Kernel(
       AttnKernel::to_underlying_arguments(
           {mainloop_args, epilogue_args, {device, params.num_sm},
            scheduler_args});
-  if constexpr (kVarlen && !kDeterministic) {
+  if constexpr (kVarlen && !UseVarlenPersistentScheduler) {
     if (logical_batch > 65535) {
       int64_t const mainloop_grid_blocks =
           int64_t(num_blocks_n) * scheduled_q_heads * logical_batch;
@@ -1140,7 +1326,8 @@ void RunAttentionBwdSm90Kernel(
       logical_batch,
       num_m_block,
       kVarlen ? params.cu_seqlens_q : nullptr,
-      nullptr, dq_slots, dq_slot_stride};
+      nullptr, dq_slots, dq_slot_stride,
+      kFixedDQ ? dq_exponent.data_ptr<int>() : nullptr};
   typename PostprocessKernel::Params postprocess_params =
       PostprocessKernel::to_underlying_arguments(postprocess_args);
   int smem_size_postprocess = PostprocessKernel::SharedStorageSize;

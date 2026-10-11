@@ -1,5 +1,4 @@
 #include "attention/precision/row_statistics_sm90.cuh"
-#include "attention/precision/row_statistics_rectangular_sm90.cuh"
 #include "attention/precision/row_statistics.h"
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -16,7 +15,8 @@ namespace wm=nvcuda::wmma;
 std::tuple<torch::Tensor,torch::Tensor,torch::Tensor> RowStatistics(
  const torch::Tensor& q,const torch::Tensor& k,const torch::Tensor& v,
  const torch::Tensor& g,const torch::Tensor& left,const torch::Tensor& right,
- const c10::optional<torch::Tensor>& qs,const c10::optional<torch::Tensor>& ks,double scale) {
+ const c10::optional<torch::Tensor>& qs,const c10::optional<torch::Tensor>& ks,double scale,
+ const c10::optional<torch::Tensor>& exact) {
  TORCH_CHECK(q.is_cuda() && q.dim()==4,"Q must be CUDA [B,N,H,D]");
  TORCH_CHECK(q.scalar_type()==at::kHalf || q.scalar_type()==at::kBFloat16,"precision statistics need FP16/BF16");
  for(const auto& t:{q,k,v,g}) TORCH_CHECK(t.is_cuda() && t.device()==q.device() && t.is_contiguous() && t.dim()==4 && t.scalar_type()==q.scalar_type(),"Q/K/V/dO must be contiguous on one device with matching dtype");
@@ -32,30 +32,30 @@ std::tuple<torch::Tensor,torch::Tensor,torch::Tensor> RowStatistics(
   const auto& t=side ? *ks : *qs;int64_t n=side ? k.size(1) : q.size(1);
   TORCH_CHECK(t.is_cuda() && t.device()==q.device() && t.scalar_type()==at::kLong && t.is_contiguous() && t.dim()==2 && t.size(0)==q.size(0) && t.size(1)==n,"invalid precision segment metadata");
  }
+ if(exact)TORCH_CHECK(qs && exact->is_cuda() && exact->device()==q.device() && exact->scalar_type()==at::kInt && exact->is_contiguous() && exact->numel()==q.size(0),"exact-bounds flags must be contiguous int32 [B] with segments");
  c10::cuda::CUDAGuard guard(q.device());auto opts=q.options().dtype(at::kFloat);
  auto delta=torch::empty({q.size(0),q.size(2),q.size(1)},opts);auto logz=torch::empty_like(delta);
  auto meta=torch::empty({6,q.size(0),q.size(2),q.size(1)},opts);
  if(!q.numel()) return {delta,logz,meta};
  auto stream=at::cuda::getCurrentCUDAStream(q.get_device());
- dim3 grid((q.size(1)+63)/64,q.size(0)*q.size(2));
  AT_DISPATCH_REDUCED_FLOATING_TYPES(q.scalar_type(),"precision_row_statistics",[&]{
   using E=std::conditional_t<std::is_same_v<scalar_t,c10::Half>,cutlass::half_t,cutlass::bfloat16_t>;
-  auto launch=[&](auto bucket,auto tag){constexpr int D=decltype(bucket)::value;constexpr bool segments=decltype(tag)::value;
-    auto kernel=RowStatisticsSm90<E,D,segments>;
-    constexpr int smem=sizeof(StatisticsShared<E,D>);
-    C10_CUDA_CHECK(cudaFuncSetAttribute(kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,smem));
-    kernel<<<grid,128,smem,stream>>>(
-      reinterpret_cast<E*>(q.data_ptr()),reinterpret_cast<E*>(k.data_ptr()),reinterpret_cast<E*>(v.data_ptr()),reinterpret_cast<E*>(g.data_ptr()),left.data_ptr<int>(),right.data_ptr<int>(),qs ? qs->data_ptr<int64_t>() : nullptr,ks ? ks->data_ptr<int64_t>() : nullptr,delta.data_ptr<float>(),logz.data_ptr<float>(),meta.data_ptr<float>(),q.size(1),k.size(1),q.size(2),k.size(2),q.size(3),v.size(3),q.size(0),float(scale));};
   auto rectangular=[&](auto bucket,auto vbucket,auto tag){
     constexpr int D=decltype(bucket)::value,DV=decltype(vbucket)::value;
     constexpr bool segments=decltype(tag)::value;
-    if constexpr(D==DV){launch(bucket,tag);}else{
-      auto kernel=RectangularRowStatisticsSm90<E,D,DV,segments>;
-      constexpr int smem=sizeof(RectangularStatisticsShared<E,D,DV>);
-      C10_CUDA_CHECK(cudaFuncSetAttribute(kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,smem));
-      kernel<<<grid,128,smem,stream>>>(
-        reinterpret_cast<E*>(q.data_ptr()),reinterpret_cast<E*>(k.data_ptr()),reinterpret_cast<E*>(v.data_ptr()),reinterpret_cast<E*>(g.data_ptr()),left.data_ptr<int>(),right.data_ptr<int>(),qs ? qs->data_ptr<int64_t>() : nullptr,ks ? ks->data_ptr<int64_t>() : nullptr,delta.data_ptr<float>(),logz.data_ptr<float>(),meta.data_ptr<float>(),q.size(1),k.size(1),q.size(2),k.size(2),q.size(3),v.size(3),q.size(0),float(scale));
-    }
+    // One K/V stage when it raises CTAs per SM (D+DV between 128 and 512);
+    // 64/64 and 256/256 keep the double-buffered ring.
+    constexpr int Stages=D+DV>128 && D+DV<512 ? 1 : 2;
+    // Two warpgroups share each K/V tile (128 query rows per CTA) when two such
+    // CTAs still fit per SM; each row's arithmetic is independent of Groups.
+    constexpr int Groups=sizeof(StatisticsShared<E,D,DV,Stages,2>)<=113*1024 ? 2 : 1;
+    auto kernel=RowStatisticsSm90<E,D,DV,segments,Stages,Groups>;
+    constexpr int smem=sizeof(StatisticsShared<E,D,DV,Stages,Groups>);
+    C10_CUDA_CHECK(cudaFuncSetAttribute(kernel,cudaFuncAttributeMaxDynamicSharedMemorySize,smem));
+    // 1-D grid; the kernel orders query blocks heaviest first.
+    const dim3 grid(unsigned(((q.size(1)+64*Groups-1)/(64*Groups))*q.size(0)*q.size(2)));
+    kernel<<<grid,128*Groups,smem,stream>>>(
+      reinterpret_cast<E*>(q.data_ptr()),reinterpret_cast<E*>(k.data_ptr()),reinterpret_cast<E*>(v.data_ptr()),reinterpret_cast<E*>(g.data_ptr()),left.data_ptr<int>(),right.data_ptr<int>(),qs ? qs->data_ptr<int64_t>() : nullptr,ks ? ks->data_ptr<int64_t>() : nullptr,exact ? exact->data_ptr<int>() : nullptr,delta.data_ptr<float>(),logz.data_ptr<float>(),meta.data_ptr<float>(),q.size(1),k.size(1),q.size(2),k.size(2),q.size(3),v.size(3),q.size(0),float(scale));
   };
   auto segments=[&](auto bucket,auto vbucket){if(qs)rectangular(bucket,vbucket,std::true_type{});else rectangular(bucket,vbucket,std::false_type{});};
   auto values=[&](auto bucket){int width=v.size(3);if(width<=64)segments(bucket,std::integral_constant<int,64>{});else if(width<=128)segments(bucket,std::integral_constant<int,128>{});else segments(bucket,std::integral_constant<int,256>{});};

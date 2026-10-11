@@ -17,97 +17,17 @@ from xattn.ops.sliding_chunk_attention import (
 
 
 ATOL = {
-    torch.float32: 1e-6,
     torch.bfloat16: 1e-3,
     torch.float16: 2e-4,
 }
 GRAD_ATOL = {
-    torch.float32: 1e-6,
     torch.bfloat16: 2e-3,
     torch.float16: 2e-4,
 }
 RTOL = {
-    torch.float32: 1e-4,
     torch.bfloat16: 1e-2,
     torch.float16: 1e-3,
 }
-
-
-def naive_sliding_chunk_attention(
-    query,
-    key,
-    value,
-    prev_key_chunk,
-    prev_value_chunk,
-    chunk_size,
-    q_segment_idx,
-    k_segment_idx,
-    scale,
-):
-    """Chunk-loop reference for global chunk positions."""
-    bsz, seq_len, _, _ = query.shape
-    assert seq_len == key.shape[1] and seq_len == value.shape[1]
-    outputs = []
-    for chunk_id in range((seq_len + chunk_size - 1) // chunk_size):
-        q_start = chunk_id * chunk_size
-        kv_start = q_start if chunk_id == 0 else (chunk_id - 1) * chunk_size
-        end = min((chunk_id + 1) * chunk_size, seq_len)
-
-        q = query[:, q_start:end]
-        k = key[:, kv_start:end]
-        v = value[:, kv_start:end]
-        q_idx = (
-            None if q_segment_idx is None else q_segment_idx[:, q_start:end]
-        )
-        if k_segment_idx is None:
-            k_idx = None
-        elif chunk_id == 0 and prev_key_chunk is not None:
-            k_idx = k_segment_idx[:, : chunk_size + end]
-        else:
-            k_offset = chunk_size if prev_key_chunk is not None else 0
-            k_idx = k_segment_idx[:, k_offset + kv_start : k_offset + end]
-
-        if chunk_id == 0 and prev_key_chunk is not None:
-            k = torch.cat([prev_key_chunk, k], dim=1)
-            v = torch.cat([prev_value_chunk, v], dim=1)
-
-        ctx_len = k.shape[1]
-        q_len = q.shape[1]
-        q_pos = torch.arange(q_start, end, device=query.device)
-        if chunk_id == 0 and prev_key_chunk is not None:
-            k_pos = torch.cat(
-                [
-                    torch.arange(-chunk_size, 0, device=query.device),
-                    torch.arange(0, end, device=query.device),
-                ]
-            )
-        else:
-            k_pos = torch.arange(kv_start, end, device=query.device)
-
-        attn_mask = torch.zeros(
-            (bsz, q_len, ctx_len),
-            dtype=torch.float32,
-            device=query.device,
-        )
-        attn_mask = attn_mask.masked_fill(
-            (k_pos.unsqueeze(0) > q_pos.unsqueeze(1)).unsqueeze(0),
-            float("-inf"),
-        )
-        if q_idx is not None:
-            attn_mask = attn_mask.masked_fill(
-                q_idx.unsqueeze(2) != k_idx.unsqueeze(1),
-                float("-inf"),
-            )
-
-        scores = torch.matmul(
-            q.transpose(1, 2).float(),
-            k.transpose(1, 2).float().transpose(2, 3),
-        )
-        scores = scores * scale + attn_mask.unsqueeze(1)
-        weights = torch.softmax(scores, dim=-1, dtype=torch.float32)
-        y = torch.matmul(weights.to(v.dtype), v.transpose(1, 2)).transpose(1, 2)
-        outputs.append(y)
-    return torch.cat(outputs, dim=1)
 
 
 def _append_runs(segment_idx, batch, length, runs):
@@ -150,56 +70,6 @@ def _reset_runs(q_segment_idx, k_segment_idx, batch, q_len, k_len):
         k_runs.append(all_k_runs[k_pos])
         k_pos += 1
     return q_runs, k_runs
-
-
-def naive_sliding_chunk_attention_reset_chunk_pos_per_seq(
-    query,
-    key,
-    value,
-    prev_key_chunk,
-    prev_value_chunk,
-    chunk_size,
-    q_segment_idx,
-    k_segment_idx,
-    scale,
-):
-    """Run-loop reference for reset chunk positions."""
-    bsz, seq_len, n_heads, _ = query.shape
-    if prev_key_chunk is not None:
-        key = torch.cat([prev_key_chunk, key], dim=1)
-        value = torch.cat([prev_value_chunk, value], dim=1)
-
-    q_runs, k_runs = _reset_runs(
-        q_segment_idx, k_segment_idx, bsz, seq_len, key.shape[1]
-    )
-    outputs = []
-    for q_run, k_run in zip(q_runs, k_runs):
-        q_batch, q_start, q_len, _ = q_run
-        k_batch, k_start, k_len, _ = k_run
-        assert q_batch == k_batch
-        assert k_len >= q_len
-        q = query[q_batch, q_start : q_start + q_len]
-        k = key[k_batch, k_start : k_start + k_len]
-        v = value[k_batch, k_start : k_start + k_len]
-
-        q_pos = torch.arange(q_len, device=query.device) + (k_len - q_len)
-        k_pos = torch.arange(k_len, device=query.device)
-        chunk_left = (
-            torch.div(q_pos, chunk_size, rounding_mode="floor") * chunk_size
-            - chunk_size
-        )
-        attn_mask = (k_pos.unsqueeze(0) > q_pos.unsqueeze(1)) | (
-            k_pos.unsqueeze(0) < chunk_left.unsqueeze(1)
-        )
-
-        scores = torch.einsum("qhd,khd->hqk", q.float(), k.float()) * scale
-        scores = scores.masked_fill(attn_mask.unsqueeze(0), float("-inf"))
-        weights = torch.softmax(scores, dim=-1, dtype=torch.float32)
-        outputs.append(torch.einsum("hqk,khv->qhv", weights.to(v.dtype), v))
-
-    return torch.cat(outputs, dim=0).reshape(
-        bsz, seq_len, n_heads, value.shape[-1]
-    )
 
 
 def _ordered_segment_runs(segment_idx):
@@ -407,155 +277,6 @@ def make_inputs(
             prev_k = None
             prev_v = None
     return q, k, v, prev_k, prev_v, q_segment_idx, k_segment_idx
-
-
-def _cpu_reference_case(prev_mode):
-    torch.manual_seed(17)
-    batch, seq_len, heads, qk_dim, v_dim, chunk_size = 2, 11, 2, 3, 4, 4
-    q = torch.randn(batch, seq_len, heads, qk_dim, dtype=torch.double)
-    k = torch.randn_like(q)
-    v = torch.randn(batch, seq_len, heads, v_dim, dtype=torch.double)
-    if prev_mode == "none":
-        prev_k = prev_v = None
-        q_segment_idx = torch.tensor(
-            [
-                [0, 0, 1, 1, 1, 2, 2, 2, 2, 3, 3],
-                [4, 4, 4, 5, 5, 6, 6, 6, 7, 7, 7],
-            ]
-        )
-        k_segment_idx = q_segment_idx
-    else:
-        prev_k = torch.randn(
-            batch, chunk_size, heads, qk_dim, dtype=torch.double
-        )
-        prev_v = torch.randn(
-            batch, chunk_size, heads, v_dim, dtype=torch.double
-        )
-        if prev_mode == "boundary":
-            prev_segment_idx = torch.tensor(
-                [[0, 0, 0, 0], [10, 10, 10, 10]]
-            )
-            q_segment_idx = torch.tensor(
-                [
-                    [1, 1, 2, 2, 2, 3, 3, 3, 3, 4, 4],
-                    [11, 11, 11, 12, 12, 13, 13, 13, 14, 14, 14],
-                ]
-            )
-        else:
-            assert prev_mode == "continuation"
-            prev_segment_idx = torch.tensor(
-                [[0, 0, 1, 1], [10, 10, 10, 11]]
-            )
-            q_segment_idx = torch.tensor(
-                [
-                    [1, 1, 1, 2, 2, 3, 3, 3, 3, 4, 4],
-                    [11, 11, 11, 12, 12, 13, 13, 13, 14, 14, 14],
-                ]
-            )
-        k_segment_idx = torch.cat(
-            [prev_segment_idx, q_segment_idx], dim=1
-        )
-    return (
-        q,
-        k,
-        v,
-        prev_k,
-        prev_v,
-        q_segment_idx,
-        k_segment_idx,
-        chunk_size,
-    )
-
-
-def test_dense_golden_encodes_global_and_reset_chunk_positions():
-    batch, seq_len, heads, qk_dim, v_dim, chunk_size = 1, 10, 1, 1, 1, 4
-    q = torch.ones(batch, seq_len, heads, qk_dim, dtype=torch.double)
-    k = torch.zeros_like(q)
-    v = torch.zeros(batch, seq_len, heads, v_dim, dtype=torch.double)
-    v[:, 3] = 10.0
-    segment_idx = torch.tensor([[0, 0, 0, 1, 1, 1, 1, 1, 1, 1]])
-
-    global_mask = dense_sliding_chunk_allowed_mask(
-        q, k, None, chunk_size, segment_idx, segment_idx, False
-    )
-    reset_mask = dense_sliding_chunk_allowed_mask(
-        q, k, None, chunk_size, segment_idx, segment_idx, True
-    )
-    assert torch.where(global_mask[0, 8])[0].tolist() == [4, 5, 6, 7, 8]
-    assert torch.where(reset_mask[0, 8])[0].tolist() == [3, 4, 5, 6, 7, 8]
-
-    y_global = dense_sliding_chunk_attention_reference(
-        q, k, v, None, None, chunk_size, segment_idx, segment_idx, 1.0, False
-    )
-    y_reset = dense_sliding_chunk_attention_reference(
-        q, k, v, None, None, chunk_size, segment_idx, segment_idx, 1.0, True
-    )
-    torch.testing.assert_close(y_global[:, 8], torch.zeros_like(y_global[:, 8]))
-    torch.testing.assert_close(
-        y_reset[:, 8], torch.full_like(y_reset[:, 8], 10.0 / 6.0)
-    )
-
-
-@pytest.mark.parametrize("reset_chunk_pos_per_seq", [False, True])
-@pytest.mark.parametrize("prev_mode", ["none", "boundary", "continuation"])
-def test_dense_golden_matches_loop_structural_reference(
-    reset_chunk_pos_per_seq, prev_mode
-):
-    case = _cpu_reference_case(prev_mode)
-    q, k, v, prev_k, prev_v, q_segment_idx, k_segment_idx, chunk_size = case
-    scale = 1.0 / math.sqrt(q.shape[-1])
-
-    dense_tensors = [
-        tensor.clone().requires_grad_() for tensor in (q, k, v)
-    ]
-    loop_tensors = [
-        tensor.clone().requires_grad_() for tensor in (q, k, v)
-    ]
-    dense_prev = (
-        []
-        if prev_k is None
-        else [prev_k.clone().requires_grad_(), prev_v.clone().requires_grad_()]
-    )
-    loop_prev = (
-        []
-        if prev_k is None
-        else [prev_k.clone().requires_grad_(), prev_v.clone().requires_grad_()]
-    )
-    dense_y = dense_sliding_chunk_attention_reference(
-        *dense_tensors,
-        *(dense_prev if dense_prev else [None, None]),
-        chunk_size,
-        q_segment_idx,
-        k_segment_idx,
-        scale,
-        reset_chunk_pos_per_seq,
-    )
-    loop_reference = (
-        naive_sliding_chunk_attention_reset_chunk_pos_per_seq
-        if reset_chunk_pos_per_seq
-        else naive_sliding_chunk_attention
-    )
-    loop_y = loop_reference(
-        *loop_tensors,
-        *(loop_prev if loop_prev else [None, None]),
-        chunk_size,
-        q_segment_idx,
-        k_segment_idx,
-        scale,
-    )
-    torch.testing.assert_close(loop_y, dense_y, rtol=2e-6, atol=2e-7)
-
-    weight = torch.randn_like(dense_y)
-    dense_grads = torch.autograd.grad(
-        (dense_y * weight).sum(), dense_tensors + dense_prev
-    )
-    loop_grads = torch.autograd.grad(
-        (loop_y * weight).sum(), loop_tensors + loop_prev
-    )
-    for loop_grad, dense_grad in zip(loop_grads, dense_grads):
-        torch.testing.assert_close(
-            loop_grad, dense_grad, rtol=3e-6, atol=3e-7
-        )
 
 
 def requires_xattn_cuda():

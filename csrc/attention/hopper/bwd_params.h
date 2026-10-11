@@ -86,6 +86,9 @@ struct AttentionBwdParams {
   const float* hp_delta = nullptr;
   float* hp_rho = nullptr;  // four planes of FP64 statistics (internal transport)
   float* hp_mass = nullptr; // max, anchored dP, scale, anchor, left, right
+  // Deterministic levels 3/4: per-row exponent e with sum_j |dS_ij| < 2^e; the
+  // statistics planes then hold int64 sums on a fixed 2^(e-62) grid.
+  const int* hp_rho_exponent = nullptr;
 
 };
 

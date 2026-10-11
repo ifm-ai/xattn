@@ -180,14 +180,16 @@ FlashSoftDeltaBwd(
     auto correction_done = event_pool.get(current.device_index());
     inputs_ready->record(current);
     inputs_ready->block(read_stream);
+    // The gate is launched first: queued after the read backward it would
+    // wait for that kernel's tiles, and the correction backward needs it.
+    run_gate();
+    gate_ready->record(current);
+    gate_ready->block(correction_stream);
     {
       c10::cuda::CUDAStreamGuard stream_guard(read_stream);
       read_gradients = run_read();
       read_done->record(read_stream);
     }
-    run_gate();
-    gate_ready->record(current);
-    gate_ready->block(correction_stream);
     {
       c10::cuda::CUDAStreamGuard stream_guard(correction_stream);
       correction_gradients = run_correction();

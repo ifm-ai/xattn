@@ -61,6 +61,27 @@ def _select_routes(
                 return (True, True)
             else:
                 return (True, False) if needs_backward else (True, True)
+    if tokens <= 256 * num_runs:
+        fwd, bwd = _short_run_routes(
+            tokens, num_runs, max_seqlen, d, value_dim, heads, kv_heads, span,
+            sliding_chunk, softdelta, deterministic, needs_backward)
+        # Previous K/V changes segment-backward costs; nondeterministic
+        # backward keeps the general rules there.
+        if has_previous and needs_backward and not deterministic:
+            bwd = _general_routes(
+                tokens, num_runs, max_seqlen, d, value_dim, batch, heads,
+                kv_heads, span, full_visibility, deterministic, needs_backward)[1]
+        return fwd, bwd
+    return _general_routes(
+        tokens, num_runs, max_seqlen, d, value_dim, batch, heads, kv_heads,
+        span, full_visibility, deterministic, needs_backward)
+
+
+def _general_routes(
+    tokens: int, num_runs: int, max_seqlen: int, d: int, value_dim: int,
+    batch: int, heads: int, kv_heads: int, span: int, full_visibility: bool,
+    deterministic: bool, needs_backward: bool,
+) -> Tuple[bool, bool]:
     # Forward routing thresholds.
     if tokens <= 32 * (num_runs):
         if max_seqlen <= 128:
@@ -113,6 +134,60 @@ def _select_routes(
                     return fwd, True
             else:
                 return fwd, False
+
+
+def _short_run_routes(
+    tokens: int, num_runs: int, max_seqlen: int, d: int, value_dim: int,
+    heads: int, kv_heads: int, span: int, sliding_chunk: bool, softdelta: bool,
+    deterministic: bool, needs_backward: bool,
+) -> Tuple[bool, bool]:
+    """Routes for mean run lengths <= 256 tokens.
+
+    Packed varlen launches max_seqlen-sized tiles for every run, so short or
+    skewed runs mostly favour segment ids.
+    """
+    mean = tokens / num_runs
+    skew = max_seqlen / mean
+    wide_v = value_dim > d
+    # Packed backward is faster for the D/V 64/128 bucket beyond very short runs.
+    dv_64_128 = 32 < d <= 64 and 96 < value_dim <= 128
+    mha = heads == kv_heads
+    if mean <= 32:
+        fwd = False
+    elif mean <= 192:
+        fwd = sliding_chunk and (d <= 128 or not softdelta)
+    else:
+        fwd = d <= 64 or not softdelta
+    if not needs_backward:
+        return fwd, fwd
+    if deterministic:
+        # Grouped heads keep ordered dK/dV, which packed short runs serialize;
+        # MHA with D <= 64 is faster packed for sliding chunks and 64/128.
+        if mha and d <= 64 and ((sliding_chunk and mean > 24) or (dv_64_128 and mean > 32)):
+            return fwd, True
+        if mean <= 64:
+            return fwd, False
+        if sliding_chunk and not softdelta and 64 < d <= 128 and mean > 192:
+            return fwd, True
+        if mean <= 96 or value_dim <= 64:
+            return fwd, sliding_chunk and d <= 64
+        if d <= 128:
+            return fwd, d <= 64
+        return fwd, tokens <= 16384
+    if not sliding_chunk:
+        if dv_64_128 and mean > 16:
+            return fwd, True
+        if tokens <= 8192:
+            return fwd, skew <= 32 and wide_v
+        return fwd, mean > 192 and wide_v
+    if d <= 64:
+        if not wide_v:
+            return fwd, mean > 24
+        return fwd, skew <= 64
+    # Plain sliding chunks of at least 4096 keys favour packed even runs.
+    if not softdelta and span >= 4096 and skew <= 2 and mean > 48:
+        return fwd, True
+    return fwd, mean > 96 and skew <= 16
 
 
 def select_flash_swa_bos_routes(

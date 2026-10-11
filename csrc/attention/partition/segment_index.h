@@ -110,9 +110,12 @@ int segment_upper_bound(
     return lo;
 }
 
+// Returns {n_block_min, n_block_max, full_min, full_max}: blocks in
+// [full_min, full_max) are full tiles (Q tile in one segment, every key of the
+// block in it); the range is empty when the Q tile spans several segments.
 template <int kBlockM, int kBlockN>
 CUTLASS_DEVICE
-cute::tuple<int, int> segment_n_block_min_max(
+cute::tuple<int, int, int, int> segment_n_block_min_max_full(
     int n_block_min,
     int n_block_max,
     int const m_block,
@@ -123,13 +126,13 @@ cute::tuple<int, int> segment_n_block_min_max(
     int const k_segment_len,
     int const bidb) {
     if (q_segment_idx == nullptr || k_segment_idx == nullptr || k_segment_len <= 0) {
-        return {n_block_min, n_block_max};
+        return {n_block_min, n_block_max, n_block_min, n_block_max};
     }
 
     int const q_start = m_block * kBlockM;
     int const q_end = q_start + kBlockM < seqlen_q ? q_start + kBlockM : seqlen_q;
     if (q_start >= q_end || n_block_min >= n_block_max) {
-        return {n_block_min, n_block_min};
+        return {n_block_min, n_block_min, 0, 0};
     }
 
     int const k_segment_offset = k_segment_len == seqlen_k ? 0 : k_segment_len - seqlen_q;
@@ -138,7 +141,7 @@ cute::tuple<int, int> segment_n_block_min_max(
     int const k_begin = k_segment_offset + k_pos_begin;
     int const k_end = k_segment_offset + k_pos_end_raw;
     if (k_begin < 0 || k_end > k_segment_len || k_begin >= k_end) {
-        return {n_block_min, n_block_min};
+        return {n_block_min, n_block_min, 0, 0};
     }
 
     int64_t q_seg_first = q_segment_idx[bidb * seqlen_q + q_start];
@@ -153,14 +156,139 @@ cute::tuple<int, int> segment_n_block_min_max(
     int const k_match_begin = segment_lower_bound(k_segment_base, k_begin, k_end, q_seg_first);
     int const k_match_end = segment_upper_bound(k_segment_base, k_match_begin, k_end, q_seg_last);
     if (k_match_end <= k_match_begin) {
-        return {n_block_min, n_block_min};
+        return {n_block_min, n_block_min, 0, 0};
     }
 
     int const k_pos_match_begin = k_match_begin - k_segment_offset;
     int const k_pos_match_end = k_match_end - k_segment_offset;
     int const new_n_block_min = std::max(n_block_min, k_pos_match_begin / kBlockN);
     int const new_n_block_max = std::min(n_block_max, (k_pos_match_end + kBlockN - 1) / kBlockN);
-    return {new_n_block_min, new_n_block_max};
+    // Blocks entirely inside [k_pos_match_begin, k_pos_match_end); the last
+    // block may end at seqlen_k.
+    int full_min = 0, full_max = 0;
+    if (q_seg_first == q_seg_last) {
+        full_min = (k_pos_match_begin + kBlockN - 1) / kBlockN;
+        full_max = k_pos_match_end == seqlen_k ? (seqlen_k + kBlockN - 1) / kBlockN
+                                               : k_pos_match_end / kBlockN;
+    }
+    return {new_n_block_min, new_n_block_max, full_min, full_max};
+}
+
+// Same result as segment_n_block_min_max_full from a precomputed span
+// {lower_bound(q_seg_first), upper_bound(q_seg_last), single segment} over all
+// k_segment_len keys: for nondecreasing ids the bounds restricted to the window
+// range are the global bounds clamped to it.
+template <int kBlockM, int kBlockN>
+CUTLASS_DEVICE
+cute::tuple<int, int, int, int> segment_n_block_min_max_full_span(
+    int n_block_min,
+    int n_block_max,
+    int const m_block,
+    int const seqlen_q,
+    int const seqlen_k,
+    int const k_segment_len,
+    int4 const span) {
+    int const q_start = m_block * kBlockM;
+    int const q_end = q_start + kBlockM < seqlen_q ? q_start + kBlockM : seqlen_q;
+    if (q_start >= q_end || n_block_min >= n_block_max) {
+        return {n_block_min, n_block_min, 0, 0};
+    }
+    int const k_segment_offset = k_segment_len == seqlen_k ? 0 : k_segment_len - seqlen_q;
+    int const k_pos_begin = n_block_min * kBlockN;
+    int const k_pos_end_raw = n_block_max * kBlockN < seqlen_k ? n_block_max * kBlockN : seqlen_k;
+    int const k_begin = k_segment_offset + k_pos_begin;
+    int const k_end = k_segment_offset + k_pos_end_raw;
+    if (k_begin < 0 || k_end > k_segment_len || k_begin >= k_end) {
+        return {n_block_min, n_block_min, 0, 0};
+    }
+    int const k_match_begin = span.x < k_begin ? k_begin : (span.x > k_end ? k_end : span.x);
+    int const k_match_end = span.y < k_match_begin ? k_match_begin : (span.y > k_end ? k_end : span.y);
+    if (k_match_end <= k_match_begin) {
+        return {n_block_min, n_block_min, 0, 0};
+    }
+    int const k_pos_match_begin = k_match_begin - k_segment_offset;
+    int const k_pos_match_end = k_match_end - k_segment_offset;
+    int const new_n_block_min = std::max(n_block_min, k_pos_match_begin / kBlockN);
+    int const new_n_block_max = std::min(n_block_max, (k_pos_match_end + kBlockN - 1) / kBlockN);
+    int full_min = 0, full_max = 0;
+    if (span.z) {
+        full_min = (k_pos_match_begin + kBlockN - 1) / kBlockN;
+        full_max = k_pos_match_end == seqlen_k ? (seqlen_k + kBlockN - 1) / kBlockN
+                                               : k_pos_match_end / kBlockN;
+    }
+    return {new_n_block_min, new_n_block_max, full_min, full_max};
+}
+
+// One thread per (batch, query row): keys of the row's segment (storage index).
+CUTLASS_DEVICE
+int2 segment_row_interval(
+    int const q_pos, int const seqlen_q,
+    int64_t const* const q_segment_idx,
+    int64_t const* const k_segment_idx,
+    int const k_segment_len, int const bidb) {
+    int64_t const q_seg = q_segment_idx[bidb * seqlen_q + q_pos];
+    int64_t const* const k_segment_base = k_segment_idx + bidb * k_segment_len;
+    int const lower = segment_lower_bound(k_segment_base, 0, k_segment_len, q_seg);
+    int const upper = segment_upper_bound(k_segment_base, lower, k_segment_len, q_seg);
+    return make_int2(lower, upper);
+}
+
+// One thread per (batch, key position): queries of the key's segment.
+CUTLASS_DEVICE
+int2 segment_key_interval(
+    int const k_pos, int const seqlen_q, int const seqlen_k,
+    int64_t const* const q_segment_idx,
+    int64_t const* const k_segment_idx,
+    int const k_segment_len, int const bidb) {
+    int const k_segment_offset = k_segment_len == seqlen_k ? 0 : k_segment_len - seqlen_q;
+    int const k_store = k_segment_offset + k_pos;
+    if (k_store < 0 || k_store >= k_segment_len) { return make_int2(0, 0); }
+    int64_t const k_seg = k_segment_idx[bidb * k_segment_len + k_store];
+    int64_t const* const q_segment_base = q_segment_idx + bidb * seqlen_q;
+    int const lower = segment_lower_bound(q_segment_base, 0, seqlen_q, k_seg);
+    int const upper = segment_upper_bound(q_segment_base, lower, seqlen_q, k_seg);
+    return make_int2(lower, upper);
+}
+
+// One thread per (batch, Q tile of kBlockM rows).
+template <int kBlockM>
+CUTLASS_DEVICE
+int4 segment_q_tile_span(
+    int const m_block, int const seqlen_q,
+    int64_t const* const q_segment_idx,
+    int64_t const* const k_segment_idx,
+    int const k_segment_len, int const bidb) {
+    int const q_start = m_block * kBlockM;
+    int const q_end = q_start + kBlockM < seqlen_q ? q_start + kBlockM : seqlen_q;
+    int64_t q_seg_first = q_segment_idx[bidb * seqlen_q + q_start];
+    int64_t q_seg_last = q_segment_idx[bidb * seqlen_q + q_end - 1];
+    if (q_seg_last < q_seg_first) {
+        int64_t const tmp = q_seg_first;
+        q_seg_first = q_seg_last;
+        q_seg_last = tmp;
+    }
+    int64_t const* const k_segment_base = k_segment_idx + bidb * k_segment_len;
+    int const lower = segment_lower_bound(k_segment_base, 0, k_segment_len, q_seg_first);
+    int const upper = segment_upper_bound(k_segment_base, lower, k_segment_len, q_seg_last);
+    return make_int4(lower, upper, int(q_seg_first == q_seg_last), 0);
+}
+
+template <int kBlockM, int kBlockN>
+CUTLASS_DEVICE
+cute::tuple<int, int> segment_n_block_min_max(
+    int n_block_min,
+    int n_block_max,
+    int const m_block,
+    int const seqlen_q,
+    int const seqlen_k,
+    int64_t const* const q_segment_idx,
+    int64_t const* const k_segment_idx,
+    int const k_segment_len,
+    int const bidb) {
+    auto const r = segment_n_block_min_max_full<kBlockM, kBlockN>(
+        n_block_min, n_block_max, m_block, seqlen_q, seqlen_k,
+        q_segment_idx, k_segment_idx, k_segment_len, bidb);
+    return {cute::get<0>(r), cute::get<1>(r)};
 }
 
 template <int kBlockM, int kBlockN>
@@ -342,6 +470,18 @@ struct SegmentPartitionPolicy {
         int64_t const* const k_segment_idx, int const k_segment_len,
         int const bidb) {
         return segment_n_block_min_max<kBlockM, kBlockN>(
+            n_block_min, n_block_max, m_block, seqlen_q, seqlen_k,
+            q_segment_idx, k_segment_idx, k_segment_len, bidb);
+    }
+
+    CUTLASS_DEVICE
+    static cute::tuple<int, int, int, int> fwd_n_block_range_full(
+        int const n_block_min, int const n_block_max, int const m_block,
+        int const seqlen_q, int const seqlen_k,
+        int64_t const* const q_segment_idx,
+        int64_t const* const k_segment_idx, int const k_segment_len,
+        int const bidb) {
+        return segment_n_block_min_max_full<kBlockM, kBlockN>(
             n_block_min, n_block_max, m_block, seqlen_q, seqlen_k,
             q_segment_idx, k_segment_idx, k_segment_len, bidb);
     }

@@ -177,6 +177,27 @@ struct AttentionFwdEpilogueArguments {
   }
 };
 
+// Segment forward pre-pass: key span of each (batch, Q tile) and the key
+// interval of each (batch, query row).
+template <int kBlockM>
+__global__ void AttentionSegmentFwdSpanKernel(
+    int num_batch, int seqlen_q, int num_m_blocks,
+    int64_t const* q_segment_idx, int64_t const* k_segment_idx,
+    int k_segment_len, int4* spans, int2* rows) {
+  int const i = int(blockIdx.x) * int(blockDim.x) + int(threadIdx.x);
+  if (i < num_batch * seqlen_q) {
+    int const bidb = i / seqlen_q;
+    rows[i] = attention::partition::segment_row_interval(
+        i - bidb * seqlen_q, seqlen_q, q_segment_idx, k_segment_idx,
+        k_segment_len, bidb);
+  }
+  if (i >= num_batch * num_m_blocks) { return; }
+  int const bidb = i / num_m_blocks;
+  spans[i] = attention::partition::segment_q_tile_span<kBlockM>(
+      i - bidb * num_m_blocks, seqlen_q, q_segment_idx, k_segment_idx,
+      k_segment_len, bidb);
+}
+
 template <
     int kHeadDim, int kHeadDimV, typename Element, typename ElementOut,
     bool kVarlen, bool kHasSegment, bool kUsePersistentScheduler,
@@ -303,6 +324,36 @@ void RunAttentionFwdSm90KernelTile(
   StrideV v_strides = make_stride(
       params.v_row_stride, _1{}, params.v_head_stride, params.v_batch_stride);
 
+  torch::Tensor segment_spans, segment_rows;
+  int4 const* segment_spans_ptr = nullptr;
+  int2 const* segment_rows_ptr = nullptr;
+  if constexpr (kHasSegment && !kSoftDeltaPair && !kSoftDeltaSingleCTA &&
+                CollectiveMainloop::SegmentTileRanges) {
+    if (params.q_segment_idx != nullptr && params.k_segment_idx != nullptr &&
+        params.k_segment_len > 0 && params.seqlen_q > 0) {
+      int const span_m_blocks = cutlass::ceil_div(params.seqlen_q, kBlockM);
+      int const span_count = params.b * span_m_blocks;
+      segment_spans = torch::empty(
+          {span_count, 4},
+          torch::TensorOptions().device(torch::kCUDA).dtype(at::kInt));
+      int const row_count = params.b * params.seqlen_q;
+      segment_rows = torch::empty(
+          {row_count, 2},
+          torch::TensorOptions().device(torch::kCUDA).dtype(at::kInt));
+      AttentionSegmentFwdSpanKernel<kBlockM>
+          <<<cutlass::ceil_div(std::max(span_count, row_count), 256), 256, 0, stream>>>(
+              params.b, params.seqlen_q, span_m_blocks, params.q_segment_idx,
+              params.k_segment_idx, params.k_segment_len,
+              reinterpret_cast<int4*>(segment_spans.data_ptr<int>()),
+              reinterpret_cast<int2*>(segment_rows.data_ptr<int>()));
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
+      segment_spans_ptr = reinterpret_cast<int4 const*>(segment_spans.data_ptr<int>());
+      segment_rows_ptr = reinterpret_cast<int2 const*>(segment_rows.data_ptr<int>());
+    }
+    TORCH_CHECK(!CollectiveMainloop::SegmentRowIntervals || params.seqlen_q == 0 ||
+                    segment_rows_ptr != nullptr,
+                "attention SM90 FWD segment masks need q/k segment ids");
+  }
   typename CollectiveMainloop::Arguments mainloop_args{
       static_cast<Element const*>(params.q_ptr),
       {params.seqlen_q, params.d, params.h, params.b},
@@ -358,7 +409,8 @@ void RunAttentionFwdSm90KernelTile(
       nullptr,
       kVarlen ? params.q_position_offsets : nullptr,
       kHasSegment ? params.q_chunk_positions : nullptr,
-      kHasSegment ? params.reset_attention_chunk : 0};
+      kHasSegment ? params.reset_attention_chunk : 0,
+      segment_spans_ptr, segment_rows_ptr};
 
   typename CollectiveEpilogue::Arguments epilogue_args =
       EpilogueArguments::template Make<CollectiveEpilogue>(params);

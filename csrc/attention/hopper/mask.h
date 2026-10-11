@@ -26,7 +26,8 @@ template <int kBlockM, int kBlockN, bool PackGQA, typename TiledMma,
           bool DenseTileFastPath=false, bool IsSlidingChunk=false,
           bool DirectChunkTileFastPath=IsSlidingChunk,
           bool AllowReset=HasSegment,
-          int BranchPairLogicalBlockM=0>
+          int BranchPairLogicalBlockM=0,
+          bool SegmentTileRanges=true>
 struct Mask
     : xattn::ops::attention::hopper::semantics::
           SegmentPartitionStorage<HasSegment> {
@@ -51,6 +52,12 @@ struct Mask
     int const chunk_position_offset;
     int const* const q_chunk_positions;
     cutlass::FastDivmod const reset_attention_chunk_divmod;
+    // Segment forward: n blocks known to be full tiles for the current m block.
+    int segment_full_min = 0, segment_full_max = 0;
+    // Segment forward: per query row key interval {lower, upper} (storage index).
+    int2 const* segment_rows = nullptr;
+    // Segment backward: per key query interval {lower, upper} (query positions).
+    int2 const* segment_key_rows = nullptr;
 
     CUTLASS_DEVICE
     Mask(const int thread_idx, const int seqlen_q, const int seqlen_k,
@@ -80,6 +87,88 @@ struct Mask
         , reset_attention_chunk_divmod(reset_attention_chunk_divmod)
     {
     };
+
+    // Segment mask from per-row key intervals (nondecreasing ids): tiles in
+    // [segment_full_min, segment_full_max) are full; elsewhere a key is kept
+    // when it lies in its row's interval.
+    template <typename Engine, typename Layout>
+    CUTLASS_DEVICE
+    void apply_segment_rows(Tensor<Engine, Layout> &tSrS, const int m_block, const int n_block) const {
+        static_assert(HasSegment && !SwapAB && !PackGQA && BranchPairLogicalBlockM == 0);
+        if (n_block >= segment_full_min && n_block < segment_full_max) { return; }
+        auto thread_mma = TiledMma{}.get_thread_slice(thread_idx);
+        auto thread0_mma = TiledMma{}.get_thread_slice(_0{});
+        Tensor cS = cute::make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});
+        Tensor tScS_rowcol = make_tensor(thread_mma.partition_C(cS).data(), flash::convert_layout_acc_rowcol(thread_mma.partition_C(cS).layout()));
+        Tensor t0ScS_rowcol = make_tensor(thread0_mma.partition_C(cS).data(), flash::convert_layout_acc_rowcol(thread0_mma.partition_C(cS).layout()));
+        Tensor tSrS_rowcol = make_tensor(tSrS.data(), flash::convert_layout_acc_rowcol(tSrS.layout()));
+        int const k_segment_offset = this->k_segment_len == seqlen_k ? 0 : this->k_segment_len - seqlen_q;
+        int const col_base = n_block * kBlockN + int(get<1>(tScS_rowcol(_0{}, _0{}))) + k_segment_offset;
+        #pragma unroll
+        for (int m = 0; m < size<0>(tSrS_rowcol); ++m) {
+            int const q_pos = int(get<0>(tScS_rowcol(m, _0{}))) + m_block * kBlockM;
+            int2 const r = q_pos < seqlen_q ? segment_rows[this->bidb * seqlen_q + q_pos] : make_int2(0, 0);
+            int const lo = r.x - col_base;
+            int const hi = std::min(r.y, seqlen_k + k_segment_offset) - col_base;
+            #pragma unroll
+            for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
+                int const col = int(get<1>(t0ScS_rowcol(_0{}, n)));
+                if (col < lo || col >= hi) { tSrS_rowcol(m, n) = -INFINITY; }
+            }
+        }
+    }
+
+    // Segment backward mask from the interval pre-pass (nondecreasing ids):
+    // unswapped tiles keep a key inside its query's key interval, swapped
+    // tiles keep a query inside its key's query interval.
+    template <typename Engine, typename Layout>
+    CUTLASS_DEVICE
+    void apply_segment_intervals(Tensor<Engine, Layout> &tSrS, const int m_block, const int n_block,
+                                 const int segment_relation) const {
+        static_assert(HasSegment && !PackGQA && BranchPairLogicalBlockM == 0);
+        if (segment_relation == SegmentPartition::kFull) { return; }
+        static constexpr int Row = !SwapAB ? 0 : 1, Col = !SwapAB ? 1 : 0;
+        auto thread_mma = TiledMma{}.get_thread_slice(thread_idx);
+        auto thread0_mma = TiledMma{}.get_thread_slice(_0{});
+        Tensor cS = cute::make_identity_tensor(Shape<Int<!SwapAB ? kBlockM : kBlockN>, Int<!SwapAB ? kBlockN : kBlockM>>{});
+        Tensor tScS = thread_mma.partition_C(cS);
+        Tensor t0ScS = thread0_mma.partition_C(cS);
+        Tensor tSrS_rowcol = make_tensor(tSrS.data(), flash::convert_layout_acc_rowcol</*Transposed=*/SwapAB>(tSrS.layout()));
+        Tensor tScS_rowcol = make_tensor(tScS.data(), flash::convert_layout_acc_rowcol</*Transposed=*/SwapAB>(tScS.layout()));
+        Tensor t0ScS_rowcol = make_tensor(t0ScS.data(), flash::convert_layout_acc_rowcol</*Transposed=*/SwapAB>(t0ScS.layout()));
+        int const thread_row_offset = get<Row>(tScS_rowcol(_0{}, _0{}));
+        int const thread_col_offset = get<Col>(tScS_rowcol(_0{}, _0{}));
+        if constexpr (!SwapAB) {
+            int const k_segment_offset = this->k_segment_len == seqlen_k ? 0 : this->k_segment_len - seqlen_q;
+            int const col_base = n_block * kBlockN + thread_col_offset + k_segment_offset;
+            #pragma unroll
+            for (int m = 0; m < size<0>(tSrS_rowcol); ++m) {
+                int const q_pos = get<Row>(tScS_rowcol(m, _0{})) + m_block * kBlockM;
+                int2 const r = q_pos < seqlen_q ? segment_rows[this->bidb * seqlen_q + q_pos] : make_int2(0, 0);
+                int const lo = r.x - col_base;
+                int const hi = std::min(r.y, seqlen_k + k_segment_offset) - col_base;
+                #pragma unroll
+                for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
+                    int const col = int(get<Col>(t0ScS_rowcol(_0{}, n)));
+                    if (col < lo || col >= hi) { tSrS_rowcol(m, n) = -INFINITY; }
+                }
+            }
+        } else {
+            int const row_base = m_block * kBlockM + thread_row_offset;
+            #pragma unroll
+            for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
+                int const k_pos = n_block * kBlockN + thread_col_offset + int(get<Col>(t0ScS_rowcol(_0{}, n)));
+                int2 const r = k_pos < seqlen_k ? segment_key_rows[this->bidb * seqlen_k + k_pos] : make_int2(0, 0);
+                int const lo = r.x - row_base;
+                int const hi = std::min(r.y, seqlen_q) - row_base;
+                #pragma unroll
+                for (int m = 0; m < size<0>(tSrS_rowcol); ++m) {
+                    int const row = int(get<Row>(t0ScS_rowcol(m, _0{})));
+                    if (row < lo || row >= hi) { tSrS_rowcol(m, n) = -INFINITY; }
+                }
+            }
+        }
+    }
 
     CUTLASS_DEVICE
     bool use_direct_chunk() const {
@@ -526,7 +615,9 @@ struct Mask
 
         int const segment_relation = segment_relation_in >= 0
             ? segment_relation_in
-            : segment_tile_relation_valid(m_block, n_block);
+            : SegmentTileRanges && n_block >= segment_full_min && n_block < segment_full_max
+                ? int(SegmentPartition::kFull)
+                : segment_tile_relation_valid(m_block, n_block);
         bool const apply_reset_chunk =
             reset_attention_chunk_divmod.divisor > 0 &&
             q_chunk_positions != nullptr;
@@ -549,6 +640,26 @@ struct Mask
 
         int const thread_col_offset = get<Col>(tScS_rowcol(_0{}, _0{}));
         int const k_segment_offset = this->k_segment_len == seqlen_k ? 0 : this->k_segment_len - seqlen_q;
+        if constexpr (!SwapAB && !PackGQA && SegmentTileRanges) {
+            if (segment_rows != nullptr && !apply_reset_chunk) {
+                // Keys of the row's segment form one interval (nondecreasing ids).
+                static constexpr int kRows = CUTE_STATIC_V(size<0>(tSrS_rowcol));
+                int const col_base = n_block * kBlockN + thread_col_offset + k_segment_offset;
+                #pragma unroll
+                for (int m = 0; m < kRows; ++m) {
+                    int const q_pos = get<Row>(tScS_rowcol(m, _0{})) + m_block * kBlockM;
+                    int2 const r = q_pos < seqlen_q ? segment_rows[this->bidb * seqlen_q + q_pos] : make_int2(0, 0);
+                    int const lo = r.x - col_base;
+                    int const hi = std::min(r.y, seqlen_k + k_segment_offset) - col_base;
+                    #pragma unroll
+                    for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
+                        int const col = int(get<Col>(t0ScS_rowcol(_0{}, n)));
+                        if (col < lo || col >= hi) { tSrS_rowcol(m, n) = -INFINITY; }
+                    }
+                }
+                return;
+            }
+        }
         if constexpr (!SwapAB) {
             static constexpr int kMmaThreadsPerRow = size<0, 0>(typename TiledMma::AtomLayoutC_TV{});
             static constexpr int kRows = CUTE_STATIC_V(size<0>(tSrS_rowcol));

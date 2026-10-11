@@ -92,6 +92,9 @@ public:
         int const* seqused = nullptr;
         // Optional FP32 backward state follows the fixed argument prefix.
         float const* ptr_O_state = nullptr;
+        // Fixed-point deterministic dQ: max_j |V_j|, max |K| in, row exponents out.
+        float const* ptr_fixed_bounds = nullptr;
+        int* ptr_dq_exponent = nullptr;
     };
 
     // Kernel entry point API
@@ -117,6 +120,8 @@ public:
         int const* cu_seqlens = nullptr;
         int const* seqused = nullptr;
         float const* ptr_O_state = nullptr;
+        float const* ptr_fixed_bounds = nullptr;
+        int* ptr_dq_exponent = nullptr;
     };
 
     // Convert to underlying arguments. In this case, a simple copy for the aliased type.
@@ -144,7 +149,9 @@ public:
             args.dq_semaphore,
             args.cu_seqlens,
             args.seqused,
-            args.ptr_O_state
+            args.ptr_O_state,
+            args.ptr_fixed_bounds,
+            args.ptr_dq_exponent
         };
     }
 
@@ -265,6 +272,23 @@ public:
             dP_sum(mi) = flash::Allreduce<kGmemThreadsPerRow>::run(dP_sum_cur, sum_op);
         }
 
+        // Row exponent e with 2 |dO_i| max|V| max|K| (1 + 1/64) < 2^e.
+        Tensor dq_exp = make_tensor<int>(make_shape(size<0>(o_fp32)));
+        if (params.ptr_dq_exponent != nullptr) {
+            float const bound_vk = params.ptr_fixed_bounds[0] * params.ptr_fixed_bounds[1];
+            #pragma unroll
+            for (int mi = 0; mi < size<0>(do_fp32); ++mi) {
+                float sq = 0.f;
+                #pragma unroll
+                for (int ni = 0; ni < size<1>(do_fp32); ++ni) { sq += do_fp32(mi, ni) * do_fp32(mi, ni); }
+                flash::SumOp<float> sum_op;
+                sq = flash::Allreduce<kGmemThreadsPerRow>::run(sq, sum_op);
+                int e = 0;
+                frexpf(2.f * sqrtf(sq) * bound_vk * 1.015625f, &e);
+                // 2^(30-e) and 2^(e-30) stay normal FP32 for e in [-90, 120].
+                dq_exp(mi) = max(-90, min(120, e));
+            }
+        }
         Tensor mdPsum = make_tensor(make_gmem_ptr(params.ptr_dPsum), params.shape_dPsum, params.stride_dPsum)(_, bidh, !is_varlen ? bidb : 0);
         Tensor gdPsum = local_tile(cute::domain_offset(make_coord(seqlen_info.offset_padded), mdPsum), Shape<Int<kBlockM>>{}, make_coord(m_block));
         if (get<1>(tOcO(_0{}, _0{}, _0{})) == 0) {
@@ -272,6 +296,15 @@ public:
             for (int mi = 0; mi < size(dP_sum); ++mi) {
                 int const row = get<0>(tOcO(_0{}, mi, _0{}));
                 gdPsum(row) = row < seqlen_o - m_block * kBlockM ? dP_sum(mi) : 0;
+            }
+            if (params.ptr_dq_exponent != nullptr) {
+                Tensor mExp = make_tensor(make_gmem_ptr(params.ptr_dq_exponent), params.shape_dPsum, params.stride_dPsum)(_, bidh, !is_varlen ? bidb : 0);
+                Tensor gExp = local_tile(cute::domain_offset(make_coord(seqlen_info.offset_padded), mExp), Shape<Int<kBlockM>>{}, make_coord(m_block));
+                #pragma unroll
+                for (int mi = 0; mi < size(dq_exp); ++mi) {
+                    int const row = get<0>(tOcO(_0{}, mi, _0{}));
+                    gExp(row) = row < seqlen_o - m_block * kBlockM ? dq_exp(mi) : 0;
+                }
             }
         }
 

@@ -8,6 +8,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <cstring>
 
 namespace xattn {
 namespace ops {
@@ -41,6 +42,39 @@ void CheckOptionalPair(
   }
 }
 
+// Two packed elements summed in FP32, as in the scalar loop below.
+template <typename scalar_t>
+__device__ __forceinline__ uint32_t AddPair(uint32_t first, uint32_t second) {
+  scalar_t a[2], b[2], sum[2];
+  memcpy(a, &first, sizeof(first));
+  memcpy(b, &second, sizeof(second));
+  for (int i = 0; i < 2; ++i) {
+    sum[i] = static_cast<scalar_t>(
+        static_cast<float>(a[i]) + static_cast<float>(b[i]));
+  }
+  uint32_t result;
+  memcpy(&result, sum, sizeof(result));
+  return result;
+}
+
+// Adds 16-byte chunk `offset` of one gradient pair, or moves `offset` past
+// this pair's `chunks`.
+template <typename scalar_t>
+__device__ __forceinline__ bool AddChunk(
+    const scalar_t* first, const scalar_t* second, scalar_t* output,
+    int64_t chunks, int64_t& offset) {
+  if (offset >= chunks) {
+    offset -= chunks;
+    return false;
+  }
+  const uint4 a = reinterpret_cast<const uint4*>(first)[offset];
+  const uint4 b = reinterpret_cast<const uint4*>(second)[offset];
+  reinterpret_cast<uint4*>(output)[offset] = make_uint4(
+      AddPair<scalar_t>(a.x, b.x), AddPair<scalar_t>(a.y, b.y),
+      AddPair<scalar_t>(a.z, b.z), AddPair<scalar_t>(a.w, b.w));
+  return true;
+}
+
 template <typename scalar_t>
 __global__ void FlashSoftDeltaMergeGradientsKernel(
     const scalar_t* read_q,
@@ -62,6 +96,7 @@ __global__ void FlashSoftDeltaMergeGradientsKernel(
     int64_t q_heads,
     int64_t q_head_dim,
     bool vectorized_q,
+    bool vectorized_sums,
     int64_t k_elements,
     int64_t v_elements,
     int64_t prev_k_elements,
@@ -106,6 +141,25 @@ __global__ void FlashSoftDeltaMergeGradientsKernel(
     return;
   }
   const int64_t add_block = int64_t(blockIdx.x) - q_prefixes;
+  if (vectorized_sums) {
+    constexpr int kScalarsPerVector = sizeof(uint4) / sizeof(scalar_t);
+    for (int64_t index = add_block * blockDim.x + threadIdx.x;
+         index < total_elements / kScalarsPerVector;
+         index += int64_t(blockDim.x) * (gridDim.x - q_prefixes)) {
+      int64_t offset = index;
+      if (AddChunk(read_k, correction_k, k,
+                   k_elements / kScalarsPerVector, offset) ||
+          AddChunk(read_v, correction_v, v,
+                   v_elements / kScalarsPerVector, offset) ||
+          AddChunk(read_prev_k, correction_prev_k, prev_k,
+                   prev_k_elements / kScalarsPerVector, offset)) {
+        continue;
+      }
+      AddChunk(read_prev_v, correction_prev_v, prev_v,
+               prev_v_elements / kScalarsPerVector, offset);
+    }
+    return;
+  }
   for (int64_t index = add_block * blockDim.x + threadIdx.x;
        index < total_elements;
        index += int64_t(blockDim.x) * (gridDim.x - q_prefixes)) {
@@ -165,13 +219,30 @@ void LaunchMergeGradients(
   const int64_t total_elements = k_elements + v_elements +
       prev_k_elements + prev_v_elements;
   constexpr int kThreads = 256;
+  constexpr int kScalarsPerVector = sizeof(uint4) / sizeof(scalar_t);
+  auto aligned = [](const c10::optional<torch::Tensor>& tensor) {
+    return !tensor.has_value() ||
+        reinterpret_cast<std::uintptr_t>(tensor->data_ptr()) %
+                sizeof(uint4) == 0;
+  };
+  const bool vectorized_sums =
+      k_elements % kScalarsPerVector == 0 &&
+      v_elements % kScalarsPerVector == 0 &&
+      prev_k_elements % kScalarsPerVector == 0 &&
+      prev_v_elements % kScalarsPerVector == 0 &&
+      aligned(read_k_grad) && aligned(correction_k_grad) && aligned(k_grad) &&
+      aligned(read_v_grad) && aligned(correction_v_grad) && aligned(v_grad) &&
+      aligned(read_prev_k_grad) && aligned(correction_prev_k_grad) &&
+      aligned(prev_k_grad) && aligned(read_prev_v_grad) &&
+      aligned(correction_prev_v_grad) && aligned(prev_v_grad);
+  const int64_t add_items =
+      vectorized_sums ? total_elements / kScalarsPerVector : total_elements;
   const int add_blocks = static_cast<int>(
-      (total_elements + kThreads - 1) / kThreads);
+      (add_items + kThreads - 1) / kThreads);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   const int64_t q_head_dim = read_q_grad.size(3);
   const int64_t q_prefixes =
       read_q_grad.numel() / (read_q_grad.size(2) * q_head_dim);
-  constexpr int kScalarsPerVector = sizeof(uint4) / sizeof(scalar_t);
   FlashSoftDeltaMergeGradientsKernel<scalar_t>
       <<<q_prefixes + add_blocks, kThreads, 0, stream>>>(
           read_q_grad.data_ptr<scalar_t>(),
@@ -197,7 +268,7 @@ void LaunchMergeGradients(
           prev_k_grad.has_value() ? prev_k_grad->data_ptr<scalar_t>() : nullptr,
           prev_v_grad.has_value() ? prev_v_grad->data_ptr<scalar_t>() : nullptr,
           q_prefixes, read_q_grad.size(2), q_head_dim,
-          q_head_dim % kScalarsPerVector == 0,
+          q_head_dim % kScalarsPerVector == 0, vectorized_sums,
           k_elements, v_elements, prev_k_elements, prev_v_elements,
           total_elements);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
