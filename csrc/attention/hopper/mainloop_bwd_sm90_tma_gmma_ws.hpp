@@ -381,7 +381,8 @@ struct CollectiveMainloopBwdSm90 {
     using StrideQKV = cute::Stride<int64_t, _1, int64_t, int64_t>;
     using ShapeLSE = cute::Shape<int32_t, int32_t, int32_t>;  // (seqlen, head, batch)
     using StrideLSE = cute::Stride<_1, int64_t, int64_t>;  // (seqlen, head, batch)
-    using ShapedQaccum = cute::Shape<int32_t, int32_t, int32_t>;  // (seqlen_q * d, head, batch)
+    // int64 extent: varlen workspaces can exceed 2^31 / d padded rows times d.
+    using ShapedQaccum = cute::Shape<int64_t, int32_t, int32_t>;  // (seqlen_q * d, head, batch)
     using StridedQaccum = cute::Stride<_1, int64_t, int64_t>;
 
     using TMA_Q = decltype(make_tma_copy_A_sm90(
@@ -1279,7 +1280,7 @@ struct CollectiveMainloopBwdSm90 {
         }
         Tensor mdQaccum = make_tensor(make_gmem_ptr(dq_accum_ptr),
                                       params.shape_dQaccum, params.stride_dQaccum)(_, bidh, !is_varlen ? bidb : 0);
-        Tensor gdQaccum_ = local_tile(domain_offset(make_coord(seqlen_info.offset_q_padded * kHeadDim), mdQaccum), Shape<Int<kBlockM * kHeadDim>>{}, make_coord(_));  // (M * K, _)
+        Tensor gdQaccum_ = local_tile(domain_offset(make_coord(int64_t(seqlen_info.offset_q_padded) * kHeadDim), mdQaccum), Shape<Int<kBlockM * kHeadDim>>{}, make_coord(_));  // (M * K, _)
         Tensor gdQaccum = cute::flat_divide(gdQaccum_, Int<kBlockM * kHeadDim / NumMmaWarpGroups>{});  // (M * K / WG, WG, _)
 
         int const num_batch = params.num_batch;
@@ -1700,7 +1701,7 @@ struct CollectiveMainloopBwdSm90 {
         bool const is_varlen = Varlen && params.cu_seqlens_q;
         Tensor mdQaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum*>(params.ptr_dQaccum)),
                                       params.shape_dQaccum, params.stride_dQaccum)(_, bidh, !is_varlen ? bidb : 0);
-        Tensor gdQaccum_ = local_tile(domain_offset(make_coord(seqlen_info.offset_q_padded * kHeadDim), mdQaccum), Shape<Int<kBlockM * kHeadDim>>{}, make_coord(_));  // (M * K, _)
+        Tensor gdQaccum_ = local_tile(domain_offset(make_coord(int64_t(seqlen_info.offset_q_padded) * kHeadDim), mdQaccum), Shape<Int<kBlockM * kHeadDim>>{}, make_coord(_));  // (M * K, _)
         Tensor gdQaccum = cute::flat_divide(gdQaccum_, Int<kBlockM * kHeadDim / NumMmaWarpGroups>{});  // (M * K / WG, WG, _)
         // Reuse the dQ shared-memory copy partition.
         Tensor tdQgdQaccum = r2s_thr_copy_dQaccum.partition_D(gdQaccum);
@@ -1778,7 +1779,7 @@ struct CollectiveMainloopBwdSm90 {
             // hides behind the GEMMs.
             [[maybe_unused]] int dq_exp_rows[kDqRows];
             if constexpr (kFixedDQ && !kStageDqExp) {
-                int const rounded = get<0>(params.shape_dQaccum) / kHeadDim;
+                int const rounded = int(get<0>(params.shape_dQaccum) / kHeadDim);
                 int const* const exp_row = params.dq_exponent
                     + (int64_t(!(Varlen && params.cu_seqlens_q) ? bidb : 0) * get<1>(params.shape_dQaccum) + bidh) * rounded
                     + seqlen_info.offset_q_padded + m_block * kBlockM;

@@ -641,17 +641,11 @@ void RunAttentionBwdSm90Kernel(
       : torch::empty({dq_slot_stride}, dq_options);
   const int num_m_block = cute::ceil_div(
       kVarlen ? params.max_seqlen_q : params.seqlen_q, kBlockM);
-  dim3 auxiliary_grid(num_m_block, params.h, logical_batch);
-  if constexpr (kVarlen) {
-    if (logical_batch > 65535) {
-      int64_t const auxiliary_grid_blocks =
-          int64_t(num_m_block) * params.h * logical_batch;
-      TORCH_CHECK(
-          auxiliary_grid_blocks <= std::numeric_limits<int>::max(),
-          "attention SM90 BWD auxiliary grid exceeds the CUDA x-dimension limit");
-      auxiliary_grid = dim3(uint32_t(auxiliary_grid_blocks));
-    }
-  }
+  // Any batch: the preprocess and postprocess kernels stride over batches
+  // past the grid z limit.
+  TORCH_CHECK(params.h <= 65535, "attention SM90 BWD supports at most 65535 query heads");
+  dim3 const auxiliary_grid(num_m_block, params.h,
+                            logical_batch < 65535 ? logical_batch : 65535);
   torch::Tensor dq_semaphore;
   torch::Tensor hp_rows;
   torch::Tensor fixed_bounds, dq_exponent;
@@ -722,15 +716,15 @@ void RunAttentionBwdSm90Kernel(
          params.dy_batch_stride},
         static_cast<float*>(params.dpsum_ptr),
         {seqlen_q_rounded, params.h, workspace_batch},
-        {_1{}, seqlen_q_rounded, params.h * seqlen_q_rounded},
+        {_1{}, seqlen_q_rounded, int64_t(params.h) * seqlen_q_rounded},
         static_cast<float const*>(params.lse_ptr),
-        {_1{}, params.seqlen_q, params.h * params.seqlen_q},
+        {_1{}, params.seqlen_q, int64_t(params.h) * params.seqlen_q},
         static_cast<float*>(params.lse_log2_ptr),
-        {_1{}, seqlen_q_rounded, params.h * seqlen_q_rounded},
+        {_1{}, seqlen_q_rounded, int64_t(params.h) * seqlen_q_rounded},
         static_cast<ElementAccum*>(params.dq_accum_ptr),
-        {seqlen_q_rounded * kHeadDim, params.h, workspace_batch},
-        {_1{}, seqlen_q_rounded * kHeadDim,
-         params.h * seqlen_q_rounded * kHeadDim},
+        {int64_t(seqlen_q_rounded) * kHeadDim, params.h, workspace_batch},
+        {_1{}, int64_t(seqlen_q_rounded) * kHeadDim,
+         int64_t(params.h) * seqlen_q_rounded * kHeadDim},
         logical_batch,
         num_m_block,
         params.dq_semaphore,
@@ -935,14 +929,14 @@ void RunAttentionBwdSm90Kernel(
       {params.dy_row_stride, _1{}, params.dy_head_stride,
        params.dy_batch_stride},
       static_cast<ElementAccum*>(params.dq_accum_ptr),
-      {seqlen_q_rounded * kHeadDim, params.h, workspace_batch},
-      {_1{}, seqlen_q_rounded * kHeadDim,
-       params.h * seqlen_q_rounded * kHeadDim},
+      {int64_t(seqlen_q_rounded) * kHeadDim, params.h, workspace_batch},
+      {_1{}, int64_t(seqlen_q_rounded) * kHeadDim,
+       int64_t(params.h) * seqlen_q_rounded * kHeadDim},
       static_cast<float const*>(params.lse_log2_ptr),
       {seqlen_q_rounded, params.h, workspace_batch},
-      {_1{}, seqlen_q_rounded, params.h * seqlen_q_rounded},
+      {_1{}, seqlen_q_rounded, int64_t(params.h) * seqlen_q_rounded},
       static_cast<float const*>(params.dpsum_ptr),
-      {_1{}, seqlen_q_rounded, params.h * seqlen_q_rounded},
+      {_1{}, seqlen_q_rounded, int64_t(params.h) * seqlen_q_rounded},
       params.scale_softmax,
       params.window_size_left,
       params.window_size_right,
@@ -1203,15 +1197,6 @@ void RunAttentionBwdSm90Kernel(
       AttnKernel::to_underlying_arguments(
           {mainloop_args, epilogue_args, {device, params.num_sm},
            scheduler_args});
-  if constexpr (kVarlen && !UseVarlenPersistentScheduler) {
-    if (logical_batch > 65535) {
-      int64_t const mainloop_grid_blocks =
-          int64_t(num_blocks_n) * scheduled_q_heads * logical_batch;
-      TORCH_CHECK(
-          mainloop_grid_blocks <= std::numeric_limits<int>::max(),
-          "attention SM90 BWD mainloop grid exceeds the CUDA x-dimension limit");
-    }
-  }
   dim3 grid_dims = AttnKernel::get_grid_shape(kernel_params);
   dim3 block_dims = AttnKernel::get_block_shape();
   int smem_size = AttnKernel::SharedStorageSize;
@@ -1315,9 +1300,9 @@ void RunAttentionBwdSm90Kernel(
       AttnKernel::CollectiveMainloop::dQ_swapAB, SplitDQ>;
   typename PostprocessKernel::Arguments postprocess_args{
       static_cast<ElementAccum const*>(params.dq_accum_ptr),
-      {seqlen_q_rounded * kHeadDim, params.h, workspace_batch},
-      {_1{}, seqlen_q_rounded * kHeadDim,
-       params.h * seqlen_q_rounded * kHeadDim},
+      {int64_t(seqlen_q_rounded) * kHeadDim, params.h, workspace_batch},
+      {_1{}, int64_t(seqlen_q_rounded) * kHeadDim,
+       int64_t(params.h) * seqlen_q_rounded * kHeadDim},
       static_cast<HPOut*>(params.dq_ptr),
       {params.seqlen_q, params.d, params.h, params.b},
       {params.dq_row_stride, _1{}, params.dq_head_stride,

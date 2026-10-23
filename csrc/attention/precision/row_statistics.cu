@@ -72,11 +72,15 @@ __global__ void FallbackDVKernel(
  const E* Q,const E* K,const E* G,const int* L,const int* R,
  const int64_t* QI,const int64_t* KI,const float* LOGZ,const float* META,
  const int* FLAGS,float* DV,int nq,int nk,int h,int hk,int d,int dv,int batch,float scale) {
- const int bh=blockIdx.y,b=bh/hk,kh=bh%hk;
+ // CTA = (16-key tile, batch*KV head) on grid (tiles, B*Hkv), or (tiles*B*Hkv)
+ // once B*Hkv exceeds grid.y's limit; both decode alike when B*Hkv == 1.
+ int tile=blockIdx.x,bh=blockIdx.y;
+ if(gridDim.y==1){const int tiles=(nk+15)/16;bh=tile/tiles;tile%=tiles;}
+ const int b=bh/hk,kh=bh%hk;
  if(!FLAGS[bh])return;
  __shared__ __align__(32) E sa[256],sb[256];
  __shared__ __align__(32) float score[256],prob[256];
- const int lane=threadIdx.x,k0=blockIdx.x*16;
+ const int lane=threadIdx.x,k0=tile*16;
  constexpr int Slots=VBucket/8;
  float accum[Slots];
  #pragma unroll
@@ -103,8 +107,8 @@ __global__ void FallbackDVKernel(
    for(int t=lane;t<256;t+=128) {
     int i=q0+t/16,j=k0+t%16;
     bool valid=i<nq && j<nk;
-    if(valid) valid=j>=L[b*nq+i] && j<=R[b*nq+i];
-    if constexpr(Segments) if(valid)valid=QI[b*nq+i]==KI[b*nk+j];
+    if(valid) valid=j>=L[int64_t(b)*nq+i] && j<=R[int64_t(b)*nq+i];
+    if constexpr(Segments) if(valid)valid=QI[int64_t(b)*nq+i]==KI[int64_t(b)*nk+j];
     float value=0.f;
     if(valid) {
      int64_t row=(int64_t(b)*h+head)*nq+i;
@@ -157,7 +161,10 @@ void FallbackDV(const torch::Tensor& q,const torch::Tensor& k,const torch::Tenso
  }
  TORCH_CHECK(std::isfinite(scale),"scale must be finite");
  if(!dv.numel())return;c10::cuda::CUDAGuard guard(q.device());auto stream=at::cuda::getCurrentCUDAStream(q.get_device());
- dim3 grid((k.size(1)+15)/16,k.size(0)*k.size(2));
+ // B*Hkv rides grid.y up to its 65535 limit; beyond it the CTAs fold into x.
+ const int64_t tiles=(k.size(1)+15)/16,heads=k.size(0)*k.size(2);
+ TORCH_CHECK(heads<=65535 || tiles*heads<=INT_MAX,"fallback dV grid exceeds CUDA limits");
+ const dim3 grid=heads<=65535 ? dim3(unsigned(tiles),unsigned(heads)) : dim3(unsigned(tiles*heads));
  AT_DISPATCH_REDUCED_FLOATING_TYPES(q.scalar_type(),"precision_fallback_dv",[&]{
   using E=std::conditional_t<std::is_same_v<scalar_t,c10::Half>,__half,__nv_bfloat16>;
   auto launch=[&](auto width,auto segment){constexpr int Width=decltype(width)::value;constexpr bool Segments=decltype(segment)::value;

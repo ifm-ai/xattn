@@ -92,6 +92,15 @@ __global__ void CoefficientKernel(const int* lo_in, const int* last_in, const in
   }
 }
 
+// (tile, KV head, batch) of a repair CTA. The grid is (tiles, hk, b), or one
+// 1-D grid in the same order once hk or b exceeds the y/z limit; both decode
+// alike when hk == b == 1.
+__device__ __forceinline__ int3 TileHeadBatch(int tiles, int hk) {
+  int tile = blockIdx.x, kh = blockIdx.y, b = blockIdx.z;
+  if (gridDim.y == 1 && gridDim.z == 1) { const int rest = tile / tiles; tile %= tiles; kh = rest % hk; b = rest / hk; }
+  return make_int3(tile, kh, b);
+}
+
 // smem[(r + 1) * d + f] becomes the inclusive prefix of staged rows 0..r.
 __device__ __forceinline__ void PrefixRows(float* smem, int count, int d) {
   const int t = threadIdx.x;
@@ -122,7 +131,8 @@ __global__ void __launch_bounds__(kThreads) DqKernel(const E* q, const E* k, con
     float* dq, float* dk, int nq, int nk, int hq, int hk, int d, float scale, bool anchor_scatter) {
   extern __shared__ float smem[];   // [(kChunk + 1) * d]
   __shared__ int s_lo[kRows], s_last[kRows], s_kmin, s_kmax;
-  const int b = blockIdx.z, kh = blockIdx.y, i0 = blockIdx.x * kRows, t = threadIdx.x;
+  const int3 cta = TileHeadBatch((nq + kRows - 1) / kRows, hk);
+  const int b = cta.z, kh = cta.y, i0 = cta.x * kRows, t = threadIdx.x;
   const int g = hq / hk, width = hk * d, lane = t % 32, warp = t / 32, vecs = d / 4;
   if (t < kRows) {
     const int i = i0 + t;
@@ -248,7 +258,8 @@ __global__ void __launch_bounds__(kThreads) DkKernel(const E* q, const float* co
     float* dk, int nq, int nk, int hq, int hk, int d, float scale) {
   extern __shared__ float smem[];
   __shared__ int s_begin[kRows], s_end[kRows];
-  const int b = blockIdx.z, kh = blockIdx.y, j0 = blockIdx.x * kRows, t = threadIdx.x;
+  const int3 cta = TileHeadBatch((nk + kRows - 1) / kRows, hk);
+  const int b = cta.z, kh = cta.y, j0 = cta.x * kRows, t = threadIdx.x;
   const int g = hq / hk, width = hk * d, lane = t % 32, warp = t / 32, vecs = d / 4;
   if (t < kRows) {
     const int j = j0 + t;
@@ -386,6 +397,13 @@ void ZeroSumRepair(const torch::Tensor& q, const torch::Tensor& k, const torch::
   auto key_rows = torch::empty({b, nk, 2}, iopt);
   KeyRowsKernel<<<(int64_t(b) * nk + 255) / 256, 256, 0, stream>>>(mono_lo.data_ptr<int>(), mono_last.data_ptr<int>(),
       reinterpret_cast<int2*>(key_rows.data_ptr<int>()), nq, nk, int64_t(b) * nk);
+  // hk and b ride grid.y/z up to their 65535 limit; beyond it the CTAs fold
+  // into x (see TileHeadBatch).
+  auto grid = [&](int64_t tiles) {
+    if (hk <= 65535 && b <= 65535) return dim3(unsigned(tiles), hk, b);
+    TORCH_CHECK(tiles * hk * b <= INT_MAX, "zero-sum repair grid exceeds CUDA limits");
+    return dim3(unsigned(tiles * hk * b));
+  };
   AT_DISPATCH_REDUCED_FLOATING_TYPES(q.scalar_type(), "attention_zero_sum_repair", [&] {
     using E = std::conditional_t<std::is_same_v<scalar_t, c10::Half>, __half, __nv_bfloat16>;
     const E* qp = reinterpret_cast<const E*>(q.data_ptr());
@@ -394,10 +412,10 @@ void ZeroSumRepair(const torch::Tensor& q, const torch::Tensor& k, const torch::
       constexpr int VPL = decltype(vpl)::value;
       C10_CUDA_CHECK(cudaFuncSetAttribute(DkKernel<E, VPL>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
       C10_CUDA_CHECK(cudaFuncSetAttribute(DqKernel<E, VPL>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem));
-      DkKernel<E, VPL><<<dim3((nk + kRows - 1) / kRows, hk, b), kThreads, smem, stream>>>(qp, coefficient.data_ptr<float>(),
+      DkKernel<E, VPL><<<grid((nk + kRows - 1) / kRows), kThreads, smem, stream>>>(qp, coefficient.data_ptr<float>(),
           reinterpret_cast<const int2*>(key_rows.data_ptr<int>()), dk.data_ptr<float>(), nq, nk, hq, hk, d, float(scale));
       C10_CUDA_KERNEL_LAUNCH_CHECK();
-      DqKernel<E, VPL><<<dim3((nq + kRows - 1) / kRows, hk, b), kThreads, smem, stream>>>(qp, kp, rho_anchor.data_ptr<double>(),
+      DqKernel<E, VPL><<<grid((nq + kRows - 1) / kRows), kThreads, smem, stream>>>(qp, kp, rho_anchor.data_ptr<double>(),
           meta.data_ptr<float>() + 3 * rows, coefficient.data_ptr<float>(), lo.data_ptr<int>(), last.data_ptr<int>(),
           dq.data_ptr<float>(), dk.data_ptr<float>(), nq, nk, hq, hk, d, float(scale), anchor_scatter);
       C10_CUDA_KERNEL_LAUNCH_CHECK();

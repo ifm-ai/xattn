@@ -3,9 +3,17 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
+#include <climits>
 namespace xattn::ops::attention::precision {
 namespace {
 constexpr int kChunk=64;
+// (chunk or key, batch*KV head) of a repair CTA. The grid is (n, b*hk), or
+// (n*b*hk) once b*hk exceeds grid.y's limit; both decode alike when b*hk == 1.
+__device__ __forceinline__ int2 RepairBlock(int n){
+ int x=blockIdx.x,bh=blockIdx.y;
+ if(gridDim.y==1){bh=x/n;x%=n;}
+ return make_int2(x,bh);
+}
 // One warp per (batch, query, head) row: the anchor share of dQ.
 template<class E>
 __global__ void RepairQuery(const E* K,const double* stats,const float* meta,float* dq,
@@ -30,8 +38,8 @@ __global__ void RepairChunks(const E* Q,const E* G,const double* stats,const flo
  const int64_t* order,const int64_t* starts,float* dk,float* dv,float* head,float* tail,int* flags,
  int nq,int nk,int h,int hk,int d,int vd,int batch,float scale,int level){
  __shared__ int keys[kChunk];__shared__ int64_t qoff[kChunk],goff[kChunk];__shared__ float coef[kChunk],mass[kChunk];__shared__ bool safe_mass[kChunk];
- const int chunk=blockIdx.x,bh=blockIdx.y,b=bh/hk,kh=bh%hk,c=threadIdx.x;
- const int rows=nq*(h/hk),chunks=gridDim.x,width=max(d,vd);
+ const int rows=nq*(h/hk),chunks=(rows+kChunk-1)/kChunk,width=max(d,vd);
+ const int2 block=RepairBlock(chunks);const int chunk=block.x,bh=block.y,b=bh/hk,kh=bh%hk,c=threadIdx.x;
  const int64_t count=int64_t(batch)*h*nq,base=int64_t(bh)*rows,p0=int64_t(chunk)*kChunk;
  const int n=int(rows-p0<kChunk ? rows-p0 : int64_t(kChunk));
  if(c<n){
@@ -68,7 +76,7 @@ __global__ void RepairChunks(const E* Q,const E* G,const double* stats,const flo
 template<class E>
 __global__ void RepairSpans(const int64_t* starts,const float* head,const float* tail,float* dk,float* dv,
  int nk,int hk,int d,int vd,int chunks,int level){
- const int key=blockIdx.x,bh=blockIdx.y,b=bh/hk,kh=bh%hk,c=threadIdx.x,width=max(d,vd);
+ const int2 block=RepairBlock(nk);const int key=block.x,bh=block.y,b=bh/hk,kh=bh%hk,c=threadIdx.x,width=max(d,vd);
  const int64_t lo=starts[int64_t(bh)*(nk+1)+key],hi=starts[int64_t(bh)*(nk+1)+key+1];
  if(hi-lo<1 || lo/kChunk==(hi-1)/kChunk)return;
  const int64_t first=lo/kChunk,last=(hi-1)/kChunk,slot=int64_t(bh)*chunks;
@@ -97,11 +105,15 @@ torch::Tensor DeterministicRepair(const torch::Tensor& q,const torch::Tensor& k,
  auto starts=at::searchsorted(anchors,keys).contiguous();
  const int chunks=int((rows+kChunk-1)/kChunk),width=int(std::max(q.size(3),g.size(3)));
  auto head=torch::empty({b*hk,chunks,2,width},q.options().dtype(at::kFloat)),tail=torch::empty_like(head);
+ // b*hk rides grid.y up to its 65535 limit; beyond it the CTAs fold into x.
+ const bool fold=b*hk>65535;
+ TORCH_CHECK(!fold || std::max<int64_t>(chunks,nk)*b*hk<=INT_MAX,"deterministic repair grid exceeds CUDA limits");
+ auto grid=[&](int64_t n){return fold ? dim3(unsigned(n*b*hk)) : dim3(unsigned(n),unsigned(b*hk));};
  AT_DISPATCH_REDUCED_FLOATING_TYPES(q.scalar_type(),"precision_deterministic_repair",[&]{
   const int64_t queries=q.numel()/q.size(3);
   RepairQuery<scalar_t><<<(queries+7)/8,256,0,stream>>>(k.data_ptr<scalar_t>(),stats.data_ptr<double>(),meta.data_ptr<float>(),dq.data_ptr<float>(),queries,q.size(1),k.size(1),q.size(2),k.size(2),q.size(3),q.size(0),float(scale));
-  RepairChunks<scalar_t><<<dim3(chunks,b*hk),256,0,stream>>>(q.data_ptr<scalar_t>(),g.data_ptr<scalar_t>(),stats.data_ptr<double>(),meta.data_ptr<float>(),order.data_ptr<int64_t>(),starts.data_ptr<int64_t>(),dk.data_ptr<float>(),dv.data_ptr<float>(),head.data_ptr<float>(),tail.data_ptr<float>(),flags.data_ptr<int>(),q.size(1),k.size(1),q.size(2),k.size(2),q.size(3),g.size(3),q.size(0),float(scale),level);
-  RepairSpans<scalar_t><<<dim3(k.size(1),b*hk),256,0,stream>>>(starts.data_ptr<int64_t>(),head.data_ptr<float>(),tail.data_ptr<float>(),dk.data_ptr<float>(),dv.data_ptr<float>(),k.size(1),k.size(2),q.size(3),g.size(3),chunks,level);
+  RepairChunks<scalar_t><<<grid(chunks),256,0,stream>>>(q.data_ptr<scalar_t>(),g.data_ptr<scalar_t>(),stats.data_ptr<double>(),meta.data_ptr<float>(),order.data_ptr<int64_t>(),starts.data_ptr<int64_t>(),dk.data_ptr<float>(),dv.data_ptr<float>(),head.data_ptr<float>(),tail.data_ptr<float>(),flags.data_ptr<int>(),q.size(1),k.size(1),q.size(2),k.size(2),q.size(3),g.size(3),q.size(0),float(scale),level);
+  RepairSpans<scalar_t><<<grid(nk),256,0,stream>>>(starts.data_ptr<int64_t>(),head.data_ptr<float>(),tail.data_ptr<float>(),dk.data_ptr<float>(),dv.data_ptr<float>(),k.size(1),k.size(2),q.size(3),g.size(3),chunks,level);
  });C10_CUDA_KERNEL_LAUNCH_CHECK();return flags;
 }
 }

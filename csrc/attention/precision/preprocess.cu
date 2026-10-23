@@ -2,6 +2,7 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
+#include <climits>
 #include <cmath>
 namespace xattn::ops::attention::precision {
 namespace {
@@ -9,13 +10,23 @@ constexpr int kCenterRows = 32;     // rows per CTA in the centering passes
 constexpr int kCenterThreads = 128; // each thread owns 8-feature groups
 template <typename E> struct Pack8 { E v[8]; };
 
+// (batch, row chunk) of a centering CTA. The grid is (chunks, B, groups), or
+// (chunks * B, 1, groups) once B exceeds grid.y's limit; both decode alike
+// when B == 1.
+__device__ __forceinline__ int2 CenterBlock(int n) {
+  int b = blockIdx.y, chunk = blockIdx.x;
+  if (gridDim.y == 1) { const int chunks = (n + kCenterRows - 1) / kCenterRows; b = chunk / chunks; chunk %= chunks; }
+  return make_int2(b, chunk);
+}
+
 // Pass 1: a feature keeps its first-row shift only if every residual
 // E(x - shift) reconstructs x exactly in FP64; otherwise it is flagged.
 // Rows are split into chunks; each thread checks 8 contiguous features with
 // one 16-byte load per row.
 template <typename E>
 __global__ void __launch_bounds__(kCenterThreads) CheckCenterRows(const E* x, int* flags, int n, int width) {
-  const int b = blockIdx.y, begin = blockIdx.x * kCenterRows, end = min(n, begin + kCenterRows);
+  const int2 block = CenterBlock(n);
+  const int b = block.x, begin = block.y * kCenterRows, end = min(n, begin + kCenterRows);
   const E* base = x + int64_t(b) * n * width;
   // grid.z spreads feature groups so wide heads do not serialize per thread.
   const int group = blockIdx.z * kCenterThreads + threadIdx.x;
@@ -49,7 +60,8 @@ __global__ void __launch_bounds__(kCenterThreads) CheckCenterRows(const E* x, in
 // Pass 2: apply the selected shift (0 for flagged features) and record it.
 template <typename E>
 __global__ void __launch_bounds__(kCenterThreads) ApplyCenterRows(const E* x, const int* flags, E* y, float* shifts, int n, int width) {
-  const int b = blockIdx.y, begin = blockIdx.x * kCenterRows, end = min(n, begin + kCenterRows);
+  const int2 block = CenterBlock(n);
+  const int b = block.x, begin = block.y * kCenterRows, end = min(n, begin + kCenterRows);
   const E* in = x + int64_t(b) * n * width;
   E* out = y + int64_t(b) * n * width;
   const int group = blockIdx.z * kCenterThreads + threadIdx.x;
@@ -59,7 +71,7 @@ __global__ void __launch_bounds__(kCenterThreads) ApplyCenterRows(const E* x, co
     float shift[8];
     #pragma unroll
     for (int c = 0; c < 8; ++c) shift[c] = flags[int64_t(b) * width + f + c] ? 0.f : float(first.v[c]);
-    if (blockIdx.x == 0) {
+    if (block.y == 0) {
       #pragma unroll
       for (int c = 0; c < 8; ++c) shifts[int64_t(b) * width + f + c] = shift[c];
     }
@@ -119,7 +131,10 @@ std::tuple<torch::Tensor,torch::Tensor> Center(const torch::Tensor& input) {
   auto stream=at::cuda::getCurrentCUDAStream(input.get_device());
   const int n=input.size(1),width=input.size(2)*input.size(3);
   auto flags=torch::zeros({input.size(0),width},input.options().dtype(at::kInt));
-  dim3 grid((n+kCenterRows-1)/kCenterRows,input.size(0),(width/8+kCenterThreads-1)/kCenterThreads);
+  // B rides grid.y up to its 65535 limit; larger batches fold into x.
+  const int64_t chunks=(n+kCenterRows-1)/kCenterRows,batch=input.size(0);const bool fold=batch>65535;
+  TORCH_CHECK(!fold || chunks*batch<=INT_MAX,"precision centering grid exceeds CUDA limits");
+  dim3 grid(unsigned(fold ? chunks*batch : chunks),unsigned(fold ? 1 : batch),(width/8+kCenterThreads-1)/kCenterThreads);
   AT_DISPATCH_REDUCED_FLOATING_TYPES(input.scalar_type(),"precision_center",[&]{
     CheckCenterRows<scalar_t><<<grid,kCenterThreads,0,stream>>>(input.data_ptr<scalar_t>(),flags.data_ptr<int>(),n,width);
     ApplyCenterRows<scalar_t><<<grid,kCenterThreads,0,stream>>>(input.data_ptr<scalar_t>(),flags.data_ptr<int>(),output.data_ptr<scalar_t>(),shifts.data_ptr<float>(),n,width);

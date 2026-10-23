@@ -65,7 +65,8 @@ public:
     using StrideO = cute::Stride<int64_t, _1, int64_t, int64_t>;
     using ShapedPsum = cute::Shape<int32_t, int32_t, int32_t>;  // (seqlen_q, head, batch)
     using StridedPsum = cute::Stride<_1, int64_t, int64_t>;
-    using ShapedQaccum = cute::Shape<int32_t, int32_t, int32_t>;  // (seqlen_q * d, head, batch)
+    // int64 extent: varlen workspaces can exceed 2^31 / d padded rows times d.
+    using ShapedQaccum = cute::Shape<int64_t, int32_t, int32_t>;  // (seqlen_q * d, head, batch)
     using StridedQaccum = cute::Stride<_1, int64_t, int64_t>;
 
     // Device side arguments
@@ -155,34 +156,22 @@ public:
         };
     }
 
+    // Batches past the grid z limit are strided: blockIdx.z, + gridDim.z, ...
     CUTLASS_DEVICE
     void
     operator()(Params const& params, [[maybe_unused]] char* smem_buf) {
+        for (int bidb = int(blockIdx.z); bidb < params.num_batch; bidb += int(gridDim.z)) {
+            run_tile(params, int(blockIdx.x), int(blockIdx.y), bidb);
+        }
+    }
+
+    CUTLASS_DEVICE
+    void
+    run_tile(Params const& params, int const m_block, int const bidh, int const bidb) {
 
         static constexpr int kBlockM = get<0>(TileShape_MK{});
 
         int const thread_idx = threadIdx.x;
-        int m_block;
-        int bidh;
-        int bidb;
-        if constexpr (Varlen) {
-            if (params.num_batch > 65535) {
-                int tile_idx = int(blockIdx.x);
-                m_block = tile_idx % params.num_m_blocks;
-                tile_idx /= params.num_m_blocks;
-                int const num_head = get<2>(params.shape_O);
-                bidh = tile_idx % num_head;
-                bidb = tile_idx / num_head;
-            } else {
-                m_block = int(blockIdx.x);
-                bidh = int(blockIdx.y);
-                bidb = int(blockIdx.z);
-            }
-        } else {
-            m_block = int(blockIdx.x);
-            bidh = int(blockIdx.y);
-            bidb = int(blockIdx.z);
-        }
 
         flash::SeqlenInfo<Varlen, kBlockM> seqlen_info(bidb, size<0>(params.shape_O), params.cu_seqlens, params.seqused);
         bool const is_varlen = Varlen && params.cu_seqlens;
@@ -317,7 +306,7 @@ public:
 
         if constexpr (Clear_dQaccum) {
             Tensor mdQaccum = make_tensor(make_gmem_ptr(params.ptr_dQaccum), params.shape_dQaccum, params.stride_dQaccum)(_, bidh, !is_varlen ? bidb : 0);
-            Tensor gdQaccum = local_tile(cute::domain_offset(make_coord(seqlen_info.offset_padded * kHeadDimQ), mdQaccum), Shape<Int<kBlockM * kHeadDimQ>>{}, make_coord(m_block));
+            Tensor gdQaccum = local_tile(cute::domain_offset(make_coord(int64_t(seqlen_info.offset_padded) * kHeadDimQ), mdQaccum), Shape<Int<kBlockM * kHeadDimQ>>{}, make_coord(m_block));
             GmemTiledCopyAccum gmem_tiled_copy_dQaccum;
             auto gmem_thr_copy_dQaccum = gmem_tiled_copy_dQaccum.get_thread_slice(thread_idx);
             Tensor tdQgdQaccum = gmem_thr_copy_dQaccum.partition_D(gdQaccum);

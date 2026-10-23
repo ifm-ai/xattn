@@ -104,7 +104,8 @@ public:
 
     using ShapedQ = cute::Shape<int32_t, int32_t, int32_t, int32_t>;   // (seqlen_q, d, head, batch)
     using StridedQ = cute::Stride<int64_t, _1, int64_t, int64_t>;
-    using ShapedQaccum = cute::Shape<int32_t, int32_t, int32_t>;  // (seqlen_q * d, head, batch)
+    // int64 extent: varlen workspaces can exceed 2^31 / d padded rows times d.
+    using ShapedQaccum = cute::Shape<int64_t, int32_t, int32_t>;  // (seqlen_q * d, head, batch)
     using StridedQaccum = cute::Stride<_1, int64_t, int64_t>;
 
     // Device side arguments
@@ -168,6 +169,16 @@ public:
     CUTLASS_DEVICE
     void
     operator()(Params const& params, char* smem_buf) {
+        // Batches past the grid z limit are strided: blockIdx.z, + gridDim.z, ...
+        for (int bidb = int(blockIdx.z); bidb < params.num_batch; bidb += int(gridDim.z)) {
+            if (bidb != int(blockIdx.z)) { __syncthreads(); }  // shared memory reuse
+            run_tile(params, smem_buf, int(blockIdx.x), int(blockIdx.y), bidb);
+        }
+    }
+
+    CUTLASS_DEVICE
+    void
+    run_tile(Params const& params, char* smem_buf, int const m_block, int const bidh, int const bidb) {
 
         static constexpr int kBlockM = get<0>(TileShape_MK{});
         SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
@@ -178,21 +189,6 @@ public:
         Tensor sdQt = make_tensor(make_smem_ptr(shared_storage.smem_dq.data()), SmemLayoutdQt{});
 
         int const thread_idx = threadIdx.x;
-        int m_block;
-        int bidh;
-        int bidb;
-        if (params.cu_seqlens != nullptr && params.num_batch > 65535) {
-            int tile_idx = int(blockIdx.x);
-            m_block = tile_idx % params.num_m_blocks;
-            tile_idx /= params.num_m_blocks;
-            int const num_head = get<2>(params.shape_dQ);
-            bidh = tile_idx % num_head;
-            bidb = tile_idx / num_head;
-        } else {
-            m_block = int(blockIdx.x);
-            bidh = int(blockIdx.y);
-            bidb = int(blockIdx.z);
-        }
 
         flash::SeqlenInfo<true /*Varlen*/, kBlockM> seqlen_info(bidb, size<0>(params.shape_dQ), params.cu_seqlens, params.seqused);
         bool const is_varlen = params.cu_seqlens;
@@ -201,7 +197,7 @@ public:
         // Step 1: load dQaccum from gmem to smem
         Tensor mdQaccum = make_tensor(make_gmem_ptr(reinterpret_cast<ElementAccum const*>(params.ptr_dQaccum)),
                                       params.shape_dQaccum, params.stride_dQaccum)(_, bidh, !is_varlen ? bidb : 0);
-        Tensor gdQaccum = local_tile(domain_offset(make_coord(seqlen_info.offset_padded * kHeadDim), mdQaccum), Shape<Int<kBlockM * kHeadDim>>{}, make_coord(m_block));  // (M * K)
+        Tensor gdQaccum = local_tile(domain_offset(make_coord(int64_t(seqlen_info.offset_padded) * kHeadDim), mdQaccum), Shape<Int<kBlockM * kHeadDim>>{}, make_coord(m_block));  // (M * K)
         // Reduce distinct key-tile partial slots in fixed order before conversion.
         if constexpr (SplitDQ) {
             if (params.dq_slots > 1) {
@@ -260,7 +256,7 @@ public:
             // int32 sums on the row grid 2^(e-30); rows index like dPsum.
             auto thr_mma_dQ = tiled_mma_dQ.get_thread_slice(thread_idx);
             Tensor cdQ = thr_mma_dQ.partition_C(cute::make_identity_tensor(select<!dQ_swapAB ? 0 : 1, !dQ_swapAB ? 1 : 0>(TileShape_MK{})));
-            int const rounded = get<0>(params.shape_dQaccum) / kHeadDim;
+            int const rounded = int(get<0>(params.shape_dQaccum) / kHeadDim);
             int const* const exp_row = params.dq_exponent
                 + (int64_t(!is_varlen ? bidb : 0) * get<1>(params.shape_dQaccum) + bidh) * rounded
                 + seqlen_info.offset_padded + m_block * kBlockM;
