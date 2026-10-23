@@ -103,35 +103,90 @@ error for arbitrary ill-conditioned or overflowing floating-point inputs.
 
 ## Group SoftDelta (in development)
 
-`group_softdelta_attention` is a separate API; the SoftDelta APIs above are
-unchanged. Its output is `read - sigmoid(g) * neg_read`. `read` uses `q` and
-includes the aligned query position; `neg_read` uses `neg_q`, reads only
-strictly earlier visible keys, and is shared by the query heads of each KV
-head. `neg_q` is any tensor already rotated like `q` and `k`, such as
-`rope(silu(k_normed))` or a second query; `neg_q=None` uses `k`.
-
 ```python
-from xattn import (
-    group_softdelta_attention,
-    group_softdelta_attention_bwd,
-    group_softdelta_attention_fwd,
-)
+from xattn import group_softdelta_attention
 
-y = group_softdelta_attention(q, k, v, g, neg_q=None, high_precision_level=0)
-y, readers, lse = group_softdelta_attention_fwd(q, k, v, g, neg_q=None, high_precision_level=1)
-dq, dk, dv, dg, dneg_q, dprev_k, dprev_v = group_softdelta_attention_bwd(
-    dy, q, k, v, g, readers, lse, neg_q=None, high_precision_level=1,
+y = group_softdelta_attention(
+    q, k, v, g,
+    neg_q=None,
+    scale=None,
+    prev_k=None,
+    prev_v=None,
+    q_segment_idx=None,
+    k_segment_idx=None,
+    segment_idx=None,
+    bos_mask=None,
+    backend="auto",
+    deterministic=False,
+    high_precision_level=0,
 )
 ```
 
-Layouts that differ from SoftDelta:
+Tensor layouts:
 
 - `q`: `[batch, seqlen, q_heads, qk_dim]`
+- `k`: `[batch, seqlen, kv_heads, qk_dim]`
+- `v`: `[batch, seqlen, kv_heads, groups, group_dim]`
+- `g`: `[batch, seqlen, q_heads, groups, 1]`, gate logits
 - `neg_q`: optional `[batch, seqlen, kv_heads, qk_dim]`, same device and dtype as `q`
-- `readers`: `[batch, seqlen, kv_heads + q_heads, groups, group_dim]`, `neg_read` heads then `read` heads
-- `lse`: `[batch, kv_heads + q_heads, seqlen]`, same head order
-- `dneg_q`: same shape and dtype as `neg_q`, or `None` when `neg_q=None` (added to `dk`)
+- `prev_k`: optional `[batch, prev_seqlen, kv_heads, qk_dim]`
+- `prev_v`: optional `[batch, prev_seqlen, kv_heads, groups, group_dim]`
+- `q_segment_idx`: optional int64 `[batch, seqlen]`
+- `k_segment_idx`, `segment_idx`: optional int64 `[batch, prev_seqlen + seqlen]`
+- `bos_mask`: optional CUDA bool `[batch, prev_seqlen + seqlen]`
 
-The other arguments, layouts, precision levels and SM90 limits follow SoftDelta;
-`high_precision_level >= 2` also requires SM90. Pass the same `neg_q` to
-backward. Finite zero/negative scales transform both `q` and `neg_q`.
+The shared arguments, precision levels and SM90 limits follow SoftDelta above.
+`high_precision_level >= 2` requires SM90 for the autograd API as well.
+
+Standalone forward/backward:
+
+```python
+from xattn import group_softdelta_attention_fwd, group_softdelta_attention_bwd
+
+y, readers, lse = group_softdelta_attention_fwd(
+    q, k, v, g,
+    neg_q=None,
+    scale=None,
+    prev_k=None,
+    prev_v=None,
+    q_segment_idx=None,
+    k_segment_idx=None,
+    segment_idx=None,
+    bos_mask=None,
+    backend="auto",
+    deterministic=False,
+    high_precision_level=1,
+)
+dq, dk, dv, dg, dneg_q, dprev_k, dprev_v = group_softdelta_attention_bwd(
+    dy, q, k, v, g, readers, lse,
+    neg_q=None,
+    scale=None,
+    prev_k=None,
+    prev_v=None,
+    q_segment_idx=None,
+    k_segment_idx=None,
+    segment_idx=None,
+    bos_mask=None,
+    backend="auto",
+    deterministic=False,
+    high_precision_level=1,
+)
+```
+
+Output layouts:
+
+- `y`, `dy`: `[batch, seqlen, q_heads, groups, group_dim]`, input dtype
+- `readers`: `[batch, seqlen, kv_heads + q_heads, groups, group_dim]`, FP32 when high precision is enabled, otherwise input dtype; negative reader heads followed by query reader heads
+- `lse`: `[batch, kv_heads + q_heads, seqlen]`, FP32, same head order as `readers`
+- `dq`, `dk`, `dv`, `dg`: same shapes and dtypes as `q`, `k`, `v`, `g`
+- `dneg_q`: same shape and dtype as `neg_q`, or `None` when `neg_q=None` (its gradient is added to `dk`)
+- `dprev_k`, `dprev_v`: same shapes and dtypes as previous K/V, or `None`
+
+Standalone calls require an SM90 build and GPU, with `backend="auto"` or
+`"sm90"`, and do not build an autograd graph or populate `.grad`.
+Forward always returns `(y, readers, lse)`, including under
+`no_grad`/inference mode. Pass the same `neg_q`, `high_precision_level` and
+other forward options to backward, together with forward's `readers` and `lse`.
+`readers.dtype` does not select the backward algorithm. Final `y` alone is
+insufficient for backward. The autograd API returns only `y` and retains
+reader state internally.
