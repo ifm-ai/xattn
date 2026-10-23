@@ -15,8 +15,9 @@ template <
     typename Visibility>
 void RunFlashSWAFwdSm90VD(
     AttentionFwdParams& params, cudaStream_t stream) {
-  static constexpr bool kUseFastExp2 =
-      !kVarlen && !kHasSegment;
+  // ex2.approx.ftz on every route (FA3 builds with fast math): it differs from
+  // exp2f only for results below 2^-126, which no output can resolve.
+  static constexpr bool kUseFastExp2 = true;
   RunAttentionFwdSm90Kernel<
       kHeadDim, kHeadDimV, Element, ElementOut,
       kVarlen, kHasSegment, true /*kUsePersistentScheduler*/,
@@ -53,6 +54,10 @@ void RunFlashSWAFwdSm90VD(
   template void RunFlashSWAFwdSm90VD<                                 \
       Element, Element, true, false, HeadDim, HeadDimV,                \
       attention::semantics::CausalSlidingWindowVisibility>(           \
+      AttentionFwdParams&, cudaStream_t);                              \
+  template void RunFlashSWAFwdSm90VD<                                 \
+      Element, Element, true, false, HeadDim, HeadDimV,                \
+      attention::semantics::CausalFullVisibility>(                    \
       AttentionFwdParams&, cudaStream_t);                              \
   }                                                                    \
   }                                                                    \

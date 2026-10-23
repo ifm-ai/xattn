@@ -357,6 +357,17 @@ struct CollectiveEpilogueFwd {
                         }
                     }
                 }
+            } else {
+                // Packed rows ((qhead_per_khead, seqlen), d): the sequence offset
+                // uses the inner row stride; rows go through the FP32 direct store.
+                Tensor mO_state = make_tensor(
+                    make_gmem_ptr(params.ptr_O_state + offset_o * get<1>(get<0>(params.stride_O_state_packed))),
+                    params.shape_O_packed, params.stride_O_state_packed)(
+                        _, _, bidh, !is_varlen ? bidb : 0, _0{});
+                using PackGQAState_t = flash::PackGQAManager<
+                    get<0>(TileShape_MNK_PV{}), get<1>(TileShape_MNK_PV{}), NumEpilogueThreads, float>;
+                PackGQAState_t::store_O_direct(
+                    mO_state, tOrO, tiled_mma, params.qhead_per_khead_divmod, thread_idx, seqlen_o, m_block);
             }
         }
 
@@ -545,6 +556,27 @@ struct CollectiveEpilogueFwd {
                         int const col = linear % kHeadDimV;
                         int const row = m_block * kBlockM + row_in_block;
                         if (row < seqlen_o &&
+                            col < get<1>(params.shape_O)) {
+                            mO_state(row, col) = 0.0f;
+                        }
+                    }
+                } else {
+                    // Packed row r = head + qhead_per_khead * token.
+                    Tensor mO_state = make_tensor(
+                        make_gmem_ptr(params.ptr_O_state +
+                                      offset_o * get<1>(get<0>(params.stride_O_state_packed))),
+                        params.shape_O_packed,
+                        params.stride_O_state_packed)(
+                            _, _, bidh, !is_varlen ? bidb : 0, _0{});
+                    int const packed_rows = seqlen_o * params.qhead_per_khead_divmod.divisor;
+                    #pragma unroll 1
+                    for (int linear = thread_idx;
+                         linear < kBlockM * kHeadDimV;
+                         linear += NumEpilogueThreads) {
+                        int const row_in_block = linear / kHeadDimV;
+                        int const col = linear % kHeadDimV;
+                        int const row = m_block * kBlockM + row_in_block;
+                        if (row < packed_rows &&
                             col < get<1>(params.shape_O)) {
                             mO_state(row, col) = 0.0f;
                         }

@@ -12,7 +12,7 @@ template <
     int kHeadDim, int kHeadDimV>
 void RunFlashSCAFwdSm90VD(
     AttentionFwdParams& params, cudaStream_t stream) {
-  static constexpr bool kUseFastExp2 = !kVarlen && !kHasSegment;
+  static constexpr bool kUseFastExp2 = true;  // ex2.approx.ftz on every route
   RunAttentionFwdSm90Kernel<
       kHeadDim, kHeadDimV, Element, ElementOut, kVarlen, kHasSegment,
       true /*kUsePersistentScheduler*/, kUseFastExp2>(params, stream);

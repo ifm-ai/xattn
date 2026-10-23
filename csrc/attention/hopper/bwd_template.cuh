@@ -10,6 +10,7 @@
 #include <cutlass/device_kernel.h>
 #include <cutlass/kernel_hardware_info.h>
 #include <cutlass/kernel_launch.h>
+#include <cutlass/numeric_conversion.h>
 #include <cutlass/numeric_types.h>
 #include <limits>
 #include <torch/types.h>
@@ -252,6 +253,39 @@ __global__ void AttentionCastGroupedKVGradsKernel(
   }
 }
 
+// Grouped dK / dV cast, 8 values per thread: output rows of d / 8 vectors
+// (contiguous) from accumulator rows of accum_row_vectors (the instance's head
+// dimension, d rounded up). Thread (row, column): row = idx >> row_shift,
+// column = idx & (2^row_shift - 1), past a row's vectors idle (no division).
+template <typename Element>
+__global__ void AttentionCastGroupedKVGradsVectorKernel(
+    int64_t rows, int row_shift, const float* __restrict__ dk_input,
+    Element* __restrict__ dk_output, int dk_row_vectors, int dk_accum_row_vectors,
+    const float* __restrict__ dv_input, Element* __restrict__ dv_output,
+    int dv_row_vectors, int dv_accum_row_vectors) {
+  using Input = cutlass::AlignedArray<float, 8>;
+  using Output = cutlass::AlignedArray<Element, 8>;
+  cutlass::NumericArrayConverter<Element, float, 8> convert;
+  int64_t const idx =
+      int64_t(blockIdx.x) * int64_t(blockDim.x) + int64_t(threadIdx.x);
+  int64_t const row = idx >> row_shift;
+  int const column = int(idx & ((int64_t(1) << row_shift) - 1));
+  if (row >= rows) {
+    return;
+  }
+  Output out;
+  if (column < dk_row_vectors) {
+    static_cast<cutlass::Array<Element, 8>&>(out) = convert(
+        reinterpret_cast<Input const*>(dk_input)[row * dk_accum_row_vectors + column]);
+    reinterpret_cast<Output*>(dk_output)[row * dk_row_vectors + column] = out;
+  }
+  if (column < dv_row_vectors) {
+    static_cast<cutlass::Array<Element, 8>&>(out) = convert(
+        reinterpret_cast<Input const*>(dv_input)[row * dv_accum_row_vectors + column]);
+    reinterpret_cast<Output*>(dv_output)[row * dv_row_vectors + column] = out;
+  }
+}
+
 // Cast directly into the unpadded gradient tensor.
 template <typename Element, int kHeadDim, int kHeadDimV>
 __global__ void AttentionCastTrimGroupedKVGradsKernel(
@@ -438,9 +472,12 @@ void RunAttentionBwdSm90Kernel(
   static constexpr bool HasSoftcap = false;
   static constexpr bool Varlen = kVarlen;
   static constexpr int kMaxHeadDim = kHeadDim > kHeadDimV ? kHeadDim : kHeadDimV;
+  // 128-row tiles for narrow Q/K; with V > 64 only dense rows keep them:
+  // segment and varlen rows spill registers there (D64/V128 at BM 64:
+  // segment 8.9 -> 1.3 ms, deterministic varlen 2.65 -> 1.89 ms).
   static constexpr bool UseLargeBlockM =
       kHeadDim <= 64 && kHeadDimV <= 128 &&
-      (!kVarlen || kDeterministic || kHeadDimV <= 64);
+      (kHeadDimV <= 64 || (!kHasSegment && !kVarlen));
   static constexpr int kDefaultBlockM = UseLargeBlockM ? 128 : 64;
   static constexpr int kBlockM =
       kBlockMOverride > 0 ? kBlockMOverride : kDefaultBlockM;
@@ -1262,6 +1299,35 @@ void RunAttentionBwdSm90Kernel(
     int64_t const dv_numel = dv_accum.numel();
     int64_t const dkv_numel = dk_numel > dv_numel ? dk_numel : dv_numel;
     auto launch_cast = [&] {
+      // Dense [rows, d] / [rows, dv] outputs: 8-value vectors (one 128-bit
+      // or wider load and store per thread) instead of one value per thread.
+      if constexpr (kHeadDim % 8 == 0 && kHeadDimV % 8 == 0) {
+        using CastOutput = cutlass::AlignedArray<HPOut, 8>;
+        int64_t const rows = dk_numel / kHeadDim;
+        auto aligned = [](void const* ptr) {
+          return reinterpret_cast<uintptr_t>(ptr) % alignof(CastOutput) == 0;
+        };
+        int const dk_row_vectors = params.d / 8;
+        int const dv_row_vectors = params.dv / 8;
+        int row_shift = 0;
+        while ((1 << row_shift) < (dk_row_vectors > dv_row_vectors ? dk_row_vectors : dv_row_vectors)) {
+          ++row_shift;
+        }
+        int64_t const cast_blocks = cutlass::ceil_div(rows << row_shift, int64_t(kCastThreads));
+        if (params.d % 8 == 0 && params.dv % 8 == 0 && params.d <= kHeadDim &&
+            params.dv <= kHeadDimV && dv_numel / kHeadDimV == rows &&
+            params.dk_head_stride == params.d && params.dv_head_stride == params.dv &&
+            aligned(params.dk_ptr) && aligned(params.dv_ptr) &&
+            cast_blocks <= std::numeric_limits<int>::max()) {
+          AttentionCastGroupedKVGradsVectorKernel<HPOut>
+              <<<uint32_t(cast_blocks), kCastThreads, 0, stream>>>(
+                  rows, row_shift, dk_accum.data_ptr<float>(),
+                  static_cast<HPOut*>(params.dk_ptr), dk_row_vectors, kHeadDim / 8,
+                  dv_accum.data_ptr<float>(), static_cast<HPOut*>(params.dv_ptr),
+                  dv_row_vectors, kHeadDimV / 8);
+          return;
+        }
+      }
       if constexpr (
           Visibility::kKind ==
               attention::semantics::VisibilityKind::kCausalFull &&

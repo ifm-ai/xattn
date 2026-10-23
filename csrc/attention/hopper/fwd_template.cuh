@@ -64,7 +64,7 @@ constexpr std::tuple<int, int, bool, bool> AttentionTileSizeFwdSm90(
     if (!kVarlen && headdim == 128 && headdim_v == 256) {
       return {128, 128, true, false};
     }
-    if (headdim == headdim_v) {
+    if (!kVarlen && headdim == headdim_v) {
       if (headdim <= 64) {
         return {192, 128, true, true};
       }
@@ -218,7 +218,8 @@ template <
     bool kSoftDeltaSplitKVMulticast = false,
     bool kSoftDeltaClusteredRowPair = false,
     bool kInitializeTileCounterOnlyForMultipleWaves = false,
-    bool kSubtractBeforeScale = false>
+    bool kSubtractBeforeScale = false,
+    bool kPackGQA = false>
 void RunAttentionFwdSm90KernelTile(
     AttentionFwdParams& params, cudaStream_t stream) {
   // Select before launching, rather than branching inside every softmax tile.
@@ -233,7 +234,7 @@ void RunAttentionFwdSm90KernelTile(
           FwdEpilogue, EpilogueArguments, MainloopAdapter, kStages,
           kSoftDeltaSplitKVMulticast, kSoftDeltaClusteredRowPair,
           kInitializeTileCounterOnlyForMultipleWaves,
-          /*kSubtractBeforeScale=*/true>(params, stream);
+          /*kSubtractBeforeScale=*/true, kPackGQA>(params, stream);
       return;
     }
   }
@@ -245,7 +246,8 @@ void RunAttentionFwdSm90KernelTile(
   static constexpr bool PagedKVNonTMA = false;
   static constexpr bool AppendKV = false;
   static constexpr bool HasQv = false;
-  static constexpr bool PackGQA = false;
+  // PackGQA: one M tile holds the query rows of all heads sharing a KV head.
+  static constexpr bool PackGQA = kPackGQA;
   static constexpr bool Split = false;
   static constexpr bool VColmajor = false;
   static constexpr bool FP8TransposeV = false;
@@ -268,6 +270,9 @@ void RunAttentionFwdSm90KernelTile(
       (kSoftDeltaSingleCTA
            ? ClusterM == (kSoftDeltaClusteredRowPair ? 2 : 1)
            : (ClusterM == 1 || ClusterM == 2)));
+  static_assert(!PackGQA || (!kHasSegment && !kSoftDeltaPair && !kSoftDeltaSingleCTA &&
+                             !IsSlidingChunk && kClusterM == 1),
+                "attention SM90 FWD PackGQA covers plain causal / window attention");
   static_assert(kBlockM % 64 == 0,
                 "attention SM90 FWD BM must be a multiple of 64");
   static_assert(kBlockN % 8 == 0,
@@ -305,7 +310,7 @@ void RunAttentionFwdSm90KernelTile(
       flash::VarlenDynamicPersistentTileScheduler<
           kBlockM, kBlockN, CollectiveMainloop::NumMmaThreads,
           CollectiveMainloop::NumProducerThreads, false /*Split*/,
-          false /*PackGQA*/, true /*WarpSpecialized*/, false /*LPT*/,
+          PackGQA, true /*WarpSpecialized*/, false /*LPT*/,
           false /*Sort*/, false /*Prepared*/>;
   using PersistentScheduler = std::conditional_t<
       kVarlen, VarlenPersistentScheduler, DensePersistentScheduler>;
@@ -419,9 +424,9 @@ void RunAttentionFwdSm90KernelTile(
   static constexpr int kSchedulerBlockM =
       kSoftDeltaSingleCTA ? kBlockM / 2 : kBlockM;
   int num_blocks_m = cutlass::ceil_div(
-      kVarlen ? params.max_seqlen_q : params.seqlen_q,
+      (kVarlen ? params.max_seqlen_q : params.seqlen_q) * (PackGQA ? qhead_per_khead : 1),
       kSchedulerBlockM);
-  int scheduler_heads = kSoftDeltaPair ? params.h / 2 : params.h;
+  int scheduler_heads = kSoftDeltaPair ? params.h / 2 : (PackGQA ? params.h_k : params.h);
   int scheduler_batches = kVarlen ? params.num_sequences : params.b;
   std::int64_t scheduler_work_tiles =
       std::int64_t(num_blocks_m) * scheduler_heads * scheduler_batches;
@@ -601,6 +606,28 @@ void RunAttentionFwdSm90Kernel(
           FwdKernel, 1 /*kClusterM*/, false /*kSoftDeltaPair*/,
           false /*kSoftDeltaSingleCTA*/, void /*SchedulerOverride*/,
           flash::CollectiveEpilogueFwdNoState>(params, stream);
+      return;
+    }
+  }
+
+  // Packed varlen causal / window attention with grouped heads: pack the
+  // query heads of each KV head into the M tile, which shortens the partial
+  // last tile of every sequence (MHA keeps TMA Q loads).
+  static constexpr bool kVarlenPackGQA =
+      kVarlen && !kHasSegment &&
+      (Visibility::kKind == attention::semantics::VisibilityKind::kCausalFull ||
+       Visibility::kKind ==
+           attention::semantics::VisibilityKind::kCausalSlidingWindow);
+  if constexpr (kVarlenPackGQA) {
+    if (params.h != params.h_k) {
+      RunAttentionFwdSm90KernelTile<
+          kHeadDim, kHeadDimV, Element, ElementOut, kVarlen, kHasSegment,
+          kUsePersistentScheduler, std::get<0>(kCurrentBlockMN),
+          std::get<1>(kCurrentBlockMN), std::get<2>(kCurrentBlockMN),
+          std::get<3>(kCurrentBlockMN), kUseFastExp2, Visibility,
+          FwdKernel, 1, false, false, void, flash::CollectiveEpilogueFwd,
+          AttentionFwdEpilogueArguments, AttentionDefaultMainloop, 2, false,
+          false, false, false, true /*kPackGQA*/>(params, stream);
       return;
     }
   }

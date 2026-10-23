@@ -226,6 +226,28 @@ void RunCausalFlashAttnBwdSm90Variant(
   }
 }
 
+// Packed varlen rows with causal-full visibility (no window mask), equal Q / K
+// lengths, nondeterministic: the dispatcher picks it when the window covers
+// every sequence.
+template <typename Element, int kHeadDim, int kHeadDimV, int kBlockN,
+          int kBlockM>
+void RunCausalFlashAttnBwdSm90VarlenNonDetVariant(
+    AttentionBwdParams& params, cudaStream_t stream) {
+  TORCH_CHECK(params.h % params.h_k == 0,
+              "FlashSWA SM90 full varlen BWD requires Hq divisible by Hkv");
+  if (params.h == params.h_k) {
+    RunAttentionBwdSm90Kernel<
+        kHeadDim, kHeadDimV, kBlockN, Element, false, true, false, kBlockM,
+        false, false, attention::semantics::CausalFullVisibility,
+        flash::FlashSWABwdSm90>(params, stream);
+  } else {
+    RunAttentionBwdSm90Kernel<
+        kHeadDim, kHeadDimV, kBlockN, Element, false, true, false, kBlockM,
+        true, false, attention::semantics::CausalFullVisibility,
+        flash::FlashSWABwdSm90>(params, stream);
+  }
+}
+
 template <typename Element, int kHeadDim, int kHeadDimV, int kBlockN,
           int kBlockM>
 void RunCausalFlashAttnBwdSm90NonDetVariant(
@@ -269,6 +291,9 @@ void RunCausalFlashAttnBwdSm90NonDetVariant(
   template void RunFlashSWABwdSm90VarlenVariant<                      \
       Element, HeadDim, HeadDimV, BlockN, 0>(                         \
       AttentionBwdParams&, bool, cudaStream_t);                        \
+  template void RunCausalFlashAttnBwdSm90VarlenNonDetVariant<          \
+      Element, HeadDim, HeadDimV, BlockN, 0>(                         \
+      AttentionBwdParams&, cudaStream_t);                              \
   }                                                                    \
   }                                                                    \
   }
@@ -301,6 +326,9 @@ void RunCausalFlashAttnBwdSm90NonDetVariant(
   namespace ops {                                                      \
   namespace flash_swa {                                                \
   template void RunFlashSWABwdSm90VarlenNonDetVariant<                \
+      Element, HeadDim, HeadDimV, BlockN, 0>(                         \
+      AttentionBwdParams&, cudaStream_t);                              \
+  template void RunCausalFlashAttnBwdSm90VarlenNonDetVariant<          \
       Element, HeadDim, HeadDimV, BlockN, 0>(                         \
       AttentionBwdParams&, cudaStream_t);                              \
   }                                                                    \

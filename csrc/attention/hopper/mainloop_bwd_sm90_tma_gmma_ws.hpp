@@ -162,9 +162,8 @@ struct CollectiveMainloopBwdSm90 {
     static constexpr int kBlockN = get<1>(TileShape_MNK{});
     static constexpr int kHeadDim = get<2>(TileShape_MNK{});
     static constexpr int kHeadDimV = kHeadDimV_;
-    // Match dense full forward's exponent approximation on equal-D/V kernels.
-    static constexpr bool UseFastExp2 =
-        Is_causal && !Varlen && !Has_segment && kHeadDim == kHeadDimV;
+    // ex2.approx.ftz like the forward (every route), on equal-D/V kernels.
+    static constexpr bool UseFastExp2 = kHeadDim == kHeadDimV;
     static constexpr bool UseDirectChunkMask =
         Is_sliding_chunk && kHeadDim == 256 && kHeadDimV == 256;
     static constexpr bool UseDirectChunkTile = DirectChunkTile_;

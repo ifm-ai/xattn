@@ -629,9 +629,22 @@ void DispatchFwd(AttentionFwdParams& params, cudaStream_t stream) {
   }
 }
 
+// A window covering every sequence without a strict past is causal-full:
+// varlen then uses causal masks instead of window masks.
+inline bool VarlenFullVisibility(int window_size_left, int window_size_right,
+                                 int max_seqlen_k) {
+  return window_size_right == 0 && window_size_left >= max_seqlen_k - 1;
+}
+
 template <typename Element, int kHeadDim>
 void DispatchVarlenFwdV(
     AttentionFwdParams& params, cudaStream_t stream) {
+  if (VarlenFullVisibility(params.window_size_left, params.window_size_right,
+                           params.max_seqlen_k)) {
+    DispatchFwdV<Element, kHeadDim, true, false,
+                 attention::semantics::CausalFullVisibility>(params, stream);
+    return;
+  }
   DispatchFwdV<Element, kHeadDim, true, false>(params, stream);
 }
 
@@ -884,6 +897,16 @@ template <typename Element, int kHeadDim, int kHeadDimV>
 void DispatchVarlenBwdBucket(
     AttentionBwdParams& params, bool deterministic,
     cudaStream_t stream) {
+  // Causal-full masks for nondeterministic, equal-length packed rows.
+  if (!deterministic && params.seqlen_q == params.seqlen_k &&
+      VarlenFullVisibility(params.window_size_left, params.window_size_right,
+                           params.max_seqlen_k)) {
+    constexpr int kBlockN = kHeadDim == 256 ? (kHeadDimV == 256 ? 80 : 128)
+        : kHeadDim == 192 && kHeadDimV == 192 ? 96 : 128;
+    flash_swa::RunCausalFlashAttnBwdSm90VarlenNonDetVariant<
+        Element, kHeadDim, kHeadDimV, kBlockN, 0>(params, stream);
+    return;
+  }
   if constexpr (kHeadDim == 256) {
     if (deterministic) {
       if constexpr (kHeadDimV <= 128) {

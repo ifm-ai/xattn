@@ -38,6 +38,11 @@ void RunFlashSWABwdSm90VarlenNonDetVariant(
     AttentionBwdParams& params, cudaStream_t stream);
 
 template <typename Element, int kHeadDim, int kHeadDimV, int kBlockN,
+          int kBlockM = 0>
+void RunCausalFlashAttnBwdSm90VarlenNonDetVariant(
+    AttentionBwdParams& params, cudaStream_t stream);
+
+template <typename Element, int kHeadDim, int kHeadDimV, int kBlockN,
           int kBlockM>
 void RunFlashSWABwdSm90SegmentVariant(
     AttentionBwdParams& params, bool deterministic, cudaStream_t stream);
