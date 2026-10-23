@@ -610,8 +610,11 @@ public:
 
 ///////////////////////////////////////////////////////////////////////////////
 
+// ResidualFirst schedules the partial L2 section (num_head * num_batch not a
+// multiple of the section size) before the full ones, so its longest blocks
+// do not form the tail.
 template <bool Varlen, int kBlock, bool SPT = false, int WorkGroupX = 1,
-          bool ContiguousWorkGroup = true>
+          bool ContiguousWorkGroup = true, bool ResidualFirst = false>
 class SingleTileBwdLPTScheduler {
 
 public:
@@ -699,12 +702,24 @@ public:
         }
         int block, bidh, bidb;
         int l2_mod, bidhb, bidhb_residual;
+        if constexpr (ResidualFirst) {
+            int const residual_tiles = params.total_blocks
+                - params.num_hb_quotient * params.l2_major_divmod.divisor;
+            if (tile_idx < residual_tiles) {
+                bidhb = params.num_hb_quotient;
+                block = params.l2_minor_residual_divmod.divmod(bidhb_residual, tile_idx);
+            } else {
+                bidhb = params.l2_major_divmod.divmod(l2_mod, tile_idx - residual_tiles);
+                block = params.l2_minor_divmod.divmod(bidhb_residual, l2_mod);
+            }
+        } else {
         bidhb = params.l2_major_divmod.divmod(l2_mod, tile_idx);
         // Residual sections use their own divisor.
         if (bidhb < params.num_hb_quotient) {
             block = params.l2_minor_divmod.divmod(bidhb_residual, l2_mod);
         } else {
             block = params.l2_minor_residual_divmod.divmod(bidhb_residual, l2_mod);
+        }
         }
         bidb = params.head_divmod.divmod(bidh, bidhb * params.l2_minor_divmod.divisor + bidhb_residual);
         bool is_valid_tile = true;

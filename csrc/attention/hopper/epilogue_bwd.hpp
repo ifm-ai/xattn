@@ -457,6 +457,156 @@ struct CollectiveEpilogueBwdSplitBatchDestinations
     }
 };
 
+// Negative-query reader groups (one work tile per key tile and KV head over all of
+// its readers) write dK / dV once, without accumulators. dV and, without
+// ptr_dKaccum, dK go out in the input dtype through the direct epilogue. With
+// ptr_dKaccum the negative-query gradient folds into dK in the dQ postprocess: dK
+// goes to that FP32 buffer ([B, L, Hkv, kHeadDim] rows) by plain stores from
+// the accumulator registers.
+template <class TileShape_MNK_, int kHeadDimV_, class Element_, class ArchTag_,
+          int NumEpilogueThreads_, bool dKV_swapAB_, int AtomLayoutKdKV = 1>
+struct CollectiveEpilogueBwdNegQGroup
+    : CollectiveEpilogueBwd<
+          TileShape_MNK_, kHeadDimV_, Element_, ArchTag_,
+          NumEpilogueThreads_, false /*Varlen*/, dKV_swapAB_, AtomLayoutKdKV> {
+    using Base = CollectiveEpilogueBwd<
+        TileShape_MNK_, kHeadDimV_, Element_, ArchTag_,
+        NumEpilogueThreads_, false /*Varlen*/, dKV_swapAB_, AtomLayoutKdKV>;
+    using BaseArguments = typename Base::Arguments;
+    using BaseParams = typename Base::Params;
+    using typename Base::Element;
+    using typename Base::ShapedKV;
+    using typename Base::StridedKV;
+    using typename Base::TileShape_MNK;
+    using typename Base::TileShape_NK_V;
+    using Base::kBlockN;
+    using Base::kHeadDim;
+    using Base::NumEpilogueThreads;
+    using Base::dKV_swapAB;
+    static_assert(Base::Use_TMA, "negative-query reader groups store dV by TMA");
+
+    struct Arguments {
+        BaseArguments base;
+        float* ptr_dKaccum;
+        ShapedKV const shape_dKaccum;
+        StridedKV const stride_dKaccum;
+    };
+
+    struct Params {
+        BaseParams base;
+        float* ptr_dKaccum;
+        ShapedKV const shape_dKaccum;
+        StridedKV const stride_dKaccum;
+    };
+
+    static Params
+    to_underlying_arguments(Arguments const& args) {
+        return {Base::to_underlying_arguments(args.base), args.ptr_dKaccum,
+                args.shape_dKaccum, args.stride_dKaccum};
+    }
+
+    CUTLASS_DEVICE
+    static void prefetch_tma_descriptors(Params const& params) {
+        Base::prefetch_tma_descriptors(params.base);
+    }
+
+    template <typename SharedStorage, typename FrgTensorK, typename FrgTensorV,
+              typename TiledMmaK, typename TiledMmaV>
+    CUTLASS_DEVICE void
+    store(Params const& params,
+          FrgTensorK const& tdKrdK,
+          FrgTensorV const& tdVrdV,
+          SharedStorage& shared_storage,
+          TiledMmaK tiled_mma_dK,
+          TiledMmaV tiled_mma_dV,
+          int thread_idx,
+          cute::tuple<int32_t, int32_t, int32_t> const& block_coord) {
+        if (params.ptr_dKaccum == nullptr) {
+            Base::store(params.base, tdKrdK, tdVrdV, shared_storage,
+                        tiled_mma_dK, tiled_mma_dV, thread_idx, block_coord);
+            return;
+        }
+        auto [n_block, bidh, bidb] = block_coord;
+        Tensor sdV = cute::as_position_independent_swizzle_tensor(make_tensor(
+            make_smem_ptr(shared_storage.tensors.epilogue.smem_dv.data()),
+            typename Base::SmemLayoutdV{}));
+        Tensor sdVt = cute::as_position_independent_swizzle_tensor(make_tensor(
+            make_smem_ptr(shared_storage.tensors.epilogue.smem_dv.data()),
+            typename Base::SmemLayoutdVt{}));
+        auto smem_tiled_copy_dV =
+            make_tiled_copy_C(typename Base::SmemCopyAtomdKV{}, tiled_mma_dV);
+        auto smem_thr_copy_dV = smem_tiled_copy_dV.get_thread_slice(thread_idx);
+        Tensor tdVrdV_out = make_tensor_like<Element>(tdVrdV);
+        flash::convert_type_out(tdVrdV, tdVrdV_out);
+        Tensor taccdVrdV = smem_thr_copy_dV.retile_S(tdVrdV_out);
+        Tensor taccdVsdV = smem_thr_copy_dV.partition_D(
+            cute::conditional_return<!dKV_swapAB>(sdV, sdVt));
+        // K/V shared-memory read completion.
+        flash::named_barrier_sync(NumEpilogueThreads, cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+        cute::copy(smem_tiled_copy_dV, taccdVrdV, taccdVsdV);
+        cutlass::arch::fence_view_async_shared();
+        cutlass::arch::NamedBarrier::arrive(NumEpilogueThreads + cutlass::NumThreadsPerWarp,
+                                            cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+        Tensor mdV = params.base.tma_store_dV.get_tma_tensor(params.base.shape_dV);
+        Tensor gdV = local_tile(mdV(_, _, bidh, bidb), TileShape_NK_V{}, make_coord(n_block, _0{}));
+        auto block_tma_dV = params.base.tma_store_dV.get_slice(_0{});
+        Tensor tdVgdV = block_tma_dV.partition_D(gdV);
+        Tensor tdVsdV = block_tma_dV.partition_S(sdV);
+        int const warp_idx_sync = __shfl_sync(0xffffffff, thread_idx / cutlass::NumThreadsPerWarp, 0);
+        if (warp_idx_sync == NumEpilogueThreads / cutlass::NumThreadsPerWarp - 1) {
+            cutlass::arch::NamedBarrier::sync(NumEpilogueThreads + cutlass::NumThreadsPerWarp,
+                                              cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+            if (cute::elect_one_sync()) {
+                cute::copy(params.base.tma_store_dV, tdVsdV, tdVgdV);
+                tma_store_arrive();
+            }
+        }
+        // dK rows while the dV store is in flight.
+        Tensor mdKaccum = make_tensor(make_gmem_ptr(params.ptr_dKaccum), params.shape_dKaccum,
+                                      params.stride_dKaccum)(_, _, bidh, bidb);
+        Tensor gdKaccum = local_tile(mdKaccum, Shape<Int<kBlockN>, Int<kHeadDim>>{},
+                                     make_coord(n_block, _0{}));
+        auto thr_mma_dK = tiled_mma_dK.get_thread_slice(thread_idx);
+        Tensor cK = cute::make_identity_tensor(
+            select<!dKV_swapAB ? 1 : 2, !dKV_swapAB ? 2 : 1>(TileShape_MNK{}));
+        Tensor tdKcK = thr_mma_dK.partition_C(cK);
+        int const rows = get<0>(params.shape_dKaccum) - n_block * kBlockN;
+        #pragma unroll
+        for (int i = 0; i < size(tdKrdK); ++i) {
+            int const axis0 = get<0>(tdKcK(i));
+            int const axis1 = get<1>(tdKcK(i));
+            int const row = !dKV_swapAB ? axis0 : axis1;
+            int const col = !dKV_swapAB ? axis1 : axis0;
+            if (row < rows) { gdKaccum(row, col) = tdKrdK(i); }
+        }
+        tma_store_wait<0>();
+    }
+
+    CUTLASS_DEVICE void
+    store_tail() {
+    }
+
+    CUTLASS_DEVICE void
+    store_zero(
+         Params const& params,
+         int thread_idx,
+         cute::tuple<int32_t, int32_t, int32_t> const& block_coord) {
+        Base::store_zero(params.base, thread_idx, block_coord);
+        if (params.ptr_dKaccum != nullptr) {
+            auto [n_block, bidh, bidb] = block_coord;
+            Tensor mdKaccum = make_tensor(make_gmem_ptr(params.ptr_dKaccum), params.shape_dKaccum,
+                                          params.stride_dKaccum)(_, _, bidh, bidb);
+            Tensor gdKaccum = local_tile(mdKaccum, Shape<Int<kBlockN>, Int<kHeadDim>>{},
+                                         make_coord(n_block, _0{}));
+            int const rows = get<0>(params.shape_dKaccum) - n_block * kBlockN;
+            int const count = (rows < kBlockN ? rows : kBlockN) * kHeadDim;
+            for (int i = thread_idx; i < count; i += NumEpilogueThreads) {
+                gdKaccum(i / kHeadDim, i % kHeadDim) = 0.f;
+            }
+        }
+    }
+};
+
 template <class TileShape_MNK_, int kHeadDimV_, class ElementAccum,
           class ArchTag_, int NumEpilogueThreads_, bool Varlen_,
           bool Deterministic, bool dKV_swapAB_>

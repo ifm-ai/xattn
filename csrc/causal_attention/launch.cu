@@ -1553,6 +1553,65 @@ std::tuple<torch::Tensor, torch::Tensor> CausalAttentionSM90VarlenFwd(
       std::move(y), std::move(lse));
 }
 
+void CausalAttentionSM90VarlenFwdInto(
+    const torch::Tensor& q, const torch::Tensor& k,
+    const torch::Tensor& v,
+    const torch::Tensor& cu_seqlens_q,
+    const torch::Tensor& cu_seqlens_k,
+    int64_t max_seqlen_q, int64_t max_seqlen_k,
+    int64_t window_size, double scale, bool strict_past,
+    torch::Tensor& y, torch::Tensor& lse) {
+  const int arch = CurrentDeviceArch(q);
+  TORCH_CHECK(
+      arch == 90,
+      "Causal attention SM90 varlen FWD requires Hopper sm90, got sm", arch);
+  TORCH_CHECK(
+      window_size >= 0 &&
+          window_size <= std::numeric_limits<int>::max(),
+      "Causal attention SM90 varlen FWD window_size must fit int32");
+  CheckPackedQKV(q, k, v);
+  const attention::sequence::VarlenMetadata metadata =
+      attention::sequence::CheckVarlenMetadata(
+          q, k, cu_seqlens_q, cu_seqlens_k,
+          max_seqlen_q, max_seqlen_k, "Causal attention SM90");
+  at::cuda::OptionalCUDAGuard guard(at::device_of(q));
+  const int64_t element_bytes = v.element_size();
+  TORCH_CHECK(
+      y.device() == q.device() && y.scalar_type() == v.scalar_type() &&
+          y.dim() == 3 && y.size(0) == q.size(0) && y.size(1) == q.size(1) &&
+          y.size(2) == v.size(2) && y.stride(2) == 1 &&
+          (y.stride(0) * element_bytes) % 16 == 0 &&
+          (y.stride(1) * element_bytes) % 16 == 0 &&
+          reinterpret_cast<uintptr_t>(y.data_ptr()) % 16 == 0,
+      "Causal attention SM90 varlen FWD output must be [total_q, Hq, V] with a "
+      "contiguous last dimension and 16-byte aligned rows and heads");
+  TORCH_CHECK(
+      lse.device() == q.device() && lse.scalar_type() == at::kFloat &&
+          lse.is_contiguous() && lse.dim() == 2 && lse.size(0) == q.size(1) &&
+          lse.size(1) == q.size(0),
+      "Causal attention SM90 varlen FWD lse must be contiguous FP32 [Hq, total_q]");
+
+  torch::Tensor q_c = q.contiguous();
+  torch::Tensor k_c = k.contiguous();
+  torch::Tensor v_c = v.contiguous();
+  torch::Tensor cu_q_c = cu_seqlens_q.contiguous();
+  torch::Tensor cu_k_c = cu_seqlens_k.contiguous();
+  const int* cu_k_aligned =
+      cu_k_c.data_ptr<int>() + metadata.k_sequence_offset;
+  AttentionFwdParams params;
+  FillVarlenFwdParams(
+      q_c, k_c, v_c, window_size, static_cast<float>(scale), y, lse,
+      c10::nullopt, cu_q_c.data_ptr<int>(), cu_k_aligned,
+      metadata.num_sequences, max_seqlen_q, max_seqlen_k, strict_past,
+      params);
+  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  if (q.scalar_type() == at::kHalf) {
+    DispatchVarlenFwd<cutlass::half_t>(params, stream);
+  } else {
+    DispatchVarlenFwd<cutlass::bfloat16_t>(params, stream);
+  }
+}
+
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
 CausalAttentionSM90VarlenBwd(
     const torch::Tensor& y_grad, const torch::Tensor& q,

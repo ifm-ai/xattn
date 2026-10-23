@@ -30,6 +30,10 @@ namespace ops {
 
 using namespace cute;
 
+// Forward kernels that read negative-query heads (group_softdelta) specialize this.
+template <template <class, class, class> class FwdKernel>
+struct AttentionFwdKernelUsesNegQReaders : std::false_type {};
+
 template <typename Mainloop>
 struct AttentionDefaultMainloop {
   using Type = Mainloop;
@@ -252,6 +256,8 @@ void RunAttentionFwdSm90KernelTile(
   static constexpr bool VColmajor = false;
   static constexpr bool FP8TransposeV = false;
   static constexpr int ClusterM = kClusterM;
+  static constexpr bool kNegQReaders =
+      AttentionFwdKernelUsesNegQReaders<FwdKernel>::value;
   static_assert(!kSoftDeltaSingleCTA || kSoftDeltaPair);
   static_assert(
       !kSoftDeltaClusteredRowPair || kSoftDeltaSingleCTA);
@@ -271,7 +277,7 @@ void RunAttentionFwdSm90KernelTile(
            ? ClusterM == (kSoftDeltaClusteredRowPair ? 2 : 1)
            : (ClusterM == 1 || ClusterM == 2)));
   static_assert(!PackGQA || (!kHasSegment && !kSoftDeltaPair && !kSoftDeltaSingleCTA &&
-                             !IsSlidingChunk && kClusterM == 1),
+                             !kNegQReaders && !IsSlidingChunk && kClusterM == 1),
                 "attention SM90 FWD PackGQA covers plain causal / window attention");
   static_assert(kBlockM % 64 == 0,
                 "attention SM90 FWD BM must be a multiple of 64");
@@ -292,7 +298,7 @@ void RunAttentionFwdSm90KernelTile(
       AppendKV, HasQv, kHasSegment, MmaPVIsRS, IntraWGOverlap, PackGQA,
       Split, VColmajor, kUseFastExp2, IsSlidingChunk, kSoftDeltaPair,
       kSoftDeltaSingleCTA, kSoftDeltaSplitKVMulticast,
-      kSoftDeltaClusteredRowPair>;
+      kSoftDeltaClusteredRowPair, kNegQReaders>;
   using AdaptedMainloop =
       typename MainloopAdapter<DefaultCollectiveMainloop>::Type;
   using CollectiveMainloop = std::conditional_t<
@@ -415,7 +421,10 @@ void RunAttentionFwdSm90KernelTile(
       kVarlen ? params.q_position_offsets : nullptr,
       kHasSegment ? params.q_chunk_positions : nullptr,
       kHasSegment ? params.reset_attention_chunk : 0,
-      segment_spans_ptr, segment_rows_ptr};
+      segment_spans_ptr, segment_rows_ptr,
+      kNegQReaders ? static_cast<Element const*>(params.neg_q_ptr) : nullptr,
+      {params.neg_q_row_stride, _1{}, params.neg_q_head_stride,
+       params.neg_q_batch_stride}};
 
   typename CollectiveEpilogue::Arguments epilogue_args =
       EpilogueArguments::template Make<CollectiveEpilogue>(params);

@@ -21,6 +21,7 @@ PYBIND11_MODULE(xattn_cuda, m) {
   ops::DefineCausalFlashAttnOps(m_ops);
   ops::DefineFlashSoftDeltaCompositionOps(m_ops);
   ops::DefineFlashSoftDeltaGateOps(m_ops);
+  ops::DefineGroupSoftDeltaOps(m_ops);
 #ifdef XATTN_HAS_SM90
   ops::DefineFlashSoftDeltaFwdOps(m_ops);
   ops::DefineAttentionPrecisionOps(m_ops);

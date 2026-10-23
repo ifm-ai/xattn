@@ -100,3 +100,38 @@ multiples of 8 in `[8, 256]`. Unsupported widths are rejected before native
 launch. Finite zero/negative scales use an exact Q zero/sign transform so
 masking remains defined. Shape coverage does not guarantee bounded relative
 error for arbitrary ill-conditioned or overflowing floating-point inputs.
+
+## Group SoftDelta (in development)
+
+`group_softdelta_attention` is a separate API; the SoftDelta APIs above are
+unchanged. Its output is `read - sigmoid(g) * neg_read`. `read` uses `q` and
+includes the aligned query position; `neg_read` uses `neg_q`, reads only
+strictly earlier visible keys, and is shared by the query heads of each KV
+head. `neg_q` is any tensor already rotated like `q` and `k`, such as
+`rope(silu(k_normed))` or a second query; `neg_q=None` uses `k`.
+
+```python
+from xattn import (
+    group_softdelta_attention,
+    group_softdelta_attention_bwd,
+    group_softdelta_attention_fwd,
+)
+
+y = group_softdelta_attention(q, k, v, g, neg_q=None, high_precision_level=0)
+y, readers, lse = group_softdelta_attention_fwd(q, k, v, g, neg_q=None, high_precision_level=1)
+dq, dk, dv, dg, dneg_q, dprev_k, dprev_v = group_softdelta_attention_bwd(
+    dy, q, k, v, g, readers, lse, neg_q=None, high_precision_level=1,
+)
+```
+
+Layouts that differ from SoftDelta:
+
+- `q`: `[batch, seqlen, q_heads, qk_dim]`
+- `neg_q`: optional `[batch, seqlen, kv_heads, qk_dim]`, same device and dtype as `q`
+- `readers`: `[batch, seqlen, kv_heads + q_heads, groups, group_dim]`, `neg_read` heads then `read` heads
+- `lse`: `[batch, kv_heads + q_heads, seqlen]`, same head order
+- `dneg_q`: same shape and dtype as `neg_q`, or `None` when `neg_q=None` (added to `dk`)
+
+The other arguments, layouts, precision levels and SM90 limits follow SoftDelta;
+`high_precision_level >= 2` also requires SM90. Pass the same `neg_q` to
+backward. Finite zero/negative scales transform both `q` and `neg_q`.

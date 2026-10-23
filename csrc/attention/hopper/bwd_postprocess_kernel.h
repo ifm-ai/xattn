@@ -19,7 +19,7 @@ namespace flash {
 
 using namespace cute;
 
-template <class TileShape_MK_, class Element, class ElementAccum, class ArchTag_, int kNThreads, class TiledMma, bool dQ_swapAB, bool SplitDQ=false>
+template <class TileShape_MK_, class Element, class ElementAccum, class ArchTag_, int kNThreads, class TiledMma, bool dQ_swapAB, bool SplitDQ=false, bool NegQReaders=false>
 class AttentionBwdPostprocessDQ {
 
 public:
@@ -98,15 +98,30 @@ public:
     };
 
     static constexpr int SharedStorageSize = sizeof(SharedStorage);
-    // Use a one-CTA launch bound above 48 KiB of shared storage.
+    // Use a one-CTA launch bound above 48 KiB of shared storage. The negative-query
+    // fold's dK registers would otherwise halve the occupancy of the readers'
+    // launch (93 vs 60 registers at D 192): two CTAs whenever two fit.
     static constexpr uint32_t MinBlocksPerMultiprocessor =
-        SharedStorageSize > 48 * 1024 ? 1 : 2;
+        NegQReaders && SharedStorageSize <= 113 * 1024 ? 2
+        : SharedStorageSize > 48 * 1024 ? 1 : 2;
 
     using ShapedQ = cute::Shape<int32_t, int32_t, int32_t, int32_t>;   // (seqlen_q, d, head, batch)
     using StridedQ = cute::Stride<int64_t, _1, int64_t, int64_t>;
     // int64 extent: varlen workspaces can exceed 2^31 / d padded rows times d.
     using ShapedQaccum = cute::Shape<int64_t, int32_t, int32_t>;  // (seqlen_q * d, head, batch)
     using StridedQaccum = cute::Stride<_1, int64_t, int64_t>;
+
+    // Negative-query readers (group_softdelta): dQaccum head l = g * readers + r. r > 0
+    // writes dQ head g * (readers - 1) + r - 1; r = 0 writes head g of dNegQ, plus
+    // the FP32 dK accumulator rows (same head and rows, rounded once) when
+    // ptr_dK_accum is set; dNegQ is then dK itself.
+    struct NegQArgs {
+        Element* ptr_dNegQ = nullptr;
+        StridedQ stride_dNegQ = {};
+        float const* ptr_dK_accum = nullptr;
+        StridedQ stride_dK_accum = {};
+        int readers = 1;
+    };
 
     // Device side arguments
     struct Arguments {
@@ -124,6 +139,7 @@ public:
         int const dq_slots = 1;
         int64_t const dq_slot_stride = 0;
         int const* dq_exponent = nullptr;  // fixed-point deterministic dQ
+        NegQArgs neg_q = {};
     };
 
     // Kernel entry point API
@@ -142,6 +158,7 @@ public:
         int const dq_slots = 1;
         int64_t const dq_slot_stride = 0;
         int const* dq_exponent = nullptr;  // fixed-point deterministic dQ
+        NegQArgs neg_q = {};
     };
 
     // Convert to underlying arguments. In this case, a simple copy for the aliased type.
@@ -162,7 +179,8 @@ public:
             args.seqused,
             args.dq_slots,
             args.dq_slot_stride,
-            args.dq_exponent
+            args.dq_exponent,
+            args.neg_q
         };
     }
 
@@ -269,6 +287,53 @@ public:
             #pragma unroll
             for (int i = 0; i < size(taccdQrdQaccum); ++i) { taccdQrdQaccum(i) *= params.softmax_scale; }
         }
+        Element* ptr_out = params.ptr_dQ;
+        StridedQ stride_out = params.stride_dQ;
+        int out_head = bidh;
+        if constexpr (NegQReaders) {
+            int const readers = params.neg_q.readers;
+            int const group = bidh / readers;
+            int const reader = bidh - group * readers;
+            out_head = reader == 0 ? group : group * (readers - 1) + reader - 1;
+            if (reader == 0 && params.neg_q.ptr_dK_accum != nullptr) {
+                // All loads before any use: one memory round trip per thread.
+                auto thr_mma_dQ = tiled_mma_dQ.get_thread_slice(thread_idx);
+                Tensor cdQ = thr_mma_dQ.partition_C(cute::make_identity_tensor(select<!dQ_swapAB ? 0 : 1, !dQ_swapAB ? 1 : 0>(TileShape_MK{})));
+                StridedQ const stride = params.neg_q.stride_dK_accum;
+                float const* const dk = params.neg_q.ptr_dK_accum + int64_t(bidb) * get<3>(stride)
+                    + int64_t(group) * get<2>(stride) + int64_t(m_block) * kBlockM * get<0>(stride);
+                int const rows = std::min(seqlen_info.seqlen - m_block * kBlockM, kBlockM);
+                float dk_values[decltype(size(taccdQrdQaccum))::value];
+                if constexpr (!dQ_swapAB) {
+                    // GMMA accumulator values 2j, 2j + 1 are adjacent columns of one row.
+                    static_assert(decltype(size(taccdQrdQaccum))::value % 2 == 0);
+                    #pragma unroll
+                    for (int i = 0; i < size(taccdQrdQaccum); i += 2) {
+                        int const row = int(get<0>(cdQ(i)));
+                        int const col = int(get<1>(cdQ(i)));
+                        // Unconditional from a clamped row, masked at use (a guarded
+                        // load becomes a branch that serializes the round trips).
+                        float2 const pair = *reinterpret_cast<float2 const*>(
+                            dk + (row < rows ? row : 0) * get<0>(stride) + col);
+                        dk_values[i] = row < rows ? pair.x : 0.0f;
+                        dk_values[i + 1] = row < rows ? pair.y : 0.0f;
+                    }
+                } else {
+                    #pragma unroll
+                    for (int i = 0; i < size(taccdQrdQaccum); ++i) {
+                        int const row = int(get<1>(cdQ(i)));
+                        int const col = int(get<0>(cdQ(i)));
+                        dk_values[i] = row < rows ? dk[row * get<0>(stride) + col] : 0.0f;
+                    }
+                }
+                #pragma unroll
+                for (int i = 0; i < size(taccdQrdQaccum); ++i) { taccdQrdQaccum(i) += dk_values[i]; }
+            }
+            if (reader == 0) {
+                ptr_out = params.neg_q.ptr_dNegQ;
+                stride_out = params.neg_q.stride_dNegQ;
+            }
+        }
         // Convert tdQrdQ from fp32 to fp16
         Tensor rdQ = make_tensor_like<Element>(taccdQrdQaccum);
         flash::convert_type_out(taccdQrdQaccum, rdQ);
@@ -282,7 +347,7 @@ public:
         __syncthreads();
 
         // Step 4: Copy dQ from smem to register to prepare for coalesced write to gmem
-        Tensor mdQ = make_tensor(make_gmem_ptr(params.ptr_dQ), params.shape_dQ, params.stride_dQ)(_, _, bidh, !is_varlen ? bidb : 0);
+        Tensor mdQ = make_tensor(make_gmem_ptr(ptr_out), params.shape_dQ, stride_out)(_, _, out_head, !is_varlen ? bidb : 0);
         Tensor gdQ = local_tile(domain_offset(make_coord(seqlen_info.offset, _0{}), mdQ), TileShape_MK{}, make_coord(m_block, _0{}));  // (M, K)
         GmemTiledCopy gmem_tiled_copy_dQ;
         auto gmem_thr_copy_dQ = gmem_tiled_copy_dQ.get_thread_slice(thread_idx);

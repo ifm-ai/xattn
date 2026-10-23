@@ -61,6 +61,18 @@ std::tuple<torch::Tensor, torch::Tensor> CausalAttentionSM90VarlenFwd(
     bool strict_past = false,
     const c10::optional<torch::Tensor>& output_state = c10::nullopt, bool output_fp32 = false);
 
+// Packed varlen forward into caller storage: y [total_q, Hq, V] with a
+// contiguous last dimension and 16-byte aligned rows / heads (any strides),
+// lse FP32 [Hq, total_q] contiguous.
+void CausalAttentionSM90VarlenFwdInto(
+    const torch::Tensor& q, const torch::Tensor& k,
+    const torch::Tensor& v,
+    const torch::Tensor& cu_seqlens_q,
+    const torch::Tensor& cu_seqlens_k,
+    int64_t max_seqlen_q, int64_t max_seqlen_k,
+    int64_t window_size, double scale, bool strict_past,
+    torch::Tensor& y, torch::Tensor& lse);
+
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
 CausalAttentionSM90VarlenBwd(
     const torch::Tensor& y_grad, const torch::Tensor& q,

@@ -2,7 +2,7 @@
 
 Run commands from the checkout root, after building xattn for the target GPU.
 The attention-family correctness modules cover causal attention, FlashSCA, FlashSWA,
-and the three SoftDelta SM90 variants.
+the three SoftDelta SM90 variants, and Group SoftDelta.
 
 ```bash
 python -m pytest tests -q

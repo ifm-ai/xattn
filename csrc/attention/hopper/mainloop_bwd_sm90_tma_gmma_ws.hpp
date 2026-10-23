@@ -84,11 +84,21 @@ template <int Stages, int Stages_dO, int Stages_dS, class ClusterShape_, class T
         bool HeadPairParallel_=false,
         bool HeadPairClusterKVReuse_=false,
         bool HeadPairPrivateKVGrad_=false, bool SplitDQ_=false, int PrecisionLevel_=0,
-        bool StageDqExp_=true>
+        bool StageDqExp_=true,
+        bool NegQReaders_=false>
 struct CollectiveMainloopBwdSm90 {
 
     static constexpr int PrecisionLevel = PrecisionLevel_;
     static_assert(PrecisionLevel >= 0 && PrecisionLevel <= 4);
+    // Negative-query readers (group SoftDelta): logical head l = g * R + r over KV head g with
+    // R = logical / KV heads. r = 0 reads head g of the negative-query Q / dO
+    // descriptors over the strict past; r > 0 reads Q / dO head
+    // g * (R - 1) + r - 1 with the inclusive boundary. LSE, dPsum and dQaccum
+    // stay logical.
+    static constexpr bool NegQReaders = NegQReaders_;
+    static_assert(!NegQReaders ||
+                  (!Varlen_ && !HeadPairParallel_ && !HeadPairClusterKVReuse_ &&
+                   PrecisionLevel_ < 2));
     static constexpr int kStages = Stages;
     static constexpr bool SplitDQ = SplitDQ_;
     static constexpr int kStages_dO = Stages_dO;
@@ -141,7 +151,9 @@ struct CollectiveMainloopBwdSm90 {
     static constexpr bool HeadPairPrivateKVGrad =
         HeadPairPrivateKVGrad_;
 
-    static_assert(!ReaderPairKVReuse || (!Varlen_ && !HasSegment_),
+    // Negative-query reader groups also run segment-masked rows (head-independent
+    // M ranges; the strict reader masks one more position per row).
+    static_assert(!ReaderPairKVReuse || (!Varlen_ && (!HasSegment_ || NegQReaders_)),
                   "reader-pair K/V reuse requires dense inputs");
     static_assert(!HeadPairParallel || (!Varlen_ && !HasSegment_),
                   "parallel head-pair execution requires dense inputs");
@@ -572,7 +584,22 @@ struct CollectiveMainloopBwdSm90 {
         int const* dq_exponent = nullptr;
         int2 const* segment_query_intervals = nullptr;
         int2 const* segment_key_intervals = nullptr;
+        // Negative-query readers: Q [seqlen_q, d, nheads_kv, batch] and its dO.
+        Element const* const ptr_NegQ = nullptr;
+        StrideQKV const stride_NegQ = {};
+        Element const* const ptr_dO_NegQ = nullptr;
+        StrideQKV const stride_dO_NegQ = {};
     };
+
+    struct NegQLoadParams {
+        TMA_Q tma_q;
+        TMA_dO tma_do;
+        ShapeQKV shape_q;
+        ShapeQKV shape_do;
+    };
+    struct NoNegQLoadParams {};
+    using NegQParams = std::conditional_t<
+        NegQReaders, NegQLoadParams, NoNegQLoadParams>;
 
     // Device side kernel params
     struct Params {
@@ -625,6 +652,7 @@ struct CollectiveMainloopBwdSm90 {
         int const* dq_exponent = nullptr;
         int2 const* segment_query_intervals = nullptr;
         int2 const* segment_key_intervals = nullptr;
+        NegQParams neg_q = {};
 
         CUTLASS_DEVICE
         int get_chunk_position_offset(
@@ -637,7 +665,11 @@ struct CollectiveMainloopBwdSm90 {
 
         CUTLASS_DEVICE
         int window_size_right_for_head(int const bidh) const {
-            if constexpr (ReaderPairKVReuse || HeadPairParallel) {
+            if constexpr (NegQReaders) {
+                int group, reader;
+                qhead_per_khead_divmod.fast_divmod(group, reader, bidh);
+                return window_size_right + (reader == 0 ? -1 : 0);
+            } else if constexpr (ReaderPairKVReuse || HeadPairParallel) {
                 return window_size_right +
                     ((bidh & 1) ? odd_head_window_right_delta : 0);
             } else {
@@ -648,14 +680,24 @@ struct CollectiveMainloopBwdSm90 {
 
     static Params
     to_underlying_arguments(Arguments const& args) {
-        Tensor mQ = make_tensor(make_gmem_ptr(args.ptr_Q), args.shape_Q, args.stride_Q);
+        // With negative-query readers shape_Q / shape_dO count logical heads; the Q
+        // and dO tensors hold the logical minus KV heads.
+        auto const physical = [&](ShapeQKV const& shape) -> ShapeQKV {
+            if constexpr (NegQReaders) {
+                return make_shape(get<0>(shape), get<1>(shape),
+                                  get<2>(shape) - get<2>(args.shape_K), get<3>(shape));
+            } else {
+                return shape;
+            }
+        };
+        Tensor mQ = make_tensor(make_gmem_ptr(args.ptr_Q), physical(args.shape_Q), args.stride_Q);
         TMA_Q tma_load_Q = make_tma_copy_A_sm90(
             GmemTiledCopyQdO{},
             mQ,
             SmemLayoutQ{}(_, _, _0{}),
             TileShape_MNK{},
             ClusterShape{}); // mcast along N mode for this M load, if any
-        Tensor mdO = make_tensor(make_gmem_ptr(args.ptr_dO), args.shape_dO, args.stride_dO);
+        Tensor mdO = make_tensor(make_gmem_ptr(args.ptr_dO), physical(args.shape_dO), args.stride_dO);
         TMA_dO tma_load_dO = make_tma_copy_A_sm90(
             GmemTiledCopyQdO{},
             mdO,
@@ -686,6 +728,26 @@ struct CollectiveMainloopBwdSm90 {
         cutlass::FastDivmod reset_attention_chunk_divmod(
             args.reset_attention_chunk >= 1 ? args.reset_attention_chunk : 1);
         reset_attention_chunk_divmod.divisor = args.reset_attention_chunk;
+        NegQParams neg_q = [&] {
+            if constexpr (NegQReaders) {
+                ShapeQKV const shape_q = make_shape(
+                    get<0>(args.shape_Q), get<1>(args.shape_Q),
+                    get<2>(args.shape_K), get<3>(args.shape_Q));
+                ShapeQKV const shape_do = make_shape(
+                    get<0>(args.shape_dO), get<1>(args.shape_dO),
+                    get<2>(args.shape_K), get<3>(args.shape_dO));
+                Tensor mNegQ = make_tensor(make_gmem_ptr(args.ptr_NegQ), shape_q, args.stride_NegQ);
+                Tensor mdONegQ = make_tensor(make_gmem_ptr(args.ptr_dO_NegQ), shape_do, args.stride_dO_NegQ);
+                return NegQParams{
+                    make_tma_copy_A_sm90(GmemTiledCopyQdO{}, mNegQ, SmemLayoutQ{}(_, _, _0{}),
+                                         TileShape_MNK{}, ClusterShape{}),
+                    make_tma_copy_A_sm90(GmemTiledCopyQdO{}, mdONegQ, SmemLayoutdO{}(_, _, _0{}),
+                                         TileShape_MNK_V{}, ClusterShape{}),
+                    shape_q, shape_do};
+            } else {
+                return NegQParams{};
+            }
+        }();
         // Softcap uses softmax_scale / softcap_val before tanh and
         // softcap_val * log2(e) before exp2. Backward applies (1 - tanh^2)
         // in the loop and the original softmax_scale in the gradient epilogue.
@@ -710,7 +772,34 @@ struct CollectiveMainloopBwdSm90 {
                 args.dq_slots, args.dq_slot_stride, args.hp_rho, args.hp_mass,
                 args.hp_row_max, args.hp_row_anchor, args.hp_row_scale, args.hp_row_anchor_index,
                 args.hp_rho_exponent, args.dq_exponent,
-                args.segment_query_intervals, args.segment_key_intervals};
+                args.segment_query_intervals, args.segment_key_intervals, neg_q};
+    }
+
+    // Q / dO descriptors and physical head of a logical head.
+    struct QdOLoad {
+        TMA_Q const* tma_q;
+        TMA_dO const* tma_do;
+        ShapeQKV const* shape_q;
+        ShapeQKV const* shape_do;
+        int head;
+    };
+
+    CUTLASS_DEVICE
+    static QdOLoad qdo_load(Params const& params, int const q_head) {
+        if constexpr (NegQReaders) {
+            int group, reader;
+            params.qhead_per_khead_divmod.fast_divmod(group, reader, q_head);
+            int const readers = params.qhead_per_khead_divmod.divisor;
+            if (reader == 0) {
+                return {&params.neg_q.tma_q, &params.neg_q.tma_do,
+                        &params.neg_q.shape_q, &params.neg_q.shape_do, group};
+            }
+            return {&params.tma_load_Q, &params.tma_load_dO, &params.shape_Q,
+                    &params.shape_dO, group * (readers - 1) + reader - 1};
+        } else {
+            return {&params.tma_load_Q, &params.tma_load_dO, &params.shape_Q,
+                    &params.shape_dO, q_head};
+        }
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -718,6 +807,10 @@ struct CollectiveMainloopBwdSm90 {
     static void prefetch_tma_descriptors(Params const& params) {
         cute::prefetch_tma_descriptor(params.tma_load_Q.get_tma_descriptor());
         cute::prefetch_tma_descriptor(params.tma_load_dO.get_tma_descriptor());
+        if constexpr (NegQReaders) {
+            cute::prefetch_tma_descriptor(params.neg_q.tma_q.get_tma_descriptor());
+            cute::prefetch_tma_descriptor(params.neg_q.tma_do.get_tma_descriptor());
+        }
         cute::prefetch_tma_descriptor(params.tma_load_K.get_tma_descriptor());
         cute::prefetch_tma_descriptor(params.tma_load_V.get_tma_descriptor());
     }
@@ -851,6 +944,7 @@ struct CollectiveMainloopBwdSm90 {
         uint2 const cluster_local_block_id = {
             block_rank_in_cluster % cluster_shape_x,
             block_rank_in_cluster / cluster_shape_x};
+        // Negative-query readers share the Q / dO descriptor types (same tiles).
         auto block_tma_Q =
             params.tma_load_Q.get_slice(cluster_local_block_id.y);
         auto block_tma_dO =
@@ -885,11 +979,11 @@ struct CollectiveMainloopBwdSm90 {
                 int const q_head = q_head_for_reader(
                     kv_head, reader, readers_per_kv_head);
                 bool const is_varlen_q = Varlen && params.cu_seqlens_q;
-                Tensor mQ = params.tma_load_Q.get_tma_tensor(params.shape_Q)(
-                    _, _, q_head, !is_varlen_q ? bidb : 0);
-                Tensor mdO =
-                    params.tma_load_dO.get_tma_tensor(params.shape_dO)(
-                        _, _, q_head, !is_varlen_q ? bidb : 0);
+                QdOLoad const qdo = qdo_load(params, q_head);
+                Tensor mQ = qdo.tma_q->get_tma_tensor(*qdo.shape_q)(
+                    _, _, qdo.head, !is_varlen_q ? bidb : 0);
+                Tensor mdO = qdo.tma_do->get_tma_tensor(*qdo.shape_do)(
+                    _, _, qdo.head, !is_varlen_q ? bidb : 0);
                 Tensor mLSE = make_tensor(
                     make_gmem_ptr(params.ptr_LSE_log2), params.shape_LSE,
                     params.stride_LSE_log2)(
@@ -925,7 +1019,7 @@ struct CollectiveMainloopBwdSm90 {
                 for (int m_block = m_block_min;
                      m_block < m_block_max; ++m_block) {
                     pipeline_q.producer_acquire(smem_pipe_write);
-                    copy(params.tma_load_Q.with(
+                    copy(qdo.tma_q->with(
                              *pipeline_q.producer_get_barrier(smem_pipe_write),
                              mcast_mask_qdo,
                              TMA::CacheHintSm90::EVICT_LAST),
@@ -957,7 +1051,7 @@ struct CollectiveMainloopBwdSm90 {
                         cute::conditional_return<Q_dO_same_stages>(
                             smem_pipe_write, smem_pipe_write_do);
                     pipeline_do.producer_acquire(smem_pipe_write_do_cur);
-                    copy(params.tma_load_dO.with(
+                    copy(qdo.tma_do->with(
                              *pipeline_do.producer_get_barrier(
                                  smem_pipe_write_do_cur),
                              mcast_mask_qdo,
@@ -1044,8 +1138,9 @@ struct CollectiveMainloopBwdSm90 {
             : params.qhead_per_khead_divmod.divide(bidh);
         bool const is_varlen_q = Varlen && params.cu_seqlens_q;
         bool const is_varlen_k = Varlen && params.cu_seqlens_k;
-        Tensor mQ = params.tma_load_Q.get_tma_tensor(params.shape_Q)(_, _, bidh, !is_varlen_q ? bidb : 0);
-        Tensor mdO = params.tma_load_dO.get_tma_tensor(params.shape_dO)(_, _, bidh, !is_varlen_q ? bidb : 0);
+        QdOLoad const qdo = qdo_load(params, bidh);
+        Tensor mQ = qdo.tma_q->get_tma_tensor(*qdo.shape_q)(_, _, qdo.head, !is_varlen_q ? bidb : 0);
+        Tensor mdO = qdo.tma_do->get_tma_tensor(*qdo.shape_do)(_, _, qdo.head, !is_varlen_q ? bidb : 0);
         Tensor mK = params.tma_load_K.get_tma_tensor(params.shape_K)(_, _, bidh_kv, !is_varlen_k ? bidb : 0);
         Tensor mV = params.tma_load_V.get_tma_tensor(params.shape_V)(_, _, bidh_kv, !is_varlen_k ? bidb : 0);
         Tensor mLSE = make_tensor(make_gmem_ptr(params.ptr_LSE_log2), params.shape_LSE, params.stride_LSE_log2)(_, bidh, !is_varlen_q ? bidb : 0);
@@ -1125,7 +1220,7 @@ struct CollectiveMainloopBwdSm90 {
 
         if (lane_predicate) {
             pipeline_q.producer_acquire(smem_pipe_write);
-            copy(params.tma_load_Q.with(*pipeline_q.producer_get_barrier(smem_pipe_write), mcast_mask_qdo, TMA::CacheHintSm90::EVICT_LAST),
+            copy(qdo.tma_q->with(*pipeline_q.producer_get_barrier(smem_pipe_write), mcast_mask_qdo, TMA::CacheHintSm90::EVICT_LAST),
                  tQgQ(_, m_block), tQsQ(_, smem_pipe_write.index()));
             copy(bulk_copy.with(*pipeline_q.producer_get_barrier(smem_pipe_write)),
                  gLSE(_, m_block), sLSE(_, smem_pipe_write.index()));
@@ -1174,7 +1269,7 @@ struct CollectiveMainloopBwdSm90 {
                 // Equal Q/dO stage counts share a pipeline state.
                 PipelineState_dO smem_pipe_write_do_cur = cute::conditional_return<Q_dO_same_stages>(smem_pipe_write, smem_pipe_write_do);
                 pipeline_do.producer_acquire(smem_pipe_write_do_cur);
-                copy(params.tma_load_dO.with(*pipeline_do.producer_get_barrier(smem_pipe_write_do_cur), mcast_mask_qdo, TMA::CacheHintSm90::EVICT_LAST),
+                copy(qdo.tma_do->with(*pipeline_do.producer_get_barrier(smem_pipe_write_do_cur), mcast_mask_qdo, TMA::CacheHintSm90::EVICT_LAST),
                      tdOgdO(_, m_block), tdOsdO(_, smem_pipe_write_do_cur.index()));
                 copy(bulk_copy.with(*pipeline_do.producer_get_barrier(smem_pipe_write_do_cur)),
                      gdPsum(_, m_block), sdPsum(_, smem_pipe_write_do_cur.index()));
@@ -1182,7 +1277,7 @@ struct CollectiveMainloopBwdSm90 {
                 if constexpr (!Q_dO_same_stages) { ++smem_pipe_write_do; }
                 ++smem_pipe_write;
                 pipeline_q.producer_acquire(smem_pipe_write);
-                copy(params.tma_load_Q.with(*pipeline_q.producer_get_barrier(smem_pipe_write), mcast_mask_qdo, TMA::CacheHintSm90::EVICT_LAST),
+                copy(qdo.tma_q->with(*pipeline_q.producer_get_barrier(smem_pipe_write), mcast_mask_qdo, TMA::CacheHintSm90::EVICT_LAST),
                      tQgQ(_, m_block + 1), tQsQ(_, smem_pipe_write.index()));
                 copy(bulk_copy.with(*pipeline_q.producer_get_barrier(smem_pipe_write)),
                      gLSE(_, m_block + 1), sLSE(_, smem_pipe_write.index()));
@@ -1193,7 +1288,7 @@ struct CollectiveMainloopBwdSm90 {
         if (lane_predicate) {
             PipelineState_dO smem_pipe_write_do_cur = cute::conditional_return<Q_dO_same_stages>(smem_pipe_write, smem_pipe_write_do);
             pipeline_do.producer_acquire(smem_pipe_write_do_cur);
-            copy(params.tma_load_dO.with(*pipeline_do.producer_get_barrier(smem_pipe_write_do_cur), mcast_mask_qdo, TMA::CacheHintSm90::EVICT_LAST),
+            copy(qdo.tma_do->with(*pipeline_do.producer_get_barrier(smem_pipe_write_do_cur), mcast_mask_qdo, TMA::CacheHintSm90::EVICT_LAST),
                  tdOgdO(_, m_block), tdOsdO(_, smem_pipe_write_do_cur.index()));
             copy(bulk_copy.with(*pipeline_do.producer_get_barrier(smem_pipe_write_do_cur)),
                  gdPsum(_, m_block), sdPsum(_, smem_pipe_write_do_cur.index()));

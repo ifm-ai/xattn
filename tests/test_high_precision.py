@@ -23,6 +23,7 @@ ALL_LEVELS = (0, *REPAIR_LEVELS)
 FAMILIES = (
     'causal_flash_attn', 'flash_sca', 'flash_swa', 'softdelta_attention',
     'sliding_chunk_softdelta_attention', 'sliding_window_softdelta_attention',
+    'group_softdelta_attention',
 )
 ENTRIES = [getattr(xattn, name + suffix) for name in FAMILIES
            for suffix in ('', '_fwd', '_bwd')]

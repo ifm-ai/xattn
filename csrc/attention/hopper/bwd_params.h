@@ -90,6 +90,31 @@ struct AttentionBwdParams {
   // statistics planes then hold int64 sums on a fixed 2^(e-62) grid.
   const int* hp_rho_exponent = nullptr;
 
+  // Negative-query readers (group_softdelta): h counts logical heads
+  // l = g * R + r; r = 0 reads negative query g (neg_q, [B, Lq, Hkv, D]) with
+  // output gradient neg_dy ([B, Lq, Hkv, V]) and writes its query gradient
+  // to dneg_q; r > 0 is query head g * (R - 1) + r - 1 of q / dy / dq. y and
+  // lse are the logical forward output [B, Lq, H + Hkv, V] and log-sum-exp
+  // [B, H + Hkv, Lq].
+  void* neg_q_ptr = nullptr;
+  index_t neg_q_batch_stride = 0;
+  index_t neg_q_row_stride = 0;
+  index_t neg_q_head_stride = 0;
+  void* neg_dy_ptr = nullptr;
+  index_t neg_dy_batch_stride = 0;
+  index_t neg_dy_row_stride = 0;
+  index_t neg_dy_head_stride = 0;
+  void* dneg_q_ptr = nullptr;
+  index_t dneg_q_batch_stride = 0;
+  index_t dneg_q_row_stride = 0;
+  index_t dneg_q_head_stride = 0;
+  // Negative-query readers: add the negative-query gradient into dk (FP32,
+  // before the dK cast; neg_q is the aligned keys) instead of writing dneg_q.
+  bool fold_neg_q = false;
+  // Caller-zeroed grouped FP32 dK | dV accumulators ([B, Lk, Hkv, D] then
+  // [B, Lk, Hkv, V], instance head dimensions) for the GQA backward; null:
+  // allocated and zeroed by the launch.
+  float* dkv_accum_ptr = nullptr;
 };
 
 }  // namespace ops

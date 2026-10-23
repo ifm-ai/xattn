@@ -3,6 +3,11 @@ from .causal_flash_attn import (
     causal_flash_attn_bwd,
     causal_flash_attn_fwd,
 )
+from .group_softdelta_attention import (
+    group_softdelta_attention,
+    group_softdelta_attention_bwd,
+    group_softdelta_attention_fwd,
+)
 from .sliding_chunk_attention import (
     flash_sca,
     flash_sca_bwd,
@@ -46,4 +51,7 @@ __all__ = [
     "sliding_chunk_softdelta_attention",
     "sliding_chunk_softdelta_attention_bwd",
     "sliding_chunk_softdelta_attention_fwd",
+    "group_softdelta_attention",
+    "group_softdelta_attention_bwd",
+    "group_softdelta_attention_fwd",
 ]

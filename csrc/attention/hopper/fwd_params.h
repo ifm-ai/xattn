@@ -75,6 +75,13 @@ struct AttentionFwdParams {
   bool use_fast_reciprocal;
   // Internal FP32-only output mode.
   bool output_fp32;
+
+  // Negative-query readers (group_softdelta): [B, Lq, Hkv, D] queries of the
+  // first logical head of every KV group; h then counts logical heads.
+  void* __restrict__ neg_q_ptr;
+  index_t neg_q_batch_stride;
+  index_t neg_q_row_stride;
+  index_t neg_q_head_stride;
 };
 
 }  // namespace ops

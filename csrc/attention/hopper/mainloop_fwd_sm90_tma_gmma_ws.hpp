@@ -41,7 +41,8 @@ template <int Stages, class ClusterShape_, class TileShape_MNK_, int kHeadDimV, 
         bool UseFastExp2_=false, bool IsSlidingChunk_=true,
         bool SoftDeltaPair_=false, bool SoftDeltaSingleCTA_=false,
         bool SoftDeltaSplitKVMulticast_=false,
-        bool SoftDeltaClusteredRowPair_=false>
+        bool SoftDeltaClusteredRowPair_=false,
+        bool NegQReaders_=false>
 struct CollectiveMainloopFwdSm90 {
 
     static constexpr int kStages = Stages;
@@ -77,6 +78,12 @@ struct CollectiveMainloopFwdSm90 {
         SoftDeltaSplitKVMulticast_;
     static constexpr bool SoftDeltaClusteredRowPair =
         SoftDeltaClusteredRowPair_;
+    // Negative-query readers (group SoftDelta): logical head l = g * R + r over KV head g with
+    // R = logical / KV heads. r = 0 reads head g of the second (negative-query)
+    // descriptor over the strict past; r > 0 reads Q head g * (R - 1) + r - 1
+    // with the inclusive boundary. The negative-query head leads its group, so a
+    // scheduler that claims tiles in head order starts it before its queries.
+    static constexpr bool NegQReaders = NegQReaders_;
     using TmaCopyClusterShape = std::conditional_t<
         SoftDeltaSplitKVMulticast,
         Shape<_1, _1, _1>, ClusterShape>;
@@ -113,6 +120,9 @@ struct CollectiveMainloopFwdSm90 {
     static_assert(!SoftDeltaSplitKVMulticast || !Transpose_V);
     static_assert(!SoftDeltaSplitKVMulticast || size<0>(ClusterShape{}) == 2);
     static_assert(!SoftDeltaPair || !PagedKVNonTMA);
+    static_assert(!NegQReaders ||
+                  (!PackGQA && !SoftDeltaPair && !AppendKV && !HasQv &&
+                   !PagedKVNonTMA && !Split));
 
     static_assert(ArchTag::kMinComputeCapability >= 90);
 
@@ -498,7 +508,18 @@ struct CollectiveMainloopFwdSm90 {
         // Optional per (batch, Q tile) segment key spans (segment forward).
         int4 const* const segment_spans = nullptr;
         int2 const* const segment_rows = nullptr;
+        // Negative-query readers: [seqlen_q, d, nheads_kv, batch] with stride_NegQ.
+        Element const* const ptr_NegQ = nullptr;
+        StrideQK const stride_NegQ = {};
     };
+
+    struct NegQLoadParams {
+        TMA_Q tma;
+        ShapeQKV shape;
+    };
+    struct NoNegQLoadParams {};
+    using NegQParams = std::conditional_t<
+        NegQReaders, NegQLoadParams, NoNegQLoadParams>;
 
     // Device side kernel params
     struct Params {
@@ -563,6 +584,7 @@ struct CollectiveMainloopFwdSm90 {
         cutlass::FastDivmod reset_attention_chunk_divmod;
         int4 const* const segment_spans = nullptr;
         int2 const* const segment_rows = nullptr;
+        NegQParams neg_q = {};
 
         CUTLASS_DEVICE
         int get_chunk_position_offset(
@@ -576,7 +598,13 @@ struct CollectiveMainloopFwdSm90 {
 
     static Params
     to_underlying_arguments(Arguments const& args) {
-        Tensor mQ = make_tensor(make_gmem_ptr(args.ptr_Q), args.shape_Q, args.stride_Q);
+        // With negative-query readers shape_Q counts logical heads; the Q tensor
+        // itself holds the logical minus KV heads.
+        ShapeQKV const shape_Q_load = NegQReaders
+            ? make_shape(get<0>(args.shape_Q), get<1>(args.shape_Q),
+                         get<2>(args.shape_Q) - get<2>(args.shape_K), get<3>(args.shape_Q))
+            : args.shape_Q;
+        Tensor mQ = make_tensor(make_gmem_ptr(args.ptr_Q), shape_Q_load, args.stride_Q);
         TMA_Q tma_load_Q = make_tma_copy_A_sm90(
             GmemTiledCopyQ{},
             mQ,
@@ -662,6 +690,20 @@ struct CollectiveMainloopFwdSm90 {
         cutlass::FastDivmod reset_attention_chunk_divmod(
             args.reset_attention_chunk >= 1 ? args.reset_attention_chunk : 1);
         reset_attention_chunk_divmod.divisor = args.reset_attention_chunk;
+        NegQParams neg_q = [&] {
+            if constexpr (NegQReaders) {
+                ShapeQKV const shape_NegQ = make_shape(
+                    get<0>(args.shape_Q), get<1>(args.shape_Q),
+                    get<2>(args.shape_K), get<3>(args.shape_Q));
+                Tensor mNegQ = make_tensor(make_gmem_ptr(args.ptr_NegQ), shape_NegQ, args.stride_NegQ);
+                return NegQParams{
+                    make_tma_copy_A_sm90(GmemTiledCopyQ{}, mNegQ, SmemLayoutQLoad{},
+                                         TileShapeMNKQLoad{}, ClusterShape{}),
+                    shape_NegQ};
+            } else {
+                return NegQParams{};
+            }
+        }();
         // Softcap uses softmax_scale / softcap_val before tanh and
         // softcap_val * log2(e) before exp2.
         return {args.ptr_Q, args.shape_Q, args.stride_Q, shape_Q_packed, stride_Q_packed,
@@ -687,7 +729,7 @@ struct CollectiveMainloopFwdSm90 {
                 args.seqused_q, args.seqused_k, args.leftpad_k,
                 args.seqlens_rotary, args.q_position_offsets,
                 args.q_chunk_positions, reset_attention_chunk_divmod,
-                args.segment_spans, args.segment_rows};
+                args.segment_spans, args.segment_rows, neg_q};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -695,6 +737,9 @@ struct CollectiveMainloopFwdSm90 {
     static void prefetch_tma_descriptors(Params const& params) {
         if constexpr (Use_TMA_Q) {
             cute::prefetch_tma_descriptor(params.tma_load_Q.get_tma_descriptor());
+            if constexpr (NegQReaders) {
+                cute::prefetch_tma_descriptor(params.neg_q.tma.get_tma_descriptor());
+            }
             if constexpr (HasQv) {
                 cute::prefetch_tma_descriptor(params.tma_load_Qv.get_tma_descriptor());
             }
@@ -706,6 +751,20 @@ struct CollectiveMainloopFwdSm90 {
         if constexpr (AppendKV) {
             cute::prefetch_tma_descriptor(params.tma_load_K_new.get_tma_descriptor());
             cute::prefetch_tma_descriptor(params.tma_load_V_new.get_tma_descriptor());
+        }
+    }
+
+    // (physical Q head, negative-query reader) of a logical head.
+    CUTLASS_DEVICE
+    static cute::tuple<int, bool> neg_q_head(Params const& params, int const bidh) {
+        if constexpr (NegQReaders) {
+            int group, reader;
+            params.qhead_per_khead_divmod.fast_divmod(group, reader, bidh);
+            int const readers = params.qhead_per_khead_divmod.divisor;
+            bool const neg_q_reader = reader == 0;
+            return {neg_q_reader ? group : group * (readers - 1) + reader - 1, neg_q_reader};
+        } else {
+            return {bidh, false};
         }
     }
 
@@ -828,7 +887,26 @@ struct CollectiveMainloopFwdSm90 {
 
         bool const is_varlen_q = Varlen && params.cu_seqlens_q;
         bool const is_varlen_k = Varlen && params.cu_seqlens_k;
-        Tensor mQ0 = params.tma_load_Q.get_tma_tensor(params.shape_Q)(_, _, bidh, !is_varlen_q ? bidb : 0);
+        // Explicit tuple access for lambda capture.
+        auto const q_load = neg_q_head(params, bidh);
+        int const q_load_head = get<0>(q_load);
+        bool const neg_q_reader = get<1>(q_load);
+        TMA_Q const& tma_load_Q = [&]() -> TMA_Q const& {
+            if constexpr (NegQReaders) {
+                return neg_q_reader ? params.neg_q.tma : params.tma_load_Q;
+            } else {
+                return params.tma_load_Q;
+            }
+        }();
+        Tensor mQ0 = [&] {
+            if constexpr (NegQReaders) {
+                return neg_q_reader
+                    ? params.neg_q.tma.get_tma_tensor(params.neg_q.shape)
+                    : params.tma_load_Q.get_tma_tensor(params.shape_Q);
+            } else {
+                return params.tma_load_Q.get_tma_tensor(params.shape_Q);
+            }
+        }()(_, _, q_load_head, !is_varlen_q ? bidb : 0);
         Tensor mQ1 = params.tma_load_Q.get_tma_tensor(params.shape_Q)(_, _, bidh + (SoftDeltaSingleCTA ? 1 : 0), !is_varlen_q ? bidb : 0);
         Tensor mK_TMA = params.tma_load_K.get_tma_tensor(params.shape_K)(_, _, bidh_kv, _);
         auto shape_V = make_shape(params.headdim_v, get<0>(params.shape_K), get<2>(params.shape_K), get<3>(params.shape_K));
@@ -852,7 +930,7 @@ struct CollectiveMainloopFwdSm90 {
         Tensor tQsQ0 = group_modes<0, 3>(block_tma_Q.partition_D(sQ0));  // (TMA)
         Tensor tQgQ1 = group_modes<0, 3>(block_tma_Q.partition_S(gQ1));  // (TMA)
         Tensor tQsQ1 = group_modes<0, 3>(block_tma_Q.partition_D(sQ1));  // (TMA)
-        if (Use_TMA_Q && thread_idx == 0) { prefetch(params.tma_load_Q, tQgQ0); }
+        if (Use_TMA_Q && thread_idx == 0) { prefetch(tma_load_Q, tQgQ0); }
         // Partition the position-independent swizzle view manually.
         auto block_tma_K = params.tma_load_K.get_slice(
             SoftDeltaSplitKVMulticast ? 0 : cluster_local_block_id.x);
@@ -1009,7 +1087,7 @@ struct CollectiveMainloopFwdSm90 {
             if ((SingleProducerWarp || warp_idx_in_warpgroup == 0) && cute::elect_one_sync()) {
                 shared_storage.pipelines.barrier_Q.arrive_and_expect_tx(
                     TmaTransactionBytesQ * (SoftDeltaSingleCTA ? 2 : 1));
-                copy(params.tma_load_Q.with(reinterpret_cast<typename cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.pipelines.barrier_Q), 0 /*mcast_mask*/, !Split ? TMA::CacheHintSm90::EVICT_FIRST : TMA::CacheHintSm90::EVICT_LAST),
+                copy(tma_load_Q.with(reinterpret_cast<typename cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.pipelines.barrier_Q), 0 /*mcast_mask*/, !Split ? TMA::CacheHintSm90::EVICT_FIRST : TMA::CacheHintSm90::EVICT_LAST),
                     tQgQ0, tQsQ0);
                 if constexpr (SoftDeltaSingleCTA) {
                     copy(params.tma_load_Q.with(reinterpret_cast<typename cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.pipelines.barrier_Q), 0 /*mcast_mask*/, !Split ? TMA::CacheHintSm90::EVICT_FIRST : TMA::CacheHintSm90::EVICT_LAST),
@@ -1317,7 +1395,7 @@ struct CollectiveMainloopFwdSm90 {
             params.get_chunk_position_offset(bidb, seqlen_q, seqlen_k),
             Has_segment ? params.q_chunk_positions : nullptr,
             params.reset_attention_chunk_divmod,
-            softdelta_branch ? -1 : 0
+            (softdelta_branch || get<1>(neg_q_head(params, bidh))) ? -1 : 0
         );
         if constexpr (SegmentTileRanges) {
             mask.segment_full_min = segment_full_min;

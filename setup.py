@@ -401,6 +401,8 @@ FLASH_SOFTDELTA_CSRCS = [
     CSRC / "softdelta" / "gate.cu",
     CSRC / "softdelta" / "gate_bindings.cc",
     CSRC / "softdelta" / "gradient_merge.cu",
+    CSRC / "group_softdelta" / "gate.cu",
+    CSRC / "group_softdelta" / "bindings.cc",
 ]
 
 
@@ -422,6 +424,13 @@ FLASH_SOFTDELTA_SM90_CSRCS = [
     CSRC / "softdelta" / "fwd.cu",
     CSRC / "softdelta" / "fwd_bindings.cc",
     *_flash_softdelta_sm90_instantiation_sources(),
+]
+
+GROUP_SOFTDELTA_SM90_CSRCS = [
+    CSRC / "group_softdelta" / "fwd.cu",
+    CSRC / "group_softdelta" / "bwd.cu",
+    CSRC / "group_softdelta" / "preprocess.cu",
+    *sorted((CSRC / "group_softdelta" / "instantiations").glob("*.cu")),
 ]
 
 ATTENTION_PRECISION_CSRCS = [
@@ -449,6 +458,7 @@ if BUILD_ONLY_SM90:
         *FLASH_SWA_SM90_CSRCS,
         *FLASH_SOFTDELTA_CSRCS,
         *FLASH_SOFTDELTA_SM90_CSRCS,
+        *GROUP_SOFTDELTA_SM90_CSRCS,
     ]
 elif BUILD_HAS_SM90:
     CSRCS = [
@@ -459,6 +469,7 @@ elif BUILD_HAS_SM90:
         *FLASH_SWA_SM90_CSRCS,
         *FLASH_SOFTDELTA_CSRCS,
         *FLASH_SOFTDELTA_SM90_CSRCS,
+        *GROUP_SOFTDELTA_SM90_CSRCS,
     ]
 else:
     CSRCS = [
