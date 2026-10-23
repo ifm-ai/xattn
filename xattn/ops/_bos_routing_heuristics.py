@@ -1,7 +1,9 @@
 """BOS routing from host metadata; True selects packed varlen.
 
 Forward and backward use separate thresholds for run lengths, attention
-visibility, head sharing, and determinism.
+visibility, head sharing, and determinism. The core decisions are trees fitted
+on a 2026-10-21 timing grid of both routes; the earlier rules remain for the
+measured exceptions.
 """
 from typing import Optional, Tuple
 
@@ -61,20 +63,130 @@ def _select_routes(
                 return (True, True)
             else:
                 return (True, False) if needs_backward else (True, True)
-    if tokens <= 256 * num_runs:
-        fwd, bwd = _short_run_routes(
-            tokens, num_runs, max_seqlen, d, value_dim, heads, kv_heads, span,
-            sliding_chunk, softdelta, deterministic, needs_backward)
-        # Previous K/V changes segment-backward costs; nondeterministic
-        # backward keeps the general rules there.
-        if has_previous and needs_backward and not deterministic:
-            bwd = _general_routes(
-                tokens, num_runs, max_seqlen, d, value_dim, batch, heads,
-                kv_heads, span, full_visibility, deterministic, needs_backward)[1]
-        return fwd, bwd
-    return _general_routes(
-        tokens, num_runs, max_seqlen, d, value_dim, batch, heads, kv_heads,
-        span, full_visibility, deterministic, needs_backward)
+    # Rules before the 2026-10-21 refit (short runs, then the general tree); used for the measured
+    # exceptions below.
+    def _previous_routes():
+        if tokens <= 256 * num_runs:
+            fwd, bwd = _short_run_routes(
+                tokens, num_runs, max_seqlen, d, value_dim, heads, kv_heads, span,
+                sliding_chunk, softdelta, deterministic, needs_backward)
+            # Previous K/V changes segment-backward costs; nondeterministic
+            # backward keeps the general rules there.
+            if has_previous and needs_backward and not deterministic:
+                bwd = _general_routes(
+                    tokens, num_runs, max_seqlen, d, value_dim, batch, heads,
+                    kv_heads, span, full_visibility, deterministic, needs_backward)[1]
+            return fwd, bwd
+        return _general_routes(
+            tokens, num_runs, max_seqlen, d, value_dim, batch, heads, kv_heads,
+            span, full_visibility, deterministic, needs_backward)
+
+    # Route trees fitted on the 2026-10-21 timing grid (6432 cases + 768 with previous K/V): forward and
+    # nondeterministic / deterministic backward from run statistics, dims, heads, visibility, previous K/V.
+    mean = tokens / num_runs
+    x = dict(mean=mean, skew=max(1.0, max_seqlen / mean), tokens=tokens, d=d, value_dim=value_dim,
+             wide_v=value_dim > d, head_ratio=heads / kv_heads, sliding_chunk=sliding_chunk,
+             full_visibility=full_visibility, softdelta=softdelta, v_ratio=value_dim / d,
+             has_previous=has_previous)
+    fwd = _route_fwd(**x)
+    if not needs_backward:
+        return fwd, fwd
+    if not deterministic and d <= 64 and value_dim > 192:
+        # Measured exception: the previous rules route narrow Q/K with V > 192 better.
+        return fwd, _previous_routes()[1]
+    if deterministic:
+        # Deterministic backward: the fitted tree for the buckets (and head ratios <= 8) where it is
+        # measured clearly better, the previous rules elsewhere (it does not generalize across D/V, heads).
+        if heads <= 8 * kv_heads and (_dim_bucket(d), _dim_bucket(value_dim)) in _DET_TREE_BUCKETS:
+            return fwd, _route_bwd_det(**x)
+        return fwd, _previous_routes()[1]
+    return fwd, _route_bwd(**x)
+
+
+_DET_TREE_BUCKETS = frozenset([(64, 96), (64, 128), (128, 256), (192, 192), (256, 256)])
+
+
+def _dim_bucket(dim):
+    for bucket in (32, 64, 96, 128, 160, 192, 256):
+        if dim <= bucket:
+            return bucket
+    return dim
+
+
+def _route_fwd(mean, skew, tokens, d, value_dim, wide_v, head_ratio, sliding_chunk,
+        full_visibility, softdelta, v_ratio, has_previous):
+    if not softdelta:
+        if head_ratio <= 1:
+            if not sliding_chunk:
+                if mean <= 96:
+                    return False
+                return True
+            if mean <= 32:
+                return False
+            return True
+        if not sliding_chunk:
+            if mean <= 12:
+                return False
+            return True
+        if mean <= 32:
+            return False
+        return True
+    if mean <= 64:
+        return False
+    if not sliding_chunk:
+        if d <= 64:
+            return True
+        return False
+    if v_ratio <= 0.75:
+        return False
+    return True
+
+
+def _route_bwd(mean, skew, tokens, d, value_dim, wide_v, head_ratio, sliding_chunk,
+        full_visibility, softdelta, v_ratio, has_previous):
+    if not sliding_chunk:
+        if value_dim <= 64:
+            if head_ratio <= 1:
+                return False
+            if not has_previous:
+                return False
+            return True
+        # Long runs: varlen only up to 32K tokens (segment ids win from 64K tokens, measured).
+        if mean <= 512 or tokens > 32768:
+            return False
+        return not softdelta
+    if d <= 64:
+        if skew <= 32:
+            if mean <= 12:
+                return False
+            return True
+        if mean <= 128:
+            return False
+        return True
+    if mean <= 96:
+        return False
+    if skew <= 8:
+        return True
+    return False
+
+
+def _route_bwd_det(mean, skew, tokens, d, value_dim, wide_v, head_ratio, sliding_chunk,
+        full_visibility, softdelta, v_ratio, has_previous):
+    if mean <= 96:
+        return False
+    if d <= 64:
+        if mean <= 128:
+            if not sliding_chunk:
+                return False
+            return True
+        if not sliding_chunk:
+            return False
+        return True
+    if head_ratio <= 1:
+        if tokens <= 16384:
+            return True
+        return False
+    return False
 
 
 def _general_routes(
