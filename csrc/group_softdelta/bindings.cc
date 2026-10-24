@@ -34,10 +34,12 @@ void DefineGroupSoftDeltaOps(py::module& m) {
 #ifdef XATTN_HAS_SM90
   m.def(
       "_group_softdelta_fwd", &GroupSoftDeltaFwd,
-      "group_softdelta fused reads FWD: (output [B, Lq, Hkv + H, V], lse [B, Hkv + H, Lq]), class-major readers",
+      "group_softdelta fused reads FWD: (output [B, Lq, Hkv + H, V], lse [B, Hkv + H, Lq]), class-major readers; "
+      "visibility 0 causal, 1 sliding window (span = window_size), 2 sliding chunk (span = chunk_size)",
       py::arg("q"), py::arg("k"), py::arg("v"), py::arg("neg_q"), py::arg("scale"),
       py::arg("q_segment_idx") = py::none(), py::arg("k_segment_idx") = py::none(),
-      py::arg("output_state") = py::none());
+      py::arg("output_state") = py::none(), py::arg("visibility") = 0, py::arg("span") = 0,
+      py::arg("reset") = false);
   m.def(
       "_group_softdelta_fwd_varlen", &GroupSoftDeltaFwdVarlen,
       "group_softdelta packed-sequence reads FWD (varlen causal + varlen strict): _group_softdelta_fwd's readers, lse",
@@ -49,13 +51,15 @@ void DefineGroupSoftDeltaOps(py::module& m) {
       py::arg("dy"), py::arg("gate"), py::arg("q"), py::arg("k"), py::arg("v"), py::arg("neg_q"),
       py::arg("neg_read_state"), py::arg("read_state"), py::arg("neg_read_lse"), py::arg("read_lse"), py::arg("scale"),
       py::arg("q_segment_idx") = py::none(), py::arg("k_segment_idx") = py::none(),
-      py::arg("gated_output") = false, py::arg("fold_neg_q") = false, py::arg("reader_groups") = -1);
+      py::arg("gated_output") = false, py::arg("fold_neg_q") = false, py::arg("reader_groups") = -1,
+      py::arg("visibility") = 0, py::arg("span") = 0, py::arg("reset") = false);
   m.def(
       "_group_softdelta_bwd", &GroupSoftDeltaBwd,
       "group_softdelta fused BWD from the forward readers: (dq, dk, dv, dneg_q, gate_grad in the gate's shape)",
       py::arg("dy"), py::arg("gate"), py::arg("q"), py::arg("k"), py::arg("v"), py::arg("neg_q"),
       py::arg("readers"), py::arg("lse"), py::arg("scale"), py::arg("q_segment_idx") = py::none(),
-      py::arg("k_segment_idx") = py::none(), py::arg("fold_neg_q") = false, py::arg("reader_groups") = -1);
+      py::arg("k_segment_idx") = py::none(), py::arg("fold_neg_q") = false, py::arg("reader_groups") = -1,
+      py::arg("visibility") = 0, py::arg("span") = 0, py::arg("reset") = false);
 #endif
 }
 

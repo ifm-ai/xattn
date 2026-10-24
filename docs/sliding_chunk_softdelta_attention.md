@@ -111,3 +111,107 @@ multiples of 8 in `[8, 256]`. Unsupported widths are rejected before native
 launch. Finite zero/negative scales use an exact Q zero/sign transform so
 masking remains defined. Shape coverage does not guarantee bounded relative
 error for arbitrary ill-conditioned or overflowing floating-point inputs.
+
+## Group SoftDelta (in development)
+
+```python
+from xattn import sliding_chunk_group_softdelta_attention
+
+y = sliding_chunk_group_softdelta_attention(
+    q, k, v, g,
+    chunk_size=2048,
+    neg_q=None,
+    scale=None,
+    prev_k=None,
+    prev_v=None,
+    q_segment_idx=None,
+    k_segment_idx=None,
+    segment_idx=None,
+    bos_mask=None,
+    backend="auto",
+    reset_chunk_pos_per_seq=False,
+    deterministic=False,
+    high_precision_level=0,
+)
+```
+
+Tensor layouts:
+
+- `q`: `[batch, seqlen, q_heads, qk_dim]`
+- `k`: `[batch, seqlen, kv_heads, qk_dim]`
+- `v`: `[batch, seqlen, kv_heads, groups, group_dim]`
+- `g`: `[batch, seqlen, q_heads, groups, 1]`, gate logits
+- `neg_q`: optional `[batch, seqlen, kv_heads, qk_dim]`, same device and dtype as `q`
+- `prev_k`: optional `[batch, chunk_size, kv_heads, qk_dim]`
+- `prev_v`: optional `[batch, chunk_size, kv_heads, groups, group_dim]`
+- `q_segment_idx`: optional int64 `[batch, seqlen]`
+- `k_segment_idx`, `segment_idx`: optional int64 `[batch, prev_seqlen + seqlen]`
+- `bos_mask`: optional CUDA bool `[batch, prev_seqlen + seqlen]`
+
+`chunk_size` selects the previous and current logical chunks for both reads, as above;
+the negative read keeps only strictly earlier keys. Previous K/V, when
+supplied, must contain exactly `chunk_size` tokens.
+`prev_seqlen` is `chunk_size` with previous K/V and `0` otherwise.
+`reset_chunk_pos_per_seq=True` resets chunk positions at each segment boundary;
+pass the same value to forward and backward.
+The other arguments, precision levels and SM90 limits follow the SoftDelta API above. `high_precision_level >= 2` requires SM90 for
+the autograd API as well.
+
+Standalone forward/backward:
+
+```python
+from xattn import (
+    sliding_chunk_group_softdelta_attention_bwd,
+    sliding_chunk_group_softdelta_attention_fwd,
+)
+
+y, readers, lse = sliding_chunk_group_softdelta_attention_fwd(
+    q, k, v, g,
+    chunk_size=2048,
+    neg_q=None,
+    scale=None,
+    prev_k=None,
+    prev_v=None,
+    q_segment_idx=None,
+    k_segment_idx=None,
+    segment_idx=None,
+    bos_mask=None,
+    backend="auto",
+    reset_chunk_pos_per_seq=False,
+    deterministic=False,
+    high_precision_level=1,
+)
+dq, dk, dv, dg, dneg_q, dprev_k, dprev_v = sliding_chunk_group_softdelta_attention_bwd(
+    dy, q, k, v, g, readers, lse,
+    chunk_size=2048,
+    neg_q=None,
+    scale=None,
+    prev_k=None,
+    prev_v=None,
+    q_segment_idx=None,
+    k_segment_idx=None,
+    segment_idx=None,
+    bos_mask=None,
+    backend="auto",
+    reset_chunk_pos_per_seq=False,
+    deterministic=False,
+    high_precision_level=1,
+)
+```
+
+Output layouts:
+
+- `y`, `dy`: `[batch, seqlen, q_heads, groups, group_dim]`, input dtype
+- `readers`: `[batch, seqlen, kv_heads + q_heads, groups, group_dim]`, FP32 when high precision is enabled, otherwise input dtype; negative reader heads followed by query reader heads
+- `lse`: `[batch, kv_heads + q_heads, seqlen]`, FP32, same head order as `readers`
+- `dq`, `dk`, `dv`, `dg`: same shapes and dtypes as `q`, `k`, `v`, `g`
+- `dneg_q`: same shape and dtype as `neg_q`, or `None` when `neg_q=None` (its gradient is added to `dk`)
+- `dprev_k`, `dprev_v`: same shapes and dtypes as previous K/V, or `None`
+
+Standalone calls require an SM90 build and GPU, with `backend="auto"` or
+`"sm90"`, and do not build an autograd graph or populate `.grad`.
+Pass the same `chunk_size`, `neg_q`, `high_precision_level` and other forward
+options to backward, together with forward's `readers` and `lse`.
+Forward always returns `(y, readers, lse)`, including under
+`no_grad`/inference mode. `readers.dtype` does not select the backward
+algorithm. Final `y` alone is insufficient for backward.

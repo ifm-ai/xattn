@@ -4,6 +4,8 @@
 #include "group_softdelta/buckets.h"
 #include "group_softdelta/bwd_launch.h"
 #include "group_softdelta/preprocess.h"
+#include "group_softdelta/visibility.h"
+#include "attention/semantics/visibility.h"
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -23,11 +25,11 @@ void SetStrides(const torch::Tensor& t, int64_t& batch, int64_t& row, int64_t& h
   head = t.stride(2);
 }
 
-// The backward instance of (D, V): its bucket pair, dense rows remapped onto
-// square instances (GroupSoftDeltaBwdDenseSquareDim).
-std::pair<int, int> BwdBucket(int d, int dv, bool has_segment) {
+// The backward instance of (D, V): its bucket pair, causal dense rows remapped
+// onto square instances (GroupSoftDeltaBwdDenseSquareDim).
+std::pair<int, int> BwdBucket(int d, int dv, bool causal_dense) {
   const int d_bucket = GroupSoftDeltaBucketDim(d), v_bucket = GroupSoftDeltaBucketDim(dv);
-  const int square = has_segment ? 0 : GroupSoftDeltaBwdDenseSquareDim(d_bucket, v_bucket);
+  const int square = causal_dense ? GroupSoftDeltaBwdDenseSquareDim(d_bucket, v_bucket) : 0;
   return square ? std::pair<int, int>{square, square} : std::pair<int, int>{d_bucket, v_bucket};
 }
 
@@ -37,10 +39,9 @@ std::pair<int, int> BwdBucket(int d, int dv, bool has_segment) {
 // of two) with enough work tiles W = B Hkv ceil(L / 128): 256 on dense rows;
 // segment rows, where long documents make long tiles in worklist order, 1024,
 // or L / 2 (at least 256) below L = 2048. Dense rows on 128-row tiles (D <= 64,
-// V <= 128 instances) keep per-head launches. Log E25 (H200, 16/16, 16/8 and
-// smaller head counts, T256-T16384, D 64-256): 0.76-1.00x of the per-head time
-// where selected; R >= 5 slower at T8192 B2-B8 (R = 5 packed B2 1.10x, R = 9 /
-// 17 up to 1.3x / 2x), W <= 128 1.3-2x, dense D 64 / V 64 1.01-1.02x.
+// V <= 128 instances) keep per-head launches.
+// Coarser reader-group tiles can reduce parallelism for larger reader counts
+// or small workloads.
 bool UseReaderGroups(int64_t batch, int64_t length, int64_t heads, int64_t kv_heads, bool has_segment,
                      int d_bucket, int v_bucket) {
   const int64_t readers = heads / kv_heads + 1;
@@ -51,23 +52,42 @@ bool UseReaderGroups(int64_t batch, int64_t length, int64_t heads, int64_t kv_he
   return tiles >= (has_segment ? std::min<int64_t>(1024, std::max<int64_t>(256, length / 2)) : 256);
 }
 
+// The instance of the call's visibility (fwd.cu DispatchFwdVisibility).
+template <typename Element, int kHeadDim, int kHeadDimV, bool kReaderGroups>
+void DispatchBwdVisibility(AttentionBwdParams& params, int64_t visibility, bool has_segment,
+                           cudaStream_t stream) {
+  using namespace attention::semantics;
+  if (visibility == kGroupSoftDeltaChunk) {
+    if (has_segment) {
+      RunGroupSoftDeltaBwdSm90<Element, kHeadDim, kHeadDimV, SlidingChunkVisibility, true, kReaderGroups>(
+          params, stream);
+    } else {
+      RunGroupSoftDeltaBwdSm90<Element, kHeadDim, kHeadDimV, SlidingChunkVisibility, false, kReaderGroups>(
+          params, stream);
+    }
+  } else if (has_segment) {
+    RunGroupSoftDeltaBwdSm90<Element, kHeadDim, kHeadDimV, CausalSlidingWindowVisibility, true, kReaderGroups>(
+        params, stream);
+  } else if (visibility == kGroupSoftDeltaWindow) {
+    RunGroupSoftDeltaBwdSm90<Element, kHeadDim, kHeadDimV, CausalSlidingWindowVisibility, false, kReaderGroups>(
+        params, stream);
+  } else {
+    RunGroupSoftDeltaBwdSm90<Element, kHeadDim, kHeadDimV, CausalFullVisibility, false, kReaderGroups>(
+        params, stream);
+  }
+}
+
 template <typename Element>
-void DispatchBwd(AttentionBwdParams& params, bool has_segment, bool reader_groups, int d_bucket,
-                 int v_bucket, cudaStream_t stream) {
-#define XATTN_GROUP_SOFTDELTA_BWD_CASE(D, V)                                    \
-  if (d_bucket == D && v_bucket == V) {                                         \
-    if (reader_groups) {                                                        \
-      if (has_segment) {                                                        \
-        RunGroupSoftDeltaBwdSm90<Element, D, V, true, true>(params, stream);    \
-      } else {                                                                  \
-        RunGroupSoftDeltaBwdSm90<Element, D, V, false, true>(params, stream);   \
-      }                                                                         \
-    } else if (has_segment) {                                                   \
-      RunGroupSoftDeltaBwdSm90<Element, D, V, true, false>(params, stream);     \
-    } else {                                                                    \
-      RunGroupSoftDeltaBwdSm90<Element, D, V, false, false>(params, stream);    \
-    }                                                                           \
-    return;                                                                     \
+void DispatchBwd(AttentionBwdParams& params, int64_t visibility, bool has_segment, bool reader_groups,
+                 int d_bucket, int v_bucket, cudaStream_t stream) {
+#define XATTN_GROUP_SOFTDELTA_BWD_CASE(D, V)                                                  \
+  if (d_bucket == D && v_bucket == V) {                                                       \
+    if (reader_groups) {                                                                      \
+      DispatchBwdVisibility<Element, D, V, true>(params, visibility, has_segment, stream);    \
+    } else {                                                                                  \
+      DispatchBwdVisibility<Element, D, V, false>(params, visibility, has_segment, stream);   \
+    }                                                                                         \
+    return;                                                                                   \
   }
   XATTN_GROUP_SOFTDELTA_FOR_EACH_BUCKET(XATTN_GROUP_SOFTDELTA_BWD_CASE)
 #undef XATTN_GROUP_SOFTDELTA_BWD_CASE
@@ -83,7 +103,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     const torch::Tensor& read_lse, double scale,
     const c10::optional<torch::Tensor>& q_segment_idx,
     const c10::optional<torch::Tensor>& k_segment_idx, bool gated_output, bool fold_neg_q,
-    int64_t reader_groups) {
+    int64_t reader_groups, int64_t visibility, int64_t span, bool reset) {
   const torch::Tensor dy = dy_in.contiguous();
   const torch::Tensor gate = gate_in.contiguous();
   TORCH_CHECK(q.is_cuda() && q.dim() == 4 && k.dim() == 4 && v.dim() == 4 && neg_q.dim() == 4 &&
@@ -119,7 +139,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
   const int64_t padded = (Lq + 127) / 128 * 128;
   const bool has_segment = q_segment_idx.has_value();
   // Accumulator rows hold the instance's (bucket) head dimensions.
-  const auto [d_bucket, v_bucket] = BwdBucket(static_cast<int>(D), static_cast<int>(V), has_segment);
+  const auto [d_bucket, v_bucket] =
+      BwdBucket(static_cast<int>(D), static_cast<int>(V), !has_segment && visibility == kGroupSoftDeltaCausal);
   TORCH_CHECK(d_bucket > 0 && v_bucket > 0, "group_softdelta fused BWD supports D, V <= 256");
   TORCH_CHECK(reader_groups >= -1 && reader_groups <= 1, "group_softdelta BWD reader_groups must be -1, 0 or 1");
   const bool groups = reader_groups < 0
@@ -188,8 +209,6 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
   params.h = static_cast<int>(H + Hkv);
   params.h_k = static_cast<int>(Hkv);
   params.scale_softmax = static_cast<float>(scale);
-  params.window_size_left = static_cast<int>(Lk - 1);
-  params.window_size_right = 0;
   if (has_segment) {
     TORCH_CHECK(q_segment_idx->scalar_type() == at::kLong && k_segment_idx->scalar_type() == at::kLong &&
                     q_segment_idx->is_contiguous() && k_segment_idx->is_contiguous(),
@@ -198,12 +217,17 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     params.k_segment_idx = k_segment_idx->data_ptr<int64_t>();
     params.k_segment_len = static_cast<int>(Lk);
   }
+  const torch::Tensor chunk_positions = visibility == kGroupSoftDeltaChunk && reset && has_segment
+      ? GroupSoftDeltaChunkPositions(*q_segment_idx, *k_segment_idx)
+      : torch::Tensor();
+  SetGroupSoftDeltaVisibility(params, visibility, span, Lk,
+                              chunk_positions.defined() ? chunk_positions.data_ptr<int>() : nullptr);
   params.num_sm = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   if (q.scalar_type() == at::kBFloat16) {
-    DispatchBwd<cutlass::bfloat16_t>(params, has_segment, groups, d_bucket, v_bucket, stream);
+    DispatchBwd<cutlass::bfloat16_t>(params, visibility, has_segment, groups, d_bucket, v_bucket, stream);
   } else {
-    DispatchBwd<cutlass::half_t>(params, has_segment, groups, d_bucket, v_bucket, stream);
+    DispatchBwd<cutlass::half_t>(params, visibility, has_segment, groups, d_bucket, v_bucket, stream);
   }
   return {dq, dk, dv, dneg_q, gate_grad};
 }
@@ -213,7 +237,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     const torch::Tensor& k, const torch::Tensor& v, const torch::Tensor& neg_q,
     const torch::Tensor& readers, const torch::Tensor& lse, double scale,
     const c10::optional<torch::Tensor>& q_segment_idx,
-    const c10::optional<torch::Tensor>& k_segment_idx, bool fold_neg_q, int64_t reader_groups) {
+    const c10::optional<torch::Tensor>& k_segment_idx, bool fold_neg_q, int64_t reader_groups,
+    int64_t visibility, int64_t span, bool reset) {
   TORCH_CHECK(q.dim() == 4 && k.dim() == 4 && v.dim() == 4 && gate.dim() == 5 && dy.dim() == 5 &&
                   readers.dim() == 4 && lse.dim() == 3,
               "group_softdelta BWD expects q / k / v [B, L, heads, dim], gate / dy 5D, readers 4D, lse 3D");
@@ -225,7 +250,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
   auto grads = GroupSoftDeltaBwdStates(dy.reshape({B, Lq, H, V}), gate.reshape({B, Lq, H, C}), q, k, v, neg_q,
                                        readers.narrow(2, 0, Hkv), readers.narrow(2, Hkv, H), lse.narrow(1, 0, Hkv),
                                        lse.narrow(1, Hkv, H), scale, q_segment_idx, k_segment_idx, false,
-                                       fold_neg_q, reader_groups);
+                                       fold_neg_q, reader_groups, visibility, span, reset);
   std::get<4>(grads) = std::get<4>(grads).view(gate.sizes());
   return grads;
 }

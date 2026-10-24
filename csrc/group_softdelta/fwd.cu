@@ -3,7 +3,9 @@
 #include "group_softdelta/fwd.h"
 #include "group_softdelta/buckets.h"
 #include "group_softdelta/fwd_launch.h"
+#include "group_softdelta/visibility.h"
 #include "attention/hopper/launch.h"
+#include "attention/semantics/visibility.h"
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -41,16 +43,32 @@ void CheckFwdInputs(const torch::Tensor& q, const torch::Tensor& k, const torch:
               "group_softdelta neg_q must be [B, Lq, Hkv, D]");
 }
 
+template <typename Element, int kHeadDim, int kHeadDimV>
+void DispatchFwdVisibility(AttentionFwdParams& params, int64_t visibility, bool has_segment,
+                           cudaStream_t stream) {
+  using namespace attention::semantics;
+  if (visibility == kGroupSoftDeltaChunk) {
+    if (has_segment) {
+      RunGroupSoftDeltaFwdSm90<Element, kHeadDim, kHeadDimV, SlidingChunkVisibility, true>(params, stream);
+    } else {
+      RunGroupSoftDeltaFwdSm90<Element, kHeadDim, kHeadDimV, SlidingChunkVisibility, false>(params, stream);
+    }
+  } else if (has_segment) {
+    // Causal segment rows read a full-span window.
+    RunGroupSoftDeltaFwdSm90<Element, kHeadDim, kHeadDimV, CausalSlidingWindowVisibility, true>(params, stream);
+  } else if (visibility == kGroupSoftDeltaWindow) {
+    RunGroupSoftDeltaFwdSm90<Element, kHeadDim, kHeadDimV, CausalSlidingWindowVisibility, false>(params, stream);
+  } else {
+    RunGroupSoftDeltaFwdSm90<Element, kHeadDim, kHeadDimV, CausalFullVisibility, false>(params, stream);
+  }
+}
+
 template <typename Element>
-void DispatchFwd(AttentionFwdParams& params, bool has_segment, cudaStream_t stream) {
+void DispatchFwd(AttentionFwdParams& params, int64_t visibility, bool has_segment, cudaStream_t stream) {
   const int d_bucket = GroupSoftDeltaBucketDim(params.d), v_bucket = GroupSoftDeltaBucketDim(params.dv);
 #define XATTN_GROUP_SOFTDELTA_FWD_CASE(D, V)                                    \
   if (d_bucket == D && v_bucket == V) {                                         \
-    if (has_segment) {                                                          \
-      RunGroupSoftDeltaFwdSm90<Element, D, V, true>(params, stream);            \
-    } else {                                                                    \
-      RunGroupSoftDeltaFwdSm90<Element, D, V, false>(params, stream);           \
-    }                                                                           \
+    DispatchFwdVisibility<Element, D, V>(params, visibility, has_segment, stream); \
     return;                                                                     \
   }
   XATTN_GROUP_SOFTDELTA_FOR_EACH_BUCKET(XATTN_GROUP_SOFTDELTA_FWD_CASE)
@@ -58,14 +76,76 @@ void DispatchFwd(AttentionFwdParams& params, bool has_segment, cudaStream_t stre
   TORCH_CHECK(false, "group_softdelta fused FWD has no instance for D=", params.d, ", V=", params.dv);
 }
 
+__device__ int SegmentLowerBound(const int64_t* segment, int lo, int hi, int64_t value) {
+  while (lo < hi) {
+    int const mid = lo + ((hi - lo) >> 1);
+    if (segment[mid] < value) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
+}
+
+__device__ int SegmentUpperBound(const int64_t* segment, int lo, int hi, int64_t value) {
+  while (lo < hi) {
+    int const mid = lo + ((hi - lo) >> 1);
+    if (segment[mid] <= value) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
+}
+
+__global__ void ChunkPositionsKernel(const int64_t* q_segment_idx, const int64_t* k_segment_idx,
+                                     int* q_chunk_positions, int batch, int seqlen_q, int seqlen_k) {
+  int64_t const linear = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (linear >= int64_t(batch) * seqlen_q) {
+    return;
+  }
+  int const bidb = static_cast<int>(linear / seqlen_q);
+  int const pos = static_cast<int>(linear - int64_t(bidb) * seqlen_q);
+  const int64_t* q_row = q_segment_idx + int64_t(bidb) * seqlen_q;
+  const int64_t* k_row = k_segment_idx + int64_t(bidb) * seqlen_k;
+  int64_t const segment = q_row[pos];
+  int const q_start = SegmentLowerBound(q_row, 0, pos + 1, segment);
+  int const q_end = SegmentUpperBound(q_row, pos, seqlen_q, segment);
+  int const k_start = SegmentLowerBound(k_row, 0, seqlen_k, segment);
+  int const k_end = SegmentUpperBound(k_row, k_start, seqlen_k, segment);
+  q_chunk_positions[linear] = pos - q_start + (k_end - k_start) - (q_end - q_start);
+}
+
 }  // namespace
+
+torch::Tensor GroupSoftDeltaChunkPositions(const torch::Tensor& q_segment_idx,
+                                           const torch::Tensor& k_segment_idx) {
+  TORCH_CHECK(q_segment_idx.scalar_type() == at::kLong && k_segment_idx.scalar_type() == at::kLong &&
+                  q_segment_idx.is_contiguous() && k_segment_idx.is_contiguous() && q_segment_idx.dim() == 2 &&
+                  k_segment_idx.dim() == 2 && q_segment_idx.size(0) == k_segment_idx.size(0),
+              "group_softdelta chunk positions need contiguous int64 [B, Lq] / [B, Lk] segment ids");
+  auto positions = torch::empty(q_segment_idx.sizes(), q_segment_idx.options().dtype(at::kInt));
+  const int64_t rows = q_segment_idx.numel();
+  if (rows > 0) {
+    constexpr int kThreads = 256;
+    ChunkPositionsKernel<<<static_cast<unsigned>((rows + kThreads - 1) / kThreads), kThreads, 0,
+                           at::cuda::getCurrentCUDAStream()>>>(
+        q_segment_idx.data_ptr<int64_t>(), k_segment_idx.data_ptr<int64_t>(), positions.data_ptr<int>(),
+        static_cast<int>(q_segment_idx.size(0)), static_cast<int>(q_segment_idx.size(1)),
+        static_cast<int>(k_segment_idx.size(1)));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
+  return positions;
+}
 
 std::tuple<torch::Tensor, torch::Tensor> GroupSoftDeltaFwd(
     const torch::Tensor& q, const torch::Tensor& k, const torch::Tensor& v,
     const torch::Tensor& neg_q, double scale,
     const c10::optional<torch::Tensor>& q_segment_idx,
     const c10::optional<torch::Tensor>& k_segment_idx,
-    const c10::optional<torch::Tensor>& output_state) {
+    const c10::optional<torch::Tensor>& output_state, int64_t visibility, int64_t span, bool reset) {
   CheckFwdInputs(q, k, v, neg_q);
   TORCH_CHECK(q_segment_idx.has_value() == k_segment_idx.has_value(),
               "group_softdelta FWD needs both or neither segment index");
@@ -121,8 +201,6 @@ std::tuple<torch::Tensor, torch::Tensor> GroupSoftDeltaFwd(
   params.h = static_cast<int>(logical_heads);
   params.h_k = static_cast<int>(Hkv);
   params.scale_softmax = static_cast<float>(scale);
-  params.window_size_left = static_cast<int>(Lk - 1);
-  params.window_size_right = 0;
   params.use_fast_reciprocal = true;
   const bool has_segment = q_segment_idx.has_value();
   if (has_segment) {
@@ -135,13 +213,19 @@ std::tuple<torch::Tensor, torch::Tensor> GroupSoftDeltaFwd(
     params.k_segment_idx = k_segment_idx->data_ptr<int64_t>();
     params.k_segment_len = static_cast<int>(Lk);
   }
+  // Chunk positions restart in each segment only with segments; dense rows are one sequence each.
+  const torch::Tensor chunk_positions = visibility == kGroupSoftDeltaChunk && reset && has_segment
+      ? GroupSoftDeltaChunkPositions(*q_segment_idx, *k_segment_idx)
+      : torch::Tensor();
+  SetGroupSoftDeltaVisibility(params, visibility, span, Lk,
+                              chunk_positions.defined() ? chunk_positions.data_ptr<int>() : nullptr);
   params.num_sm = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
 
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   if (q.scalar_type() == at::kBFloat16) {
-    DispatchFwd<cutlass::bfloat16_t>(params, has_segment, stream);
+    DispatchFwd<cutlass::bfloat16_t>(params, visibility, has_segment, stream);
   } else {
-    DispatchFwd<cutlass::half_t>(params, has_segment, stream);
+    DispatchFwd<cutlass::half_t>(params, visibility, has_segment, stream);
   }
   return {output, lse};
 }

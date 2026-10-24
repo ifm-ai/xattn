@@ -14,9 +14,15 @@ caller passes (the keys, a transformed key, a second query); by default the
 aligned keys themselves, whose query-side gradient then folds into ``k``'s
 gradient. ``readers`` ``[B, Lq, Hkv + H, C, Dg]`` stacks the negative reads,
 then the query reads.
+
+The sliding window and sliding chunk variants restrict both reads to the same
+local support as ``sliding_window_softdelta_attention`` /
+``sliding_chunk_softdelta_attention``; the negative read keeps only its
+strictly earlier keys.
 """
 
 import functools
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
@@ -48,9 +54,44 @@ __all__ = [
     "group_softdelta_attention",
     "group_softdelta_attention_fwd",
     "group_softdelta_attention_bwd",
+    "sliding_window_group_softdelta_attention",
+    "sliding_window_group_softdelta_attention_fwd",
+    "sliding_window_group_softdelta_attention_bwd",
+    "sliding_chunk_group_softdelta_attention",
+    "sliding_chunk_group_softdelta_attention_fwd",
+    "sliding_chunk_group_softdelta_attention_bwd",
 ]
 
 _API = "group_softdelta_attention"
+
+
+@dataclass(frozen=True)
+class _Local:
+    """Local support of both reads: a sliding window (``span`` the inclusive left radius) or
+    sliding chunks (``span`` the chunk size, ``reset`` chunk positions per segment). Causal
+    calls pass None instead."""
+    kind: AttentionVisibility
+    span: int
+    reset: bool = False
+
+    @property
+    def visibility(self) -> int:
+        """The SoftDelta readers' visibility code: 1 sliding window, 2 sliding chunk."""
+        return 1 if self.kind is AttentionVisibility.SLIDING_WINDOW else 2
+
+
+def _local_support(function, kind: AttentionVisibility, arguments) -> Optional[_Local]:
+    """The call's local support (None for causal calls), validated like the SoftDelta variants."""
+    if kind is AttentionVisibility.CAUSAL_FULL:
+        return None
+    if kind is AttentionVisibility.SLIDING_WINDOW:
+        span, reset = arguments["window_size"], False
+    else:
+        span, reset = arguments["chunk_size"], arguments["reset_chunk_pos_per_seq"]
+        if not isinstance(reset, bool):
+            raise TypeError(f"{function.__name__} reset_chunk_pos_per_seq must be a bool")
+    AttentionSemantics(visibility=kind, boundary=AttentionBoundary.INCLUSIVE, span=span)
+    return _Local(kind, span, reset)
 
 
 def _validate_inputs(
@@ -212,12 +253,13 @@ def _gate_combine(read: Tensor, neg_read: Tensor, g: Tensor) -> Tensor:
     return y.view(batch, length, q_heads, groups, group_dim).to(g.dtype)
 
 
-def _fused_ops(q: Tensor, v: Tensor, prev_k: Optional[Tensor]):
+def _fused_ops(q: Tensor, v: Tensor, prev_k: Optional[Tensor], local: Optional[_Local] = None,
+               k_length: int = 0):
     """Extension ops with the fused reads for this call, or None (composition).
 
     The fused SM90 instances cover every D, V <= 256 (multiples of 8, rounded up to
     the causal_flash_attn buckets; csrc/group_softdelta/instantiations) with gate
-    groups of a multiple of 8 channels.
+    groups of a multiple of 8 channels; sliding windows / chunks need equal Q / K lengths.
     """
     dim, width = q.shape[-1], v.shape[3] * v.shape[4]
     if (
@@ -225,10 +267,32 @@ def _fused_ops(q: Tensor, v: Tensor, prev_k: Optional[Tensor]):
         or not (0 < dim <= 256 and 0 < width <= 256)
         or dim % 8 != 0
         or v.shape[4] % 8 != 0
+        or (local is not None and q.shape[1] != k_length)
     ):
         return None
     ops = _extension_ops()
-    return ops if hasattr(ops, "_group_softdelta_fwd") else None
+    if not hasattr(ops, "_group_softdelta_fwd") or (local is not None and not _fused_local(ops)):
+        return None
+    return ops
+
+
+@functools.lru_cache(maxsize=None)
+def _fused_local(ops) -> bool:
+    """Whether the extension's fused reads take a visibility (sliding window / chunk)."""
+    return "visibility" in (ops._group_softdelta_fwd.__doc__ or "")
+
+
+def _fused_local_args(local: Optional[_Local]) -> tuple:
+    """The fused ops' trailing (visibility, span, reset) arguments; none for causal calls."""
+    return () if local is None else (local.visibility, local.span, local.reset)
+
+
+def _effective_local(local: Optional[_Local], k_length: int) -> Optional[_Local]:
+    """``local``, or None (causal) when it covers every earlier key: a window of at least
+    ``k_length - 1`` keys or a chunk of at least ``k_length`` (total K/V length)."""
+    if local is None or local.span < (k_length - 1 if local.visibility == 1 else k_length):
+        return local
+    return None
 
 
 def _split_readers(readers: Tensor, lse: Tensor, q_heads: int):
@@ -251,12 +315,27 @@ def _add_optional(a: Optional[Tensor], b: Optional[Tensor]) -> Optional[Tensor]:
     return (a.float() + b.float()).to(a.dtype)
 
 
-def _forward(q, k, v, g, neg_q, prev_k, prev_v, q_segment_idx, k_segment_idx, scale, level, varlen_plan):
+def _local_reader(q, k, v, local, scale, prev_k, prev_v, q_segment_idx, k_segment_idx, strict, deterministic,
+                  **options):
+    """One read over ``local`` support through the SoftDelta readers' SM90 routes: forward
+    ``(output, lse)`` (``state`` receives FP32 state), or backward with ``dy`` / ``y`` / ``lse``
+    ``(dq, dk, dv, dprev_k, dprev_v)`` (FP32 for level >= 2)."""
+    from ._softdelta_attention import _reader
+    return _reader(
+        q, k, v, span=local.span, scale=scale, prev_k=prev_k, prev_v=prev_v, qi=q_segment_idx,
+        ki=k_segment_idx, bos=None, visibility=local.visibility, reset=local.reset, strict=strict,
+        deterministic=deterministic, **options,
+    )
+
+
+def _forward(q, k, v, g, neg_q, prev_k, prev_v, q_segment_idx, k_segment_idx, scale, level, varlen_plan,
+             local=None):
     """Both reads and the gate: ``(y, readers, lse)``.
 
     ``readers`` ``[B, Lq, Hkv + H, C * Dg]`` holds the KV heads' negative reads, then the query heads'
     reads (FP32 state for level >= 1); ``lse`` ``[B, Hkv + H, Lq]`` matches. The fused SM90 launch
-    writes this layout directly; the composition (previous K/V or other gate groups) concatenates it.
+    writes this layout directly; the composition (previous K/V, other gate groups or local support)
+    concatenates it.
     """
     batch, length, q_heads, _ = q.shape
     kv_heads = k.shape[2]
@@ -264,7 +343,7 @@ def _forward(q, k, v, g, neg_q, prev_k, prev_v, q_segment_idx, k_segment_idx, sc
     flat_v = v.flatten(3)
     if neg_q is None:
         neg_q = _aligned_keys(k, length)
-    fused = _fused_ops(q, v, prev_k)
+    fused = _fused_ops(q, v, prev_k, local, k.shape[1])
     if fused is not None:
         q, k, flat_v, neg_q = (_tma_readable(t) for t in (q, k, flat_v, neg_q))
         state = None
@@ -280,7 +359,7 @@ def _forward(q, k, v, g, neg_q, prev_k, prev_v, q_segment_idx, k_segment_idx, sc
             )
         else:
             readers, lse = fused._group_softdelta_fwd(
-                q, k, flat_v, neg_q, scale, q_segment_idx, k_segment_idx, state,
+                q, k, flat_v, neg_q, scale, q_segment_idx, k_segment_idx, state, *_fused_local_args(local),
             )
         readers = readers if state is None else state
         y = fused._group_softdelta_gate_fwd_readers(
@@ -292,11 +371,16 @@ def _forward(q, k, v, g, neg_q, prev_k, prev_v, q_segment_idx, k_segment_idx, sc
     if level:
         read_state = allocate_backward_output_state(q, flat_v)
         neg_read_state = allocate_backward_output_state(neg_q, flat_v)
-    common = (scale, prev_k, flat_prev_v, q_segment_idx, k_segment_idx, "sm90")
-    read, read_lse = _dense_fwd(q, k, flat_v, None, *common, output_state=read_state)
-    neg_read, neg_read_lse = _dense_fwd(
-        neg_q, k, flat_v, None, *common, strict_past=True, output_state=neg_read_state,
-    )
+    if local is None:
+        common = (scale, prev_k, flat_prev_v, q_segment_idx, k_segment_idx, "sm90")
+        read, read_lse = _dense_fwd(q, k, flat_v, None, *common, output_state=read_state)
+        neg_read, neg_read_lse = _dense_fwd(
+            neg_q, k, flat_v, None, *common, strict_past=True, output_state=neg_read_state,
+        )
+    else:
+        common = (local, scale, prev_k, flat_prev_v, q_segment_idx, k_segment_idx)
+        read, read_lse = _local_reader(q, k, flat_v, *common, False, False, state=read_state)
+        neg_read, neg_read_lse = _local_reader(neg_q, k, flat_v, *common, True, False, state=neg_read_state)
     read = read if read_state is None else read_state
     neg_read = neg_read if neg_read_state is None else neg_read_state
     y = _extension_ops()._group_softdelta_gate_fwd(
@@ -308,7 +392,7 @@ def _forward(q, k, v, g, neg_q, prev_k, prev_v, q_segment_idx, k_segment_idx, sc
 
 
 def _backward(y_grad, q, k, v, g, neg_q, prev_k, prev_v, q_segment_idx, k_segment_idx,
-              readers, lse, scale, deterministic, level):
+              readers, lse, scale, deterministic, level, local=None):
     """``(dq, dk, dv, dg, dneg_q, dprev_k, dprev_v)`` from the forward's readers and LSE.
 
     ``dneg_q`` is None when ``neg_q`` is (the aligned keys' query-side gradient is in ``dk``).
@@ -325,12 +409,12 @@ def _backward(y_grad, q, k, v, g, neg_q, prev_k, prev_v, q_segment_idx, k_segmen
     if fold_neg_q:
         neg_q = _aligned_keys(k, length)
     y_grad, g = y_grad.contiguous(), g.contiguous()
-    fused = _fused_ops(q, v, prev_k)
+    fused = _fused_ops(q, v, prev_k, local, k.shape[1])
     if level < 2 and not deterministic and fused is not None and length == k.shape[1]:
         q, k, flat_v, neg_q = (_tma_readable(t) for t in (q, k, flat_v, neg_q))
         dq, dk, dv, dneg_q, dg = fused._group_softdelta_bwd(
             y_grad, g, q, k, flat_v, neg_q, readers, lse, scale, q_segment_idx, k_segment_idx,
-            fold_neg_q, _BWD_READER_GROUPS,
+            fold_neg_q, _BWD_READER_GROUPS, *_fused_local_args(local),
         )
         return dq, dk, dv.view(v.shape), dg, None if fold_neg_q else dneg_q, None, None
     read, read_lse, neg_read, neg_read_lse = _split_readers(readers, lse, q_heads)
@@ -342,7 +426,18 @@ def _backward(y_grad, q, k, v, g, neg_q, prev_k, prev_v, q_segment_idx, k_segmen
     )
     neg_read_grad = neg_read_grad.view(batch, length, kv_heads, groups * group_dim)
     read_grad = y_grad.view(batch, length, q_heads, groups * group_dim)
-    if level >= 2:
+    if local is not None:
+        # Levels >= 2 return FP32 gradients, merged below like the causal precision backward.
+        common = (local, scale, prev_k, flat_prev_v, q_segment_idx, k_segment_idx)
+        dq, dk, dv, dprev_k, dprev_v = _local_reader(
+            q, k, flat_v, *common, False, deterministic, dy=read_grad, y=read, lse=read_lse,
+            high_precision_level=level,
+        )
+        dneg_q, dk_neg, dv_neg, dprev_k_neg, dprev_v_neg = _local_reader(
+            neg_q, k, flat_v, *common, True, deterministic, dy=neg_read_grad, y=neg_read,
+            lse=neg_read_lse, high_precision_level=level,
+        )
+    elif level >= 2:
         from ._precision_backend import backward as precision_backward
         common = dict(
             level=level, visibility=0, scale=scale, prev_k=prev_k, prev_v=flat_prev_v,
@@ -353,6 +448,14 @@ def _backward(y_grad, q, k, v, g, neg_q, prev_k, prev_v, q_segment_idx, k_segmen
         dneg_q, dk_neg, dv_neg, dprev_k_neg, dprev_v_neg = precision_backward(
             neg_read_grad, neg_q, k, flat_v, strict=True, **common,
         )
+    else:
+        common = (scale, prev_k, flat_prev_v, q_segment_idx, k_segment_idx, deterministic, "sm90")
+        dq, dk, dv, dprev_k, dprev_v = _dense_bwd(read_grad, q, k, flat_v, read, read_lse, None, *common)
+        dneg_q, dk_neg, dv_neg, dprev_k_neg, dprev_v_neg = _dense_bwd(
+            neg_read_grad, neg_q, k, flat_v, neg_read, neg_read_lse, None,
+            *common, strict_past=True,
+        )
+    if level >= 2:
         dk += dk_neg
         dv += dv_neg
         if fold_neg_q:
@@ -364,12 +467,6 @@ def _backward(y_grad, q, k, v, g, neg_q, prev_k, prev_v, q_segment_idx, k_segmen
             None if x is None else x.to(q.dtype) for x in (dq, dk, dv, dneg_q, dprev_k, dprev_v)
         )
     else:
-        common = (scale, prev_k, flat_prev_v, q_segment_idx, k_segment_idx, deterministic, "sm90")
-        dq, dk, dv, dprev_k, dprev_v = _dense_bwd(read_grad, q, k, flat_v, read, read_lse, None, *common)
-        dneg_q, dk_neg, dv_neg, dprev_k_neg, dprev_v_neg = _dense_bwd(
-            neg_read_grad, neg_q, k, flat_v, neg_read, neg_read_lse, None,
-            *common, strict_past=True,
-        )
         dk, dv = ops._group_softdelta_merge_gradients(
             dk.contiguous(), dk_neg.contiguous(), dneg_q.contiguous() if fold_neg_q else None,
             dv.contiguous(), dv_neg.contiguous(),
@@ -409,15 +506,17 @@ class _GroupSoftDeltaFunc(torch.autograd.Function):
         deterministic: bool,
         high_precision_level: int,
         varlen_plan: Optional[Tuple[Tensor, int]] = None,
+        local: Optional[_Local] = None,
     ) -> Tensor:
         y, readers, lse = _forward(
             q, k, v, g, neg_q, prev_k, prev_v, q_segment_idx, k_segment_idx, scale,
-            high_precision_level, varlen_plan,
+            high_precision_level, varlen_plan, local,
         )
         ctx.save_for_backward(q, k, v, g, neg_q, prev_k, prev_v, q_segment_idx, k_segment_idx, readers, lse)
         ctx.scale = scale
         ctx.deterministic = deterministic
         ctx.high_precision_level = high_precision_level
+        ctx.local = local
         return y
 
     @staticmethod
@@ -425,9 +524,9 @@ class _GroupSoftDeltaFunc(torch.autograd.Function):
         q, k, v, g, neg_q, prev_k, prev_v, q_segment_idx, k_segment_idx, readers, lse = ctx.saved_tensors
         gradients = _backward(
             y_grad, q, k, v, g, neg_q, prev_k, prev_v, q_segment_idx, k_segment_idx,
-            readers, lse, ctx.scale, ctx.deterministic, ctx.high_precision_level,
+            readers, lse, ctx.scale, ctx.deterministic, ctx.high_precision_level, ctx.local,
         )
-        return (*gradients, None, None, None, None, None, None)
+        return (*gradients, None, None, None, None, None, None, None)
 
 
 def _torch_group_softdelta(
@@ -441,6 +540,7 @@ def _torch_group_softdelta(
     q_segment_idx: Optional[Tensor],
     k_segment_idx: Optional[Tensor],
     scale: float,
+    local: Optional[_Local] = None,
 ) -> Tensor:
     """Explicit correctness plan: materialized masks, FP32 reads and gate."""
     length = q.shape[1]
@@ -463,6 +563,9 @@ def _torch_group_softdelta(
             device=q.device,
             semantics=AttentionSemantics(
                 visibility=AttentionVisibility.CAUSAL_FULL, boundary=boundary
+            ) if local is None else AttentionSemantics(
+                visibility=local.kind, boundary=boundary, span=local.span,
+                reset_position_per_segment=local.reset,
             ),
             q_segment_idx=q_segment_idx,
             k_segment_idx=k_segment_idx,
@@ -539,6 +642,103 @@ def _prepare(api_name, q, k, v, g, neg_q, scale, prev_k, prev_v, q_segment_idx, 
     return q_segment_idx, k_segment_idx, resolve_scale(q, scale), use_sm90
 
 
+_TENSORS = ("q", "k", "v", "g", "neg_q", "prev_k", "prev_v")
+_OPTIONS = ("q_segment_idx", "k_segment_idx", "segment_idx", "bos_mask", "backend", "deterministic",
+            "high_precision_level")
+
+
+def _prepare_call(function, kind, arguments, standalone):
+    """``_prepare`` over a public call's arguments, then its local support (validated after the
+    level, scale, widths and shapes, as in the SoftDelta variants): ``(tensors, local,
+    q_segment_idx, k_segment_idx, resolved scale, SM90)``. ``local`` is None for causal calls
+    and for windows / chunks covering every earlier key."""
+    q, k, v, g, neg_q, prev_k, prev_v = tensors = tuple(arguments[n] for n in _TENSORS)
+    q_segment_idx, k_segment_idx, segment_idx, bos_mask, backend, deterministic, level = (
+        arguments[n] for n in _OPTIONS
+    )
+    prepared = _prepare(
+        function.__name__, q, k, v, g, neg_q, arguments["scale"], prev_k, prev_v, q_segment_idx,
+        k_segment_idx, segment_idx, bos_mask, backend, deterministic, level, standalone,
+    )
+    local = _local_support(function, kind, arguments)
+    prev_length = 0 if prev_k is None else prev_k.shape[1]
+    if local is not None and local.visibility == 2 and prev_k is not None and prev_length != local.span:
+        raise ValueError(f"{function.__name__} prev_k/prev_v sequence length must equal chunk_size")
+    return (tensors, _effective_local(local, k.shape[1] + prev_length), *prepared)
+
+
+def _call(function, kind, arguments):
+    """The autograd call of ``function`` over ``kind`` support."""
+    if arguments["scale"] is not None and float(arguments["scale"]) <= 0:
+        return _dispatch_nonpositive_scale(function, arguments)
+    tensors, local, q_segment_idx, k_segment_idx, resolved_scale, use_sm90 = _prepare_call(
+        function, kind, arguments, standalone=False,
+    )
+    q, k, v, g, neg_q, prev_k, prev_v = tensors
+    deterministic, level = arguments["deterministic"], arguments["high_precision_level"]
+    if not use_sm90:
+        return _torch_group_softdelta(
+            q, k, v, g, neg_q, prev_k, prev_v, q_segment_idx, k_segment_idx, resolved_scale, local,
+        )
+    needs_backward = torch.is_grad_enabled() and any(t is not None and t.requires_grad for t in tensors)
+    varlen_plan, q_segment_idx, k_segment_idx = _varlen_route(
+        q, k, v, g, neg_q, prev_k, arguments["bos_mask"], q_segment_idx, k_segment_idx, deterministic,
+        level, needs_backward, local,
+    )
+    return _GroupSoftDeltaFunc.apply(
+        q, k, v, g, neg_q, prev_k, prev_v, q_segment_idx, k_segment_idx,
+        resolved_scale, deterministic, level, varlen_plan, local,
+    )
+
+
+def _call_fwd(function, kind, arguments):
+    """The standalone forward of ``function``: ``(y, readers, lse)``."""
+    if arguments["scale"] is not None and float(arguments["scale"]) <= 0:
+        return _dispatch_nonpositive_scale(function, arguments)
+    tensors, local, q_segment_idx, k_segment_idx, resolved_scale, _ = _prepare_call(
+        function, kind, arguments, standalone=True,
+    )
+    q, k, v, g, neg_q, prev_k, prev_v = tensors
+    deterministic, level = arguments["deterministic"], arguments["high_precision_level"]
+    varlen_plan, q_segment_idx, k_segment_idx = _varlen_route(
+        q, k, v, g, neg_q, prev_k, arguments["bos_mask"], q_segment_idx, k_segment_idx, deterministic,
+        level, True, local,
+    )
+    y, readers, lse = _forward(
+        q, k, v, g, neg_q, prev_k, prev_v, q_segment_idx, k_segment_idx, resolved_scale,
+        level, varlen_plan, local,
+    )
+    batch, length, q_heads, _ = q.shape
+    return y, readers.view(batch, length, k.shape[2] + q_heads, *v.shape[3:]), lse
+
+
+def _call_bwd(function, kind, arguments):
+    """The standalone backward of ``function``: ``(dq, dk, dv, dg, dneg_q, dprev_k, dprev_v)``."""
+    if arguments["scale"] is not None and float(arguments["scale"]) <= 0:
+        return _dispatch_nonpositive_scale(function, arguments)
+    tensors, local, q_segment_idx, k_segment_idx, resolved_scale, _ = _prepare_call(
+        function, kind, arguments, standalone=True,
+    )
+    q, k, v, g, neg_q, prev_k, prev_v = tensors
+    y_grad, readers, lse = arguments["y_grad"], arguments["readers"], arguments["lse"]
+    deterministic, level = arguments["deterministic"], arguments["high_precision_level"]
+    validate_backward_precision(level, readers, q)
+    batch, length, q_heads, _ = q.shape
+    reader_heads = k.shape[2] + q_heads
+    for name, tensor, shape, dtypes in (
+        ("y_grad", y_grad, (batch, length, q_heads, *v.shape[3:]), (q.dtype,)),
+        ("readers", readers, (batch, length, reader_heads, *v.shape[3:]), (q.dtype, torch.float32)),
+        ("lse", lse, (batch, reader_heads, length), (torch.float32,)),
+    ):
+        if tuple(tensor.shape) != shape or tensor.device != q.device or tensor.dtype not in dtypes:
+            raise ValueError(f"{function.__name__} {name} has incompatible shape, device, or dtype")
+    return _backward(
+        y_grad, q, k, v, g, neg_q, prev_k, prev_v, q_segment_idx, k_segment_idx,
+        readers.reshape(batch, length, reader_heads, -1).contiguous(), lse.contiguous(),
+        resolved_scale, deterministic, level, local,
+    )
+
+
 def group_softdelta_attention(
     q: Tensor,
     k: Tensor,
@@ -580,28 +780,7 @@ def group_softdelta_attention(
     backward; 2-4 add the advanced precision backward (SM90).
     """
     validate_attention_scale(scale)
-    if scale is not None and float(scale) <= 0:
-        return _dispatch_nonpositive_scale(group_softdelta_attention, locals())
-    q_segment_idx, k_segment_idx, resolved_scale, use_sm90 = _prepare(
-        _API, q, k, v, g, neg_q, scale, prev_k, prev_v, q_segment_idx, k_segment_idx,
-        segment_idx, bos_mask, backend, deterministic, high_precision_level, standalone=False,
-    )
-    if not use_sm90:
-        return _torch_group_softdelta(
-            q, k, v, g, neg_q, prev_k, prev_v, q_segment_idx, k_segment_idx,
-            resolved_scale,
-        )
-    needs_backward = torch.is_grad_enabled() and any(
-        t is not None and t.requires_grad for t in (q, k, v, g, neg_q, prev_k, prev_v)
-    )
-    varlen_plan, q_segment_idx, k_segment_idx = _varlen_route(
-        q, k, v, g, neg_q, prev_k, bos_mask, q_segment_idx, k_segment_idx, deterministic,
-        high_precision_level, needs_backward,
-    )
-    return _GroupSoftDeltaFunc.apply(
-        q, k, v, g, neg_q, prev_k, prev_v, q_segment_idx, k_segment_idx,
-        resolved_scale, deterministic, high_precision_level, varlen_plan,
-    )
+    return _call(group_softdelta_attention, AttentionVisibility.CAUSAL_FULL, locals())
 
 
 @torch.no_grad()
@@ -632,23 +811,7 @@ def group_softdelta_attention_fwd(
     forward's other arguments, to ``group_softdelta_attention_bwd``.
     """
     validate_attention_scale(scale)
-    if scale is not None and float(scale) <= 0:
-        return _dispatch_nonpositive_scale(group_softdelta_attention_fwd, locals())
-    api = "group_softdelta_attention_fwd"
-    q_segment_idx, k_segment_idx, resolved_scale, _ = _prepare(
-        api, q, k, v, g, neg_q, scale, prev_k, prev_v, q_segment_idx, k_segment_idx,
-        segment_idx, bos_mask, backend, deterministic, high_precision_level, standalone=True,
-    )
-    varlen_plan, q_segment_idx, k_segment_idx = _varlen_route(
-        q, k, v, g, neg_q, prev_k, bos_mask, q_segment_idx, k_segment_idx, deterministic,
-        high_precision_level, True,
-    )
-    y, readers, lse = _forward(
-        q, k, v, g, neg_q, prev_k, prev_v, q_segment_idx, k_segment_idx, resolved_scale,
-        high_precision_level, varlen_plan,
-    )
-    batch, length, q_heads, _ = q.shape
-    return y, readers.view(batch, length, k.shape[2] + q_heads, *v.shape[3:]), lse
+    return _call_fwd(group_softdelta_attention_fwd, AttentionVisibility.CAUSAL_FULL, locals())
 
 
 @torch.no_grad()
@@ -682,28 +845,179 @@ def group_softdelta_attention_bwd(
     included in ``dk``); absent previous gradients are None.
     """
     validate_attention_scale(scale)
-    if scale is not None and float(scale) <= 0:
-        return _dispatch_nonpositive_scale(group_softdelta_attention_bwd, locals())
-    api = "group_softdelta_attention_bwd"
-    q_segment_idx, k_segment_idx, resolved_scale, _ = _prepare(
-        api, q, k, v, g, neg_q, scale, prev_k, prev_v, q_segment_idx, k_segment_idx,
-        segment_idx, bos_mask, backend, deterministic, high_precision_level, standalone=True,
-    )
-    validate_backward_precision(high_precision_level, readers, q)
-    batch, length, q_heads, _ = q.shape
-    reader_heads = k.shape[2] + q_heads
-    for name, tensor, shape, dtypes in (
-        ("y_grad", y_grad, (batch, length, q_heads, *v.shape[3:]), (q.dtype,)),
-        ("readers", readers, (batch, length, reader_heads, *v.shape[3:]), (q.dtype, torch.float32)),
-        ("lse", lse, (batch, reader_heads, length), (torch.float32,)),
-    ):
-        if tuple(tensor.shape) != shape or tensor.device != q.device or tensor.dtype not in dtypes:
-            raise ValueError(f"{api} {name} has incompatible shape, device, or dtype")
-    return _backward(
-        y_grad, q, k, v, g, neg_q, prev_k, prev_v, q_segment_idx, k_segment_idx,
-        readers.reshape(batch, length, reader_heads, -1).contiguous(), lse.contiguous(),
-        resolved_scale, deterministic, high_precision_level,
-    )
+    return _call_bwd(group_softdelta_attention_bwd, AttentionVisibility.CAUSAL_FULL, locals())
+
+
+def sliding_window_group_softdelta_attention(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    g: Tensor,
+    window_size: int,
+    neg_q: Optional[Tensor] = None,
+    scale: Optional[float] = None,
+    prev_k: Optional[Tensor] = None,
+    prev_v: Optional[Tensor] = None,
+    q_segment_idx: Optional[Tensor] = None,
+    k_segment_idx: Optional[Tensor] = None,
+    *,
+    segment_idx: Optional[Tensor] = None,
+    bos_mask: Optional[Tensor] = None,
+    backend: str = "auto",
+    deterministic: bool = False,
+    high_precision_level: int = 0,
+) -> Tensor:
+    """Run group SoftDelta within a causal sliding window, with autograd.
+
+    ``group_softdelta_attention`` with both reads limited to keys at most
+    ``window_size`` positions before the aligned query position (the inclusive
+    left radius of ``sliding_window_softdelta_attention``): the query read sees
+    ``[i - window_size, i]``, the negative read ``[i - window_size, i - 1]``.
+    """
+    validate_attention_scale(scale)
+    return _call(sliding_window_group_softdelta_attention, AttentionVisibility.SLIDING_WINDOW, locals())
+
+
+@torch.no_grad()
+def sliding_window_group_softdelta_attention_fwd(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    g: Tensor,
+    window_size: int,
+    neg_q: Optional[Tensor] = None,
+    scale: Optional[float] = None,
+    prev_k: Optional[Tensor] = None,
+    prev_v: Optional[Tensor] = None,
+    q_segment_idx: Optional[Tensor] = None,
+    k_segment_idx: Optional[Tensor] = None,
+    *,
+    segment_idx: Optional[Tensor] = None,
+    bos_mask: Optional[Tensor] = None,
+    backend: str = "auto",
+    deterministic: bool = False,
+    high_precision_level: int = 0,
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """``group_softdelta_attention_fwd`` within a sliding window: ``(y, readers, lse)``."""
+    validate_attention_scale(scale)
+    return _call_fwd(sliding_window_group_softdelta_attention_fwd, AttentionVisibility.SLIDING_WINDOW, locals())
+
+
+@torch.no_grad()
+def sliding_window_group_softdelta_attention_bwd(
+    y_grad: Tensor,
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    g: Tensor,
+    readers: Tensor,
+    lse: Tensor,
+    window_size: int,
+    neg_q: Optional[Tensor] = None,
+    scale: Optional[float] = None,
+    prev_k: Optional[Tensor] = None,
+    prev_v: Optional[Tensor] = None,
+    q_segment_idx: Optional[Tensor] = None,
+    k_segment_idx: Optional[Tensor] = None,
+    *,
+    segment_idx: Optional[Tensor] = None,
+    bos_mask: Optional[Tensor] = None,
+    backend: str = "auto",
+    deterministic: bool = False,
+    high_precision_level: int = 0,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, Optional[Tensor], Optional[Tensor], Optional[Tensor]]:
+    """``group_softdelta_attention_bwd`` within a sliding window:
+    ``(dq, dk, dv, dg, dneg_q, dprev_k, dprev_v)``."""
+    validate_attention_scale(scale)
+    return _call_bwd(sliding_window_group_softdelta_attention_bwd, AttentionVisibility.SLIDING_WINDOW, locals())
+
+
+def sliding_chunk_group_softdelta_attention(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    g: Tensor,
+    chunk_size: int,
+    neg_q: Optional[Tensor] = None,
+    scale: Optional[float] = None,
+    prev_k: Optional[Tensor] = None,
+    prev_v: Optional[Tensor] = None,
+    q_segment_idx: Optional[Tensor] = None,
+    k_segment_idx: Optional[Tensor] = None,
+    *,
+    segment_idx: Optional[Tensor] = None,
+    bos_mask: Optional[Tensor] = None,
+    backend: str = "auto",
+    reset_chunk_pos_per_seq: bool = False,
+    deterministic: bool = False,
+    high_precision_level: int = 0,
+) -> Tensor:
+    """Run group SoftDelta over the previous and current logical chunks, with autograd.
+
+    ``group_softdelta_attention`` with both reads limited to the keys of the
+    query's chunk and the chunk before it (``sliding_chunk_softdelta_attention``'s
+    support); the negative read keeps only strictly earlier keys. Previous K/V,
+    when given, holds exactly ``chunk_size`` tokens. ``reset_chunk_pos_per_seq``
+    restarts chunk positions in every segment.
+    """
+    validate_attention_scale(scale)
+    return _call(sliding_chunk_group_softdelta_attention, AttentionVisibility.SLIDING_CHUNK, locals())
+
+
+@torch.no_grad()
+def sliding_chunk_group_softdelta_attention_fwd(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    g: Tensor,
+    chunk_size: int,
+    neg_q: Optional[Tensor] = None,
+    scale: Optional[float] = None,
+    prev_k: Optional[Tensor] = None,
+    prev_v: Optional[Tensor] = None,
+    q_segment_idx: Optional[Tensor] = None,
+    k_segment_idx: Optional[Tensor] = None,
+    *,
+    segment_idx: Optional[Tensor] = None,
+    bos_mask: Optional[Tensor] = None,
+    backend: str = "auto",
+    reset_chunk_pos_per_seq: bool = False,
+    deterministic: bool = False,
+    high_precision_level: int = 0,
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """``group_softdelta_attention_fwd`` over sliding chunks: ``(y, readers, lse)``."""
+    validate_attention_scale(scale)
+    return _call_fwd(sliding_chunk_group_softdelta_attention_fwd, AttentionVisibility.SLIDING_CHUNK, locals())
+
+
+@torch.no_grad()
+def sliding_chunk_group_softdelta_attention_bwd(
+    y_grad: Tensor,
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    g: Tensor,
+    readers: Tensor,
+    lse: Tensor,
+    chunk_size: int,
+    neg_q: Optional[Tensor] = None,
+    scale: Optional[float] = None,
+    prev_k: Optional[Tensor] = None,
+    prev_v: Optional[Tensor] = None,
+    q_segment_idx: Optional[Tensor] = None,
+    k_segment_idx: Optional[Tensor] = None,
+    *,
+    segment_idx: Optional[Tensor] = None,
+    bos_mask: Optional[Tensor] = None,
+    backend: str = "auto",
+    reset_chunk_pos_per_seq: bool = False,
+    deterministic: bool = False,
+    high_precision_level: int = 0,
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, Optional[Tensor], Optional[Tensor], Optional[Tensor]]:
+    """``group_softdelta_attention_bwd`` over sliding chunks:
+    ``(dq, dk, dv, dg, dneg_q, dprev_k, dprev_v)``."""
+    validate_attention_scale(scale)
+    return _call_bwd(sliding_chunk_group_softdelta_attention_bwd, AttentionVisibility.SLIDING_CHUNK, locals())
 
 
 _VARLEN_MIN_TOKENS = 65536
@@ -713,14 +1027,14 @@ _BWD_READER_GROUPS = -1
 
 
 def _varlen_route(q, k, v, g, neg_q, prev_k, bos_mask, q_segment_idx, k_segment_idx, deterministic,
-                  high_precision_level, needs_backward):
-    """``(varlen plan or None, q_segment_idx, k_segment_idx)`` for the fused forward.
+                  high_precision_level, needs_backward, local=None):
+    """``(varlen plan or None, q_segment_idx, k_segment_idx)`` for the fused causal forward.
 
     Packed varlen forward from 64K tokens; below, the plan's host sync and extra launches cost more
     than the segment forward loses (T4096 B8: segment 1.098x vs varlen 1.085x the Stage 3 FA3 path,
-    fwd+bwd).
+    fwd+bwd). Local support reads BOS masks as segment ids.
     """
-    if (bos_mask is None or prev_k is not None or q.shape[1] != k.shape[1]
+    if (local is not None or bos_mask is None or prev_k is not None or q.shape[1] != k.shape[1]
             or q.shape[0] * q.shape[1] < _VARLEN_MIN_TOKENS or _fused_ops(q, v, prev_k) is None):
         return None, q_segment_idx, k_segment_idx
     varlen_plan, dense = _bos_varlen_plan(

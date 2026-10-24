@@ -7,6 +7,12 @@ from .group_softdelta_attention import (
     group_softdelta_attention,
     group_softdelta_attention_bwd,
     group_softdelta_attention_fwd,
+    sliding_chunk_group_softdelta_attention,
+    sliding_chunk_group_softdelta_attention_bwd,
+    sliding_chunk_group_softdelta_attention_fwd,
+    sliding_window_group_softdelta_attention,
+    sliding_window_group_softdelta_attention_bwd,
+    sliding_window_group_softdelta_attention_fwd,
 )
 from .sliding_chunk_attention import (
     flash_sca,
@@ -54,4 +60,10 @@ __all__ = [
     "group_softdelta_attention",
     "group_softdelta_attention_bwd",
     "group_softdelta_attention_fwd",
+    "sliding_window_group_softdelta_attention",
+    "sliding_window_group_softdelta_attention_bwd",
+    "sliding_window_group_softdelta_attention_fwd",
+    "sliding_chunk_group_softdelta_attention",
+    "sliding_chunk_group_softdelta_attention_bwd",
+    "sliding_chunk_group_softdelta_attention_fwd",
 ]

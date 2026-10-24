@@ -18,13 +18,17 @@ def group_softdelta_fp64_oracle(
     prev_v: Optional[Tensor] = None,
     q_segment_idx: Optional[Tensor] = None,
     k_segment_idx: Optional[Tensor] = None,
+    visibility: str = "full",
+    span: Optional[int] = None,
+    reset_position_per_segment: bool = False,
     return_aux: bool = False,
 ):
     """Independent FP64 oracle over caller-provided quantized values.
 
     The negative read uses ``neg_q`` (default: the aligned current keys) as a
     per-KV-head query over the strict past; every query head of the group
-    subtracts its gated copy.
+    subtracts its gated copy. ``visibility`` ("full", "window" or "chunk") and
+    ``span`` select the SoftDelta oracle's support for both reads.
     """
     tensors = (q, k, v, g) if neg_q is None else (q, k, v, g, neg_q)
     assert all(t.dtype == torch.float64 for t in tensors)
@@ -40,8 +44,8 @@ def group_softdelta_fp64_oracle(
     groups, group_dim = v.shape[3:]
     resolved_scale = q.shape[-1] ** -0.5 if scale is None else float(scale)
     inclusive, strict_past = _allowed_masks(
-        length, k.shape[1], batch, q.device, "full", None,
-        q_segment_idx, k_segment_idx, False,
+        length, k.shape[1], batch, q.device, visibility, span,
+        q_segment_idx, k_segment_idx, reset_position_per_segment,
     )
     assert bool(inclusive.any(dim=-1).all())
     flat_v = v.flatten(3)

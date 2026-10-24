@@ -18,6 +18,7 @@ namespace ops {
 // is added to dk in FP32 and dneg_q is empty; otherwise dneg_q is the neg_q gradient.
 // reader_groups: -1 picks the launch layout (per logical head or reader
 // groups, see bwd.cu), 0 / 1 force per logical head / reader groups.
+// visibility / span / reset: the forward's support (GroupSoftDeltaFwd).
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> GroupSoftDeltaBwdStates(
     const torch::Tensor& dy, const torch::Tensor& gate, const torch::Tensor& q,
     const torch::Tensor& k, const torch::Tensor& v, const torch::Tensor& neg_q,
@@ -25,7 +26,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     const torch::Tensor& read_lse, double scale,
     const c10::optional<torch::Tensor>& q_segment_idx,
     const c10::optional<torch::Tensor>& k_segment_idx, bool gated_output, bool fold_neg_q = false,
-    int64_t reader_groups = -1);
+    int64_t reader_groups = -1, int64_t visibility = 0, int64_t span = 0, bool reset = false);
 
 // GroupSoftDeltaBwdStates from the forward's class-major readers [B, Lq, Hkv + H, V] and LSE
 // [B, Hkv + H, Lq], the output gradient [B, Lq, H, C, Dg] and gate logits
@@ -35,7 +36,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     const torch::Tensor& k, const torch::Tensor& v, const torch::Tensor& neg_q,
     const torch::Tensor& readers, const torch::Tensor& lse, double scale,
     const c10::optional<torch::Tensor>& q_segment_idx,
-    const c10::optional<torch::Tensor>& k_segment_idx, bool fold_neg_q, int64_t reader_groups = -1);
+    const c10::optional<torch::Tensor>& k_segment_idx, bool fold_neg_q, int64_t reader_groups = -1,
+    int64_t visibility = 0, int64_t span = 0, bool reset = false);
 
 }  // namespace ops
 }  // namespace xattn
