@@ -59,7 +59,8 @@ def test_sm90_invalid_dimensions_rejected_before_launch(fn, level, dimensions):
     if not torch.cuda.is_available():
         pytest.skip('CUDA unavailable')
     d, width = dimensions
-    soft = 'softdelta' in fn.__name__
+    # SoftDelta: interleaved q1/q2 heads and value groups; Group SoftDelta takes plain q / v.
+    soft = 'softdelta' in fn.__name__ and 'group' not in fn.__name__
     signature = inspect.signature(fn)
     kwargs = {n: None for n, p in signature.parameters.items()
               if p.default is inspect.Parameter.empty}

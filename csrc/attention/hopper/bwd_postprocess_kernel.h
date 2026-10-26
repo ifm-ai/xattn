@@ -100,7 +100,7 @@ public:
     static constexpr int SharedStorageSize = sizeof(SharedStorage);
     // Use a one-CTA launch bound above 48 KiB of shared storage. The negative-query
     // fold's dK registers would otherwise halve the occupancy of the readers'
-    // launch (93 vs 60 registers at D 192): two CTAs whenever two fit.
+    // launch: two CTAs whenever two fit.
     static constexpr uint32_t MinBlocksPerMultiprocessor =
         NegQReaders && SharedStorageSize <= 113 * 1024 ? 2
         : SharedStorageSize > 48 * 1024 ? 1 : 2;

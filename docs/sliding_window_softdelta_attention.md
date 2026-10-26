@@ -133,22 +133,15 @@ Tensor layouts:
 
 - `q`: `[batch, seqlen, q_heads, qk_dim]`
 - `k`: `[batch, seqlen, kv_heads, qk_dim]`
-- `v`: `[batch, seqlen, kv_heads, groups, group_dim]`
-- `g`: `[batch, seqlen, q_heads, groups, 1]`, gate logits
+- `v`: `[batch, seqlen, kv_heads, v_dim]`
+- `g`: `[batch, seqlen, q_heads]`, gate logits
 - `neg_q`: optional `[batch, seqlen, kv_heads, qk_dim]`, same device and dtype as `q`
 - `prev_k`: optional `[batch, prev_seqlen, kv_heads, qk_dim]`
-- `prev_v`: optional `[batch, prev_seqlen, kv_heads, groups, group_dim]`
+- `prev_v`: optional `[batch, prev_seqlen, kv_heads, v_dim]`
 - `q_segment_idx`: optional int64 `[batch, seqlen]`
 - `k_segment_idx`, `segment_idx`: optional int64 `[batch, prev_seqlen + seqlen]`
 - `bos_mask`: optional CUDA bool `[batch, prev_seqlen + seqlen]`
-
-`prev_seqlen=0` without previous K/V.
-
-`window_size` is the inclusive left radius shared by both reads: the query read sees keys
-`[i - window_size, i]` of aligned position `i`, the negative read
-`[i - window_size, i - 1]`. The other arguments, precision levels and SM90 limits
-follow the SoftDelta API above. `high_precision_level >= 2` requires SM90 for
-the autograd API as well.
+- `prev_seqlen`: previous K/V sequence length, or `0`
 
 Standalone forward/backward:
 
@@ -192,17 +185,9 @@ dq, dk, dv, dg, dneg_q, dprev_k, dprev_v = sliding_window_group_softdelta_attent
 
 Output layouts:
 
-- `y`, `dy`: `[batch, seqlen, q_heads, groups, group_dim]`, input dtype
-- `readers`: `[batch, seqlen, kv_heads + q_heads, groups, group_dim]`, FP32 when high precision is enabled, otherwise input dtype; negative reader heads followed by query reader heads
-- `lse`: `[batch, kv_heads + q_heads, seqlen]`, FP32, same head order as `readers`
+- `y`, `dy`: `[batch, seqlen, q_heads, v_dim]`, input dtype
+- `readers`: `[batch, seqlen, kv_heads + q_heads, v_dim]`, FP32 when high precision is enabled, otherwise input dtype
+- `lse`: `[batch, kv_heads + q_heads, seqlen]`, FP32
 - `dq`, `dk`, `dv`, `dg`: same shapes and dtypes as `q`, `k`, `v`, `g`
-- `dneg_q`: same shape and dtype as `neg_q`, or `None` when `neg_q=None` (its gradient is added to `dk`)
+- `dneg_q`: same shape and dtype as `neg_q`, or `None` when `neg_q=None`
 - `dprev_k`, `dprev_v`: same shapes and dtypes as previous K/V, or `None`
-
-Standalone calls require an SM90 build and GPU, with `backend="auto"` or
-`"sm90"`, and do not build an autograd graph or populate `.grad`.
-Pass the same `window_size`, `neg_q`, `high_precision_level` and other forward
-options to backward, together with forward's `readers` and `lse`.
-Forward always returns `(y, readers, lse)`, including under
-`no_grad`/inference mode. `readers.dtype` does not select the backward
-algorithm. Final `y` alone is insufficient for backward.

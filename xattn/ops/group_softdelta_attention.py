@@ -12,13 +12,18 @@ The negative read runs once per KV head and is shared by the query heads of its
 group. Its query ``neg_q`` is whatever post-RoPE ``[B, Lq, Hkv, D]`` tensor the
 caller passes (the keys, a transformed key, a second query); by default the
 aligned keys themselves, whose query-side gradient then folds into ``k``'s
-gradient. ``readers`` ``[B, Lq, Hkv + H, C, Dg]`` stacks the negative reads,
+gradient. ``readers`` ``[B, Lq, Hkv + H, V]`` stacks the negative reads,
 then the query reads.
 
 The sliding window and sliding chunk variants restrict both reads to the same
 local support as ``sliding_window_softdelta_attention`` /
 ``sliding_chunk_softdelta_attention``; the negative read keeps only its
 strictly earlier keys.
+
+The public API takes scalar gates: ``v`` ``[B, Lkv, Hkv, V]`` and one gate logit
+per query head and token, ``g`` ``[B, Lq, H]``. The implementation keeps value
+groups (``v`` ``[B, Lkv, Hkv, C, Dg]``, ``g`` ``[B, Lq, H, C, 1]``, a gate per
+group of ``Dg`` channels); public calls run it with ``C = 1``.
 """
 
 import functools
@@ -104,14 +109,12 @@ def _validate_inputs(
     prev_v: Optional[Tensor],
     deterministic: bool,
     api_name: str = _API,
-) -> Tuple[int, int, int]:
-    """Return ``(groups, group_dim, prev_length)`` after shape validation."""
+) -> int:
+    """Return ``prev_length`` after validating the scalar-gate layouts."""
     if not isinstance(deterministic, bool):
         raise TypeError(f"{api_name} deterministic must be a bool")
-    if q.dim() != 4 or k.dim() != 4:
-        raise ValueError(f"{api_name} expects 4D q/k tensors")
-    if v.dim() != 5 or g.dim() != 5:
-        raise ValueError(f"{api_name} expects 5D v/g tensors")
+    if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
+        raise ValueError(f"{api_name} expects 4D q/k/v tensors")
     tensors = (k, v, g) if neg_q is None else (k, v, g, neg_q)
     device, dtype = q.device, q.dtype
     if any(t.device != device for t in tensors):
@@ -140,17 +143,16 @@ def _validate_inputs(
             f"{api_name} neg_q must have shape {[batch, q_length, kv_heads, qk_dim]}"
         )
 
-    groups, group_dim = v.shape[3:]
-    if groups <= 0 or group_dim <= 0:
-        raise ValueError(f"{api_name} value group dimensions must be positive")
-    expected_gate = (batch, q_length, q_heads, groups, 1)
-    if tuple(g.shape) != expected_gate:
-        raise ValueError(f"{api_name} g must have shape {list(expected_gate)}")
+    value_dim = v.shape[3]
+    if value_dim <= 0:
+        raise ValueError(f"{api_name} value dimension must be positive")
+    if tuple(g.shape) != (batch, q_length, q_heads):
+        raise ValueError(f"{api_name} g must have shape {[batch, q_length, q_heads]}")
 
     if (prev_k is None) != (prev_v is None):
         raise ValueError(f"{api_name} prev_k and prev_v must be provided together")
     if prev_k is None:
-        return groups, group_dim, 0
+        return 0
     assert prev_v is not None
     if prev_k.device != q.device or prev_v.device != q.device:
         raise ValueError(f"{api_name} previous and current tensors must share a device")
@@ -161,9 +163,15 @@ def _validate_inputs(
         raise ValueError(f"{api_name} previous sequence length must be positive")
     if tuple(prev_k.shape) != (batch, prev_length, kv_heads, qk_dim):
         raise ValueError(f"{api_name} prev_k shape is incompatible with q/k")
-    if tuple(prev_v.shape) != (batch, prev_length, kv_heads, groups, group_dim):
+    if tuple(prev_v.shape) != (batch, prev_length, kv_heads, value_dim):
         raise ValueError(f"{api_name} prev_v shape is incompatible with v")
-    return groups, group_dim, prev_length
+    return prev_length
+
+
+def _grouped(v: Tensor, g: Tensor, prev_v: Optional[Tensor]):
+    """The scalar-gate tensors in the internal value-group layout, as views: one group of V
+    channels (``v`` ``[B, L, Hkv, 1, V]``, ``g`` ``[B, Lq, H, 1, 1]``)."""
+    return v.unsqueeze(3), g[..., None, None], None if prev_v is None else prev_v.unsqueeze(3)
 
 
 def _prepare_segments(
@@ -626,7 +634,7 @@ def _prepare(api_name, q, k, v, g, neg_q, scale, prev_k, prev_v, q_segment_idx, 
     validate_attention_scale(scale)
     backend = _normalize_backend(backend)
     validate_sm90_dimensions(q, v, backend, api_name=api_name)
-    _, _, prev_length = _validate_inputs(q, k, v, g, neg_q, prev_k, prev_v, deterministic, api_name)
+    prev_length = _validate_inputs(q, k, v, g, neg_q, prev_k, prev_v, deterministic, api_name)
     q_segment_idx, k_segment_idx = _prepare_segments(
         q, prev_length + k.shape[1], q_segment_idx, k_segment_idx, segment_idx, bos_mask, api_name,
     )
@@ -650,9 +658,10 @@ _OPTIONS = ("q_segment_idx", "k_segment_idx", "segment_idx", "bos_mask", "backen
 def _prepare_call(function, kind, arguments, standalone):
     """``_prepare`` over a public call's arguments, then its local support (validated after the
     level, scale, widths and shapes, as in the SoftDelta variants): ``(tensors, local,
-    q_segment_idx, k_segment_idx, resolved scale, SM90)``. ``local`` is None for causal calls
-    and for windows / chunks covering every earlier key."""
-    q, k, v, g, neg_q, prev_k, prev_v = tensors = tuple(arguments[n] for n in _TENSORS)
+    q_segment_idx, k_segment_idx, resolved scale, SM90)``. ``tensors`` holds ``v`` / ``g`` /
+    ``prev_v`` in the internal value-group layout (``_grouped``). ``local`` is None for causal
+    calls and for windows / chunks covering every earlier key."""
+    q, k, v, g, neg_q, prev_k, prev_v = tuple(arguments[n] for n in _TENSORS)
     q_segment_idx, k_segment_idx, segment_idx, bos_mask, backend, deterministic, level = (
         arguments[n] for n in _OPTIONS
     )
@@ -664,6 +673,8 @@ def _prepare_call(function, kind, arguments, standalone):
     prev_length = 0 if prev_k is None else prev_k.shape[1]
     if local is not None and local.visibility == 2 and prev_k is not None and prev_length != local.span:
         raise ValueError(f"{function.__name__} prev_k/prev_v sequence length must equal chunk_size")
+    v, g, prev_v = _grouped(v, g, prev_v)
+    tensors = (q, k, v, g, neg_q, prev_k, prev_v)
     return (tensors, _effective_local(local, k.shape[1] + prev_length), *prepared)
 
 
@@ -679,7 +690,7 @@ def _call(function, kind, arguments):
     if not use_sm90:
         return _torch_group_softdelta(
             q, k, v, g, neg_q, prev_k, prev_v, q_segment_idx, k_segment_idx, resolved_scale, local,
-        )
+        ).flatten(3)
     needs_backward = torch.is_grad_enabled() and any(t is not None and t.requires_grad for t in tensors)
     varlen_plan, q_segment_idx, k_segment_idx = _varlen_route(
         q, k, v, g, neg_q, prev_k, arguments["bos_mask"], q_segment_idx, k_segment_idx, deterministic,
@@ -688,7 +699,7 @@ def _call(function, kind, arguments):
     return _GroupSoftDeltaFunc.apply(
         q, k, v, g, neg_q, prev_k, prev_v, q_segment_idx, k_segment_idx,
         resolved_scale, deterministic, level, varlen_plan, local,
-    )
+    ).flatten(3)
 
 
 def _call_fwd(function, kind, arguments):
@@ -709,7 +720,7 @@ def _call_fwd(function, kind, arguments):
         level, varlen_plan, local,
     )
     batch, length, q_heads, _ = q.shape
-    return y, readers.view(batch, length, k.shape[2] + q_heads, *v.shape[3:]), lse
+    return y.flatten(3), readers.view(batch, length, k.shape[2] + q_heads, -1), lse
 
 
 def _call_bwd(function, kind, arguments):
@@ -724,19 +735,20 @@ def _call_bwd(function, kind, arguments):
     deterministic, level = arguments["deterministic"], arguments["high_precision_level"]
     validate_backward_precision(level, readers, q)
     batch, length, q_heads, _ = q.shape
-    reader_heads = k.shape[2] + q_heads
+    reader_heads, value_dim = k.shape[2] + q_heads, arguments["v"].shape[-1]
     for name, tensor, shape, dtypes in (
-        ("y_grad", y_grad, (batch, length, q_heads, *v.shape[3:]), (q.dtype,)),
-        ("readers", readers, (batch, length, reader_heads, *v.shape[3:]), (q.dtype, torch.float32)),
+        ("y_grad", y_grad, (batch, length, q_heads, value_dim), (q.dtype,)),
+        ("readers", readers, (batch, length, reader_heads, value_dim), (q.dtype, torch.float32)),
         ("lse", lse, (batch, reader_heads, length), (torch.float32,)),
     ):
         if tuple(tensor.shape) != shape or tensor.device != q.device or tensor.dtype not in dtypes:
             raise ValueError(f"{function.__name__} {name} has incompatible shape, device, or dtype")
-    return _backward(
-        y_grad, q, k, v, g, neg_q, prev_k, prev_v, q_segment_idx, k_segment_idx,
-        readers.reshape(batch, length, reader_heads, -1).contiguous(), lse.contiguous(),
-        resolved_scale, deterministic, level, local,
+    dq, dk, dv, dg, dneg_q, dprev_k, dprev_v = _backward(
+        y_grad.unsqueeze(3), q, k, v, g, neg_q, prev_k, prev_v, q_segment_idx, k_segment_idx,
+        readers.contiguous(), lse.contiguous(), resolved_scale, deterministic, level, local,
     )
+    return (dq, dk, dv.flatten(3), dg.reshape(g.shape[:3]), dneg_q, dprev_k,
+            None if dprev_v is None else dprev_v.flatten(3))
 
 
 def group_softdelta_attention(
@@ -760,11 +772,12 @@ def group_softdelta_attention(
     """Run causal group SoftDelta attention with autograd.
 
     ``q`` is ``[B, Lq, H, D]``, ``k`` ``[B, Lkv, Hkv, D]``, ``v``
-    ``[B, Lkv, Hkv, C, Dg]`` and the gate logits ``g`` ``[B, Lq, H, C, 1]``,
-    with ``Lq <= Lkv`` and ``H % Hkv == 0``. Query ``i`` aligns to key
-    ``i + P + Lkv - Lq``, where ``P`` is the optional previous KV length.
+    ``[B, Lkv, Hkv, V]`` and ``g`` ``[B, Lq, H]`` the gate logits (before the
+    sigmoid; one scalar gate per query head and token), with ``Lq <= Lkv`` and
+    ``H % Hkv == 0``. Query ``i`` aligns to key ``i + P + Lkv - Lq``, where
+    ``P`` is the optional previous KV length.
 
-    The output ``y`` ``[B, Lq, H, C, Dg]`` is ``read - sigmoid(g) * neg_read``:
+    The output ``y`` ``[B, Lq, H, V]`` is ``read - sigmoid(g) * neg_read``:
     the query read ``read`` covers every visible key up to and including the
     aligned position with ``q``; the negative read ``neg_read`` covers only
     strictly earlier visible keys, once per KV head, with the negative query
@@ -804,7 +817,7 @@ def group_softdelta_attention_fwd(
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """Return ``(y, readers, lse)`` without an autograd graph (SM90).
 
-    ``readers`` ``[B, Lq, Hkv + H, C, Dg]`` holds the KV heads' negative reads,
+    ``readers`` ``[B, Lq, Hkv + H, V]`` holds the KV heads' negative reads,
     then the query heads' reads: FP32 when ``high_precision_level >= 1``,
     otherwise the input dtype, including under no_grad/inference mode. ``lse``
     ``[B, Hkv + H, Lq]`` (FP32) uses the same head order. Pass both, with the
@@ -1030,9 +1043,8 @@ def _varlen_route(q, k, v, g, neg_q, prev_k, bos_mask, q_segment_idx, k_segment_
                   high_precision_level, needs_backward, local=None):
     """``(varlen plan or None, q_segment_idx, k_segment_idx)`` for the fused causal forward.
 
-    Packed varlen forward from 64K tokens; below, the plan's host sync and extra launches cost more
-    than the segment forward loses (T4096 B8: segment 1.098x vs varlen 1.085x the Stage 3 FA3 path,
-    fwd+bwd). Local support reads BOS masks as segment ids.
+    Packed varlen forward from 64K tokens; below, the plan's host synchronization and extra launches
+    cost more than the segment forward loses. Local support reads BOS masks as segment ids.
     """
     if (local is not None or bos_mask is None or prev_k is not None or q.shape[1] != k.shape[1]
             or q.shape[0] * q.shape[1] < _VARLEN_MIN_TOKENS or _fused_ops(q, v, prev_k) is None):

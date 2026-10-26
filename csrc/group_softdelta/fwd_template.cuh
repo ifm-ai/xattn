@@ -70,7 +70,7 @@ void RunGroupSoftDeltaFwdSm90(AttentionFwdParams& params, cudaStream_t stream) {
   }
   if constexpr (!kHasSegment && Visibility::kKind == VisibilityKind::kSlidingChunk && kHeadDim == kHeadDimV &&
                 (kHeadDim == 64 || kHeadDim == 128)) {
-    // The causal NoState epilogue: 2% off the dense chunk forward at D = V = 128 (windows: no change).
+    // The causal NoState epilogue for dense chunks (dense windows keep the state epilogue).
     if (params.o_state_ptr == nullptr && params.use_fast_reciprocal) {
       RunAttentionFwdSm90KernelTile<
           kHeadDim, kHeadDimV, Element, Element, false, false, true,

@@ -3,6 +3,8 @@
 Run commands from the checkout root, after building xattn for the target GPU.
 The attention-family correctness modules cover causal attention, FlashSCA, FlashSWA,
 the three SoftDelta SM90 variants, and the three Group SoftDelta variants.
+Group SoftDelta exposes scalar gates; `tests/group_softdelta/test_value_groups.py`
+also covers its internal value-group layout (a gate per group of value channels).
 
 ```bash
 python -m pytest tests -q

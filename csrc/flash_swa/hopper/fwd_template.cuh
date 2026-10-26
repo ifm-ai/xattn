@@ -15,8 +15,8 @@ template <
     typename Visibility>
 void RunFlashSWAFwdSm90VD(
     AttentionFwdParams& params, cudaStream_t stream) {
-  // ex2.approx.ftz on every route (FA3 builds with fast math): it differs from
-  // exp2f only for results below 2^-126, which no output can resolve.
+  // ex2.approx.ftz on every route: it differs from exp2f only for results below
+  // 2^-126, which no output can resolve.
   static constexpr bool kUseFastExp2 = true;
   RunAttentionFwdSm90Kernel<
       kHeadDim, kHeadDimV, Element, ElementOut,

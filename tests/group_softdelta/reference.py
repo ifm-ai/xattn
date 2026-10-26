@@ -29,10 +29,18 @@ def group_softdelta_fp64_oracle(
     per-KV-head query over the strict past; every query head of the group
     subtracts its gated copy. ``visibility`` ("full", "window" or "chunk") and
     ``span`` select the SoftDelta oracle's support for both reads.
+
+    Scalar gates (the public layout: ``v`` ``[B, L, Hkv, V]``, ``g`` ``[B, Lq, H]``)
+    or the internal value groups (``v`` ``[B, L, Hkv, C, Dg]``, ``g``
+    ``[B, Lq, H, C, 1]``); the outputs follow the input layout.
     """
     tensors = (q, k, v, g) if neg_q is None else (q, k, v, g, neg_q)
     assert all(t.dtype == torch.float64 for t in tensors)
     assert (prev_k is None) == (prev_v is None)
+    scalar = v.dim() == 4
+    if scalar:
+        v, g = v.unsqueeze(3), g[..., None, None]
+        prev_v = None if prev_v is None else prev_v.unsqueeze(3)
     batch, length, q_heads, _ = q.shape
     if neg_q is None:
         neg_q = k[:, k.shape[1] - length:]
@@ -56,10 +64,8 @@ def group_softdelta_fp64_oracle(
     neg_read = neg_read.reshape(batch, length, kv_heads, 1, groups, group_dim)
     gate = torch.sigmoid(g).reshape(batch, length, kv_heads, rep, groups, 1)
     y = (read - gate * neg_read).reshape(batch, length, q_heads, groups, group_dim)
-    if return_aux:
-        return (
-            y,
-            read.reshape(batch, length, q_heads, groups, group_dim),
-            neg_read.reshape(batch, length, kv_heads, groups, group_dim),
-        )
-    return y
+    read = read.reshape(batch, length, q_heads, groups, group_dim)
+    neg_read = neg_read.reshape(batch, length, kv_heads, groups, group_dim)
+    if scalar:
+        y, read, neg_read = y.flatten(3), read.flatten(3), neg_read.flatten(3)
+    return (y, read, neg_read) if return_aux else y

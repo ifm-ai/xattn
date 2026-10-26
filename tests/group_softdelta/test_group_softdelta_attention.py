@@ -19,13 +19,13 @@ def _requires_sm90_extension():
         pytest.skip("Flash group SoftDelta requires SM90")
 
 
-def _inputs(*, batch, length, q_heads, kv_heads, qk_dim, groups, group_dim, dtype,
+def _inputs(*, batch, length, q_heads, kv_heads, qk_dim, value_dim, dtype,
             device="cuda", with_neg_q=False, q_length=None, prev_length=0):
     q_length = length if q_length is None else q_length
     q = torch.randn(batch, q_length, q_heads, qk_dim, dtype=dtype, device=device)
     k = torch.randn(batch, length, kv_heads, qk_dim, dtype=dtype, device=device)
-    v = torch.randn(batch, length, kv_heads, groups, group_dim, dtype=dtype, device=device)
-    g = torch.randn(batch, q_length, q_heads, groups, 1, dtype=dtype, device=device)
+    v = torch.randn(batch, length, kv_heads, value_dim, dtype=dtype, device=device)
+    g = torch.randn(batch, q_length, q_heads, dtype=dtype, device=device)
     neg_q = torch.randn(batch, q_length, kv_heads, qk_dim, dtype=dtype, device=device) if with_neg_q else None
     with torch.no_grad():
         q = F.normalize(q, dim=-1)
@@ -36,7 +36,7 @@ def _inputs(*, batch, length, q_heads, kv_heads, qk_dim, groups, group_dim, dtyp
     prev_k = prev_v = None
     if prev_length:
         prev_k = F.normalize(torch.randn(batch, prev_length, kv_heads, qk_dim, dtype=dtype, device=device), dim=-1)
-        prev_v = F.silu(torch.randn(batch, prev_length, kv_heads, groups, group_dim, dtype=dtype, device=device)) + 0.1
+        prev_v = F.silu(torch.randn(batch, prev_length, kv_heads, value_dim, dtype=dtype, device=device)) + 0.1
     return dict(q=q, k=k, v=v, g=g, neg_q=neg_q, prev_k=prev_k, prev_v=prev_v)
 
 
@@ -56,10 +56,12 @@ def _segments(batch, length, lengths, device="cuda"):
 def _assert_composed_close(actual, expected, read, neg_read, g, dtype):
     q_heads, kv_heads = read.shape[2], neg_read.shape[2]
     neg_read = neg_read.repeat_interleave(q_heads // kv_heads, dim=2)
+    gate = torch.sigmoid(g.double())
+    gate = gate if gate.dim() == read.dim() else gate[..., None]  # scalar gates [B, L, H]
     difference = (actual.double() - expected).abs()
     bound = (
         ATOL[dtype] + RTOL[dtype] * read.abs()
-        + torch.sigmoid(g.double()) * (ATOL[dtype] + RTOL[dtype] * neg_read.abs())
+        + gate * (ATOL[dtype] + RTOL[dtype] * neg_read.abs())
         + ATOL[dtype] + RTOL[dtype] * expected.abs()
     )
     normalized = difference / bound
@@ -152,7 +154,7 @@ def test_matches_fp64_oracle(case, heads, with_neg_q, dtype, deterministic, high
     spec = CASES[case]
     batch, length = 2, spec["length"]
     inputs = _inputs(batch=batch, length=length, q_heads=heads[0], kv_heads=heads[1], qk_dim=64,
-                     groups=2, group_dim=32, dtype=dtype, with_neg_q=with_neg_q)
+                     value_dim=64, dtype=dtype, with_neg_q=with_neg_q)
     metadata = {}
     if "segments" in spec:
         metadata["segment_idx"] = _segments(batch, length, spec["segments"])
@@ -169,7 +171,7 @@ def test_matches_fp64_oracle(case, heads, with_neg_q, dtype, deterministic, high
 def test_previous_kv(q_length, with_neg_q, dtype, deterministic, high_precision_level):
     _requires_sm90_extension()
     torch.manual_seed(7)
-    inputs = _inputs(batch=2, length=9, q_heads=4, kv_heads=2, qk_dim=64, groups=1, group_dim=64,
+    inputs = _inputs(batch=2, length=9, q_heads=4, kv_heads=2, qk_dim=64, value_dim=64,
                      dtype=dtype, with_neg_q=with_neg_q, q_length=q_length, prev_length=7)
     _check(inputs, dtype, deterministic=deterministic, high_precision_level=high_precision_level)
 
@@ -178,17 +180,17 @@ def test_previous_kv(q_length, with_neg_q, dtype, deterministic, high_precision_
 def test_torch_backend_matches_oracle(dtype):
     torch.manual_seed(3)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    inputs = _inputs(batch=2, length=33, q_heads=4, kv_heads=2, qk_dim=32, groups=2, group_dim=16,
+    inputs = _inputs(batch=2, length=33, q_heads=4, kv_heads=2, qk_dim=32, value_dim=32,
                      dtype=dtype, device=device, with_neg_q=True)
     _check(inputs, dtype, backend="torch",
            segment_idx=_segments(2, 33, (1, 9, 4, 30), device=device))
 
 
-def test_stage3_shape_bf16():
-    """The 1.3B Stage 3 layout: GQA 16/4, D = V = 128, packed documents."""
+def test_gqa16x4_d128_packed_bf16():
+    """GQA 16/4, D = V = 128, packed documents."""
     _requires_sm90_extension()
     torch.manual_seed(11)
-    inputs = _inputs(batch=1, length=320, q_heads=16, kv_heads=4, qk_dim=128, groups=1, group_dim=128,
+    inputs = _inputs(batch=1, length=320, q_heads=16, kv_heads=4, qk_dim=128, value_dim=128,
                      dtype=torch.bfloat16)
     _check(inputs, torch.bfloat16, segment_idx=_segments(1, 320, (100, 1, 150, 69)))
 
@@ -197,7 +199,7 @@ def test_stage3_shape_bf16():
 def test_gate_extremes(gate_value):
     _requires_sm90_extension()
     torch.manual_seed(5)
-    inputs = _inputs(batch=1, length=65, q_heads=4, kv_heads=2, qk_dim=64, groups=1, group_dim=64,
+    inputs = _inputs(batch=1, length=65, q_heads=4, kv_heads=2, qk_dim=64, value_dim=64,
                      dtype=torch.bfloat16)
     inputs["g"] = torch.full_like(inputs["g"], gate_value)
     _check(inputs, torch.bfloat16)
@@ -206,10 +208,10 @@ def test_gate_extremes(gate_value):
 def test_deterministic_backward_is_repeatable():
     _requires_sm90_extension()
     torch.manual_seed(9)
-    inputs = _inputs(batch=2, length=257, q_heads=8, kv_heads=2, qk_dim=64, groups=1, group_dim=64,
+    inputs = _inputs(batch=2, length=257, q_heads=8, kv_heads=2, qk_dim=64, value_dim=64,
                      dtype=torch.bfloat16)
     leaves = [inputs[n].detach().clone().requires_grad_(True) for n in ("q", "k", "v", "g")]
-    grad = torch.randn(2, 257, 8, 1, 64, dtype=torch.bfloat16, device="cuda")
+    grad = torch.randn(2, 257, 8, 64, dtype=torch.bfloat16, device="cuda")
     runs = []
     for _ in range(2):
         out = group_softdelta_attention(*leaves, deterministic=True)
@@ -219,7 +221,7 @@ def test_deterministic_backward_is_repeatable():
 
 
 def test_rejects_invalid_arguments():
-    inputs = _inputs(batch=1, length=8, q_heads=4, kv_heads=2, qk_dim=32, groups=1, group_dim=32,
+    inputs = _inputs(batch=1, length=8, q_heads=4, kv_heads=2, qk_dim=32, value_dim=32,
                      dtype=torch.bfloat16, device="cpu")
     q, k, v, g = inputs["q"], inputs["k"], inputs["v"], inputs["g"]
     with pytest.raises(ValueError, match="neg_q must have shape"):
@@ -228,6 +230,11 @@ def test_rejects_invalid_arguments():
         group_softdelta_attention(q[:, :, :3], k, v, g[:, :, :3])
     with pytest.raises(ValueError, match="g must have shape"):
         group_softdelta_attention(q, k, v, g[:, :, :2])
+    # Scalar gates only: the value-group layouts are not accepted.
+    with pytest.raises(ValueError, match="4D q/k/v"):
+        group_softdelta_attention(q, k, v.unsqueeze(3), g)
+    with pytest.raises(ValueError, match="g must have shape"):
+        group_softdelta_attention(q, k, v, g[..., None, None])
     with pytest.raises(ValueError, match="finite"):
         group_softdelta_attention(q, k, v, g, scale=float("nan"))
     with pytest.raises(ValueError, match="SM90"):
@@ -253,40 +260,40 @@ FUSED_CASES = {
 @pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16), ids=("fp16", "bf16"))
 @pytest.mark.parametrize("deterministic,high_precision_level", ((False, 0), (True, 1)), ids=("level0", "det-level1"))
 def test_fused_bucket_matches_fp64_oracle(case, heads, with_neg_q, dtype, deterministic, high_precision_level):
-    """D = V = 128 (the Stage 3 shape) across head mappings, deterministic mode on the composition."""
+    """D = V = 128 across head mappings, deterministic mode on the composition."""
     _requires_sm90_extension()
     torch.manual_seed(20261021)
     spec = FUSED_CASES[case]
     batch, length = 2, spec["length"]
     inputs = _inputs(batch=batch, length=length, q_heads=heads[0], kv_heads=heads[1], qk_dim=128,
-                     groups=1, group_dim=128, dtype=dtype, with_neg_q=with_neg_q)
+                     value_dim=128, dtype=dtype, with_neg_q=with_neg_q)
     metadata = {}
     if "segments" in spec:
         metadata["segment_idx"] = _segments(batch, length, spec["segments"])
     _check(inputs, dtype, deterministic=deterministic, high_precision_level=high_precision_level, **metadata)
 
 
-# (D, groups, group_dim) across the fused (D, V) buckets: exact buckets, dims rounded up to a bucket, the
+# (D, V) across the fused buckets: exact buckets, dims rounded up to a bucket, the
 # dense forward full-span tiles ((32, 64), (192, 128), (256, 32)) and the dense backward square remaps
 # ((64, 96) -> (96, 96); (160, 128), (152, 136) -> (160, 160), (192, 128), (192, 160) -> (192, 192);
 # (128, 256), (256, 128) -> (256, 256)).
 FUSED_DIMS = {
-    "d32v32": (32, 1, 32),
-    "d32v64": (32, 1, 64),
-    "d40v56": (40, 1, 56),
-    "d64v96": (64, 1, 96),
-    "d80v72": (80, 1, 72),
-    "d128v64": (128, 2, 32),
-    "d152v136": (152, 1, 136),
-    "d160v128": (160, 1, 128),
-    "d192v128": (192, 1, 128),
-    "d192v160": (192, 1, 160),
-    "d192v192": (192, 3, 64),
-    "d128v256": (128, 2, 128),
-    "d256v32": (256, 1, 32),
-    "d256v128": (256, 1, 128),
-    "d256v256": (256, 1, 256),
-    "d64v256": (64, 4, 64),
+    "d32v32": (32, 32),
+    "d32v64": (32, 64),
+    "d40v56": (40, 56),
+    "d64v96": (64, 96),
+    "d80v72": (80, 72),
+    "d128v64": (128, 64),
+    "d152v136": (152, 136),
+    "d160v128": (160, 128),
+    "d192v128": (192, 128),
+    "d192v160": (192, 160),
+    "d192v192": (192, 192),
+    "d128v256": (128, 256),
+    "d256v32": (256, 32),
+    "d256v128": (256, 128),
+    "d256v256": (256, 256),
+    "d64v256": (64, 256),
 }
 
 
@@ -299,11 +306,11 @@ def test_fused_dims_match_fp64_oracle(dims, case, with_neg_q, dtype, high_precis
     """Every D, V <= 256 takes the fused SM90 reads (bucketed like causal_flash_attn)."""
     _requires_sm90_extension()
     torch.manual_seed(20261023)
-    qk_dim, groups, group_dim = FUSED_DIMS[dims]
+    qk_dim, value_dim = FUSED_DIMS[dims]
     spec = FUSED_CASES[case]
     batch, length = 2, spec["length"]
     inputs = _inputs(batch=batch, length=length, q_heads=8, kv_heads=2, qk_dim=qk_dim,
-                     groups=groups, group_dim=group_dim, dtype=dtype, with_neg_q=with_neg_q)
+                     value_dim=value_dim, dtype=dtype, with_neg_q=with_neg_q)
     metadata = {}
     if "segments" in spec:
         metadata["segment_idx"] = _segments(batch, length, spec["segments"])
@@ -325,7 +332,7 @@ def test_fused_reader_groups_match_fp64_oracle(monkeypatch, case, heads, with_ne
     spec = FUSED_CASES[case]
     batch, length = 2, spec["length"]
     inputs = _inputs(batch=batch, length=length, q_heads=heads[0], kv_heads=heads[1], qk_dim=128,
-                     groups=1, group_dim=128, dtype=dtype, with_neg_q=with_neg_q)
+                     value_dim=128, dtype=dtype, with_neg_q=with_neg_q)
     metadata = {}
     if "segments" in spec:
         metadata["segment_idx"] = _segments(batch, length, spec["segments"])
@@ -341,11 +348,11 @@ def test_fused_reader_groups_dims_match_fp64_oracle(monkeypatch, dims, case, wit
     _requires_sm90_extension()
     monkeypatch.setattr(importlib.import_module("xattn.ops.group_softdelta_attention"), "_BWD_READER_GROUPS", 1)
     torch.manual_seed(20261027)
-    qk_dim, groups, group_dim = FUSED_DIMS[dims]
+    qk_dim, value_dim = FUSED_DIMS[dims]
     spec = FUSED_CASES[case]
     batch, length = 2, spec["length"]
     inputs = _inputs(batch=batch, length=length, q_heads=4, kv_heads=4, qk_dim=qk_dim,
-                     groups=groups, group_dim=group_dim, dtype=dtype, with_neg_q=with_neg_q)
+                     value_dim=value_dim, dtype=dtype, with_neg_q=with_neg_q)
     metadata = {}
     if "segments" in spec:
         metadata["segment_idx"] = _segments(batch, length, spec["segments"])
@@ -361,7 +368,7 @@ def test_fused_mha_automatic_layout_matches_fp64_oracle(with_neg_q, segments):
     torch.manual_seed(20261028)
     batch, length, heads = (8, 2048, 8) if segments else (2, 2048, 8)
     inputs = _inputs(batch=batch, length=length, q_heads=heads, kv_heads=heads, qk_dim=128,
-                     groups=1, group_dim=128, dtype=torch.bfloat16, with_neg_q=with_neg_q)
+                     value_dim=128, dtype=torch.bfloat16, with_neg_q=with_neg_q)
     metadata = {"segment_idx": _segments(batch, length, (700, 1, 1300, 64))} if segments else {}
     _check(inputs, torch.bfloat16, **metadata)
 
@@ -371,9 +378,9 @@ def _bos_mask(batch, length, lengths):
     return ids.diff(dim=1, prepend=torch.full((batch, 1), -1, dtype=torch.int64, device="cuda")) != 0
 
 
-# (D, groups, group_dim) for the packed (BOS) route.
-BOS_DIMS = {"d128v128": (128, 1, 128), "d64v96": (64, 1, 96), "d40v56": (40, 1, 56),
-            "d256v256": (256, 1, 256), "d192v192": (192, 3, 64), "d128v64": (128, 2, 32)}
+# (D, V) for the packed (BOS) route.
+BOS_DIMS = {"d128v128": (128, 128), "d64v96": (64, 96), "d40v56": (40, 56),
+            "d256v256": (256, 256), "d192v192": (192, 192), "d128v64": (128, 64)}
 
 
 @pytest.mark.parametrize("dims", list(BOS_DIMS), ids=list(BOS_DIMS))
@@ -390,10 +397,10 @@ def test_fused_bos_varlen_forward_matches_fp64_oracle(monkeypatch, dims, heads, 
     monkeypatch.setattr(module, "select_flash_swa_bos_routes", lambda *args, **kwargs: (True, True))
     monkeypatch.setattr(module, "_VARLEN_MIN_TOKENS", 0)
     torch.manual_seed(20261024)
-    qk_dim, groups, group_dim = BOS_DIMS[dims]
+    qk_dim, value_dim = BOS_DIMS[dims]
     batch, length = 2, 300
     inputs = _inputs(batch=batch, length=length, q_heads=heads[0], kv_heads=heads[1], qk_dim=qk_dim,
-                     groups=groups, group_dim=group_dim, dtype=dtype, with_neg_q=with_neg_q)
+                     value_dim=value_dim, dtype=dtype, with_neg_q=with_neg_q)
     _check(inputs, dtype, deterministic=deterministic, high_precision_level=high_precision_level,
            bos_mask=_bos_mask(batch, length, (1, 2, 130, 3, 64, 7)))
 
@@ -411,26 +418,15 @@ def test_fused_bos_routes_match_fp64_oracle(monkeypatch, case, dtype):
     torch.manual_seed(20261025)
     batch, length = 2, 300
     inputs = _inputs(batch=batch, length=length, q_heads=16, kv_heads=4, qk_dim=128,
-                     groups=1, group_dim=128, dtype=dtype, with_neg_q=False)
+                     value_dim=128, dtype=dtype, with_neg_q=False)
     _check(inputs, dtype, bos_mask=_bos_mask(batch, length, BOS_CASES[case]))
-
-
-@pytest.mark.parametrize("heads", ((8, 2), (16, 1)), ids=("h8kv2", "h16kv1"))
-@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16), ids=("fp16", "bf16"))
-def test_fused_gate_groups_match_fp64_oracle(heads, dtype):
-    """Several value groups (segmented gate-gradient sums) on the fused bucket."""
-    _requires_sm90_extension()
-    torch.manual_seed(20261022)
-    inputs = _inputs(batch=2, length=150, q_heads=heads[0], kv_heads=heads[1], qk_dim=128,
-                     groups=2, group_dim=64, dtype=dtype)
-    _check(inputs, dtype)
 
 
 def test_output_flattens_without_copy_semantics_issues():
     """The fused path may return a strided view; downstream reshapes and in-graph use must behave."""
     _requires_sm90_extension()
     torch.manual_seed(13)
-    inputs = _inputs(batch=2, length=130, q_heads=8, kv_heads=2, qk_dim=128, groups=1, group_dim=128,
+    inputs = _inputs(batch=2, length=130, q_heads=8, kv_heads=2, qk_dim=128, value_dim=128,
                      dtype=torch.bfloat16)
     leaves = {n: inputs[n].detach().clone().requires_grad_(True) for n in ("q", "k", "v", "g")}
     out = group_softdelta_attention(**leaves)
@@ -461,10 +457,9 @@ def test_large_batch_matches_chunked(case, with_neg_q):
     torch.manual_seed(29)
     batch, chunks = spec["batch"], spec["chunks"]
     inputs = _inputs(batch=batch, length=spec["length"], q_heads=spec["heads"][0], kv_heads=spec["heads"][1],
-                     qk_dim=128, groups=1, group_dim=128, dtype=torch.bfloat16, with_neg_q=with_neg_q)
+                     qk_dim=128, value_dim=128, dtype=torch.bfloat16, with_neg_q=with_neg_q)
     names = [n for n in ("q", "k", "v", "g", "neg_q") if inputs[n] is not None]
-    y_grad = torch.randn(batch, spec["length"], spec["heads"][0], 1, 128, device="cuda",
-                              dtype=torch.bfloat16)
+    y_grad = torch.randn(batch, spec["length"], spec["heads"][0], 128, device="cuda", dtype=torch.bfloat16)
 
     def run(rows):
         leaves = {n: inputs[n][rows].detach().clone().requires_grad_(True) for n in names}
@@ -498,7 +493,7 @@ def test_precision_levels_match_fp64_oracle(case, heads, with_neg_q, dtype, dete
     spec = CASES[case]
     batch, length = 2, spec["length"]
     inputs = _inputs(batch=batch, length=length, q_heads=heads[0], kv_heads=heads[1], qk_dim=64,
-                     groups=2, group_dim=32, dtype=dtype, with_neg_q=with_neg_q)
+                     value_dim=64, dtype=dtype, with_neg_q=with_neg_q)
     metadata = {}
     if "segments" in spec:
         metadata["segment_idx"] = _segments(batch, length, spec["segments"])
@@ -515,10 +510,10 @@ def test_precision_levels_dims_match_fp64_oracle(dims, with_neg_q, dtype, high_p
     """Levels 2-4 across the fused (D, V) buckets (fused forward state, precision backward)."""
     _requires_sm90_extension()
     torch.manual_seed(20261102)
-    qk_dim, groups, group_dim = FUSED_DIMS[dims]
+    qk_dim, value_dim = FUSED_DIMS[dims]
     batch, length = 2, 300
     inputs = _inputs(batch=batch, length=length, q_heads=8, kv_heads=2, qk_dim=qk_dim,
-                     groups=groups, group_dim=group_dim, dtype=dtype, with_neg_q=with_neg_q)
+                     value_dim=value_dim, dtype=dtype, with_neg_q=with_neg_q)
     _check(inputs, dtype, high_precision_level=high_precision_level,
            segment_idx=_segments(batch, length, FUSED_CASES["segments"]["segments"]))
 
@@ -535,21 +530,20 @@ def test_short_query_matches_fp64_oracle(q_length, segments, with_neg_q, dtype, 
     _requires_sm90_extension()
     torch.manual_seed(20261103)
     batch, length = 2, 150
-    inputs = _inputs(batch=batch, length=length, q_heads=8, kv_heads=2, qk_dim=128, groups=1, group_dim=128,
+    inputs = _inputs(batch=batch, length=length, q_heads=8, kv_heads=2, qk_dim=128, value_dim=128,
                      dtype=dtype, with_neg_q=with_neg_q, q_length=q_length)
     metadata = {"segment_idx": _segments(batch, length, (1, 2, 40, 3, 64, 7))} if segments else {}
     _check(inputs, dtype, deterministic=deterministic, high_precision_level=high_precision_level, **metadata)
 
 
 # Standalone fwd / bwd cases: fused forward (dense, segments, BOS, short Q) and the composition (previous
-# K/V, gate groups whose width is not a multiple of 8).
+# K/V).
 STANDALONE_CASES = {
     "dense": dict(length=150),
     "segments": dict(length=150, segments=(1, 2, 40, 3, 64, 7)),
     "bos": dict(length=150, bos=(5, 1, 70, 2)),
     "short-q": dict(length=150, q_length=61),
     "previous": dict(length=40, prev_length=33),
-    "composed-groups": dict(length=70, groups=4, group_dim=12),
 }
 
 
@@ -566,9 +560,9 @@ def test_standalone_fwd_bwd_match_fp64_oracle(case, with_neg_q, dtype, determini
     spec = STANDALONE_CASES[case]
     batch, length = 2, spec["length"]
     q_heads, kv_heads = 8, 2
-    groups, group_dim = spec.get("groups", 2), spec.get("group_dim", 32)
-    inputs = _inputs(batch=batch, length=length, q_heads=q_heads, kv_heads=kv_heads, qk_dim=64, groups=groups,
-                     group_dim=group_dim, dtype=dtype, with_neg_q=with_neg_q, q_length=spec.get("q_length"),
+    value_dim = 64
+    inputs = _inputs(batch=batch, length=length, q_heads=q_heads, kv_heads=kv_heads, qk_dim=64, value_dim=value_dim,
+                     dtype=dtype, with_neg_q=with_neg_q, q_length=spec.get("q_length"),
                      prev_length=spec.get("prev_length", 0))
     total = length + spec.get("prev_length", 0)
     metadata = {}
@@ -584,7 +578,7 @@ def test_standalone_fwd_bwd_match_fp64_oracle(case, with_neg_q, dtype, determini
     with torch.inference_mode():
         y, readers, lse = group_softdelta_attention_fwd(*base, **options)
     q_length = tensors["q"].shape[1]
-    assert readers.shape == (batch, q_length, kv_heads + q_heads, groups, group_dim)
+    assert readers.shape == (batch, q_length, kv_heads + q_heads, value_dim)
     assert readers.dtype == (torch.float32 if high_precision_level else dtype)
     assert lse.shape == (batch, kv_heads + q_heads, q_length) and lse.dtype == torch.float32
     expected, read, neg_read, expected_inputs = _oracle(tensors, metadata)
@@ -621,7 +615,7 @@ def test_nonpositive_scale_matches_fp64_oracle(scale, q_length, with_neg_q, high
     _requires_sm90_extension()
     torch.manual_seed(20261106)
     dtype = torch.bfloat16
-    inputs = _inputs(batch=2, length=150, q_heads=8, kv_heads=2, qk_dim=64, groups=2, group_dim=32,
+    inputs = _inputs(batch=2, length=150, q_heads=8, kv_heads=2, qk_dim=64, value_dim=64,
                      dtype=dtype, with_neg_q=with_neg_q, q_length=q_length)
     _check(inputs, dtype, high_precision_level=high_precision_level, scale=scale)
     names = [n for n in ("q", "k", "v", "g", "neg_q") if inputs[n] is not None]
@@ -644,7 +638,7 @@ def test_nonpositive_scale_matches_fp64_oracle(scale, q_length, with_neg_q, high
 def test_standalone_rejects_mismatched_state():
     _requires_sm90_extension()
     torch.manual_seed(20261105)
-    inputs = _inputs(batch=1, length=64, q_heads=4, kv_heads=2, qk_dim=64, groups=1, group_dim=64,
+    inputs = _inputs(batch=1, length=64, q_heads=4, kv_heads=2, qk_dim=64, value_dim=64,
                      dtype=torch.bfloat16)
     base = (inputs["q"], inputs["k"], inputs["v"], inputs["g"])
     y, readers, lse = group_softdelta_attention_fwd(*base, high_precision_level=1)
@@ -700,8 +694,8 @@ def test_negative_query_sources_match_fp64_oracle(source, heads, dtype, determin
     leaves = {
         "q_pre": F.normalize(torch.randn(batch, length, q_heads, dim, device="cuda"), dim=-1),
         "k_pre": F.normalize(torch.randn(batch, length, kv_heads, dim, device="cuda"), dim=-1),
-        "v": F.silu(torch.randn(batch, length, kv_heads, 1, 64, device="cuda")) + 0.1,
-        "g": torch.randn(batch, length, q_heads, 1, 1, device="cuda") * 0.75,
+        "v": F.silu(torch.randn(batch, length, kv_heads, 64, device="cuda")) + 0.1,
+        "g": torch.randn(batch, length, q_heads, device="cuda") * 0.75,
     }
     if source == "second-query":
         leaves["q2_pre"] = F.normalize(torch.randn(batch, length, kv_heads, dim, device="cuda"), dim=-1)
@@ -758,8 +752,8 @@ def test_input_views_match_fp64_oracle(layout, dtype, high_precision_level):
         q, k, neg_q = packed[:, :, :q_heads], packed[:, :, q_heads:q_heads + kv_heads], packed[:, :, -kv_heads:]
     else:
         (_, q), (_, k), (_, neg_q) = make(q_heads), make(kv_heads), make(kv_heads)
-    v = (F.silu(torch.randn(batch, length, kv_heads, 1, 64, device="cuda", dtype=dtype)) + 0.1).requires_grad_(True)
-    g = (torch.randn(batch, length, q_heads, 1, 1, device="cuda", dtype=dtype) * 0.75).requires_grad_(True)
+    v = (F.silu(torch.randn(batch, length, kv_heads, 64, device="cuda", dtype=dtype)) + 0.1).requires_grad_(True)
+    g = (torch.randn(batch, length, q_heads, device="cuda", dtype=dtype) * 0.75).requires_grad_(True)
     metadata = {"segment_idx": _segments(batch, length, (1, 2, 40, 3, 64, 7))}
     actual = group_softdelta_attention(q, k, v, g, neg_q=neg_q, high_precision_level=high_precision_level,
                                        **metadata)

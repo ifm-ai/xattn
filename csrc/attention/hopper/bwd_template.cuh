@@ -487,8 +487,7 @@ void RunAttentionBwdSm90Kernel(
   static constexpr bool Varlen = kVarlen;
   static constexpr int kMaxHeadDim = kHeadDim > kHeadDimV ? kHeadDim : kHeadDimV;
   // 128-row tiles for narrow Q/K; with V > 64 only dense rows keep them:
-  // segment and varlen rows spill registers there (D64/V128 at BM 64:
-  // segment 8.9 -> 1.3 ms, deterministic varlen 2.65 -> 1.89 ms).
+  // segment and varlen rows spill registers there.
   static constexpr bool UseLargeBlockM =
       kHeadDim <= 64 && kHeadDimV <= 128 &&
       (kHeadDimV <= 64 || (!kHasSegment && !kVarlen));

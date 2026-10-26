@@ -2,8 +2,8 @@
 
 Forward and backward use separate thresholds for run lengths, attention
 visibility, head sharing, and determinism. The core decisions are trees fitted
-on a 2026-10-21 timing grid of both routes; the earlier rules remain for the
-measured exceptions.
+to timings of both routes; the run-length rules cover the cases they route
+better.
 """
 from typing import Optional, Tuple
 
@@ -63,9 +63,8 @@ def _select_routes(
                 return (True, True)
             else:
                 return (True, False) if needs_backward else (True, True)
-    # Rules before the 2026-10-21 refit (short runs, then the general tree); used for the measured
-    # exceptions below.
-    def _previous_routes():
+    # Run-length rules: short runs, then the general rules.
+    def _rule_routes():
         if tokens <= 256 * num_runs:
             fwd, bwd = _short_run_routes(
                 tokens, num_runs, max_seqlen, d, value_dim, heads, kv_heads, span,
@@ -81,8 +80,8 @@ def _select_routes(
             tokens, num_runs, max_seqlen, d, value_dim, batch, heads, kv_heads,
             span, full_visibility, deterministic, needs_backward)
 
-    # Route trees fitted on the 2026-10-21 timing grid (6432 cases + 768 with previous K/V): forward and
-    # nondeterministic / deterministic backward from run statistics, dims, heads, visibility, previous K/V.
+    # Route trees for the forward and the nondeterministic / deterministic backward from run statistics,
+    # dims, heads, visibility and previous K/V.
     mean = tokens / num_runs
     x = dict(mean=mean, skew=max(1.0, max_seqlen / mean), tokens=tokens, d=d, value_dim=value_dim,
              wide_v=value_dim > d, head_ratio=heads / kv_heads, sliding_chunk=sliding_chunk,
@@ -92,14 +91,14 @@ def _select_routes(
     if not needs_backward:
         return fwd, fwd
     if not deterministic and d <= 64 and value_dim > 192:
-        # Measured exception: the previous rules route narrow Q/K with V > 192 better.
-        return fwd, _previous_routes()[1]
+        # Narrow Q/K with V > 192: the run-length rules route better.
+        return fwd, _rule_routes()[1]
     if deterministic:
-        # Deterministic backward: the fitted tree for the buckets (and head ratios <= 8) where it is
-        # measured clearly better, the previous rules elsewhere (it does not generalize across D/V, heads).
+        # Deterministic backward: the tree for the buckets (and head ratios <= 8) where it routes better,
+        # the run-length rules elsewhere.
         if heads <= 8 * kv_heads and (_dim_bucket(d), _dim_bucket(value_dim)) in _DET_TREE_BUCKETS:
             return fwd, _route_bwd_det(**x)
-        return fwd, _previous_routes()[1]
+        return fwd, _rule_routes()[1]
     return fwd, _route_bwd(**x)
 
 
@@ -151,7 +150,7 @@ def _route_bwd(mean, skew, tokens, d, value_dim, wide_v, head_ratio, sliding_chu
             if not has_previous:
                 return False
             return True
-        # Long runs: varlen only up to 32K tokens (segment ids win from 64K tokens, measured).
+        # Long runs: varlen only up to 32K tokens; segment ids are faster beyond.
         if mean <= 512 or tokens > 32768:
             return False
         return not softdelta
