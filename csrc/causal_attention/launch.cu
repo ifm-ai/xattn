@@ -83,8 +83,8 @@ torch::Tensor EmptyLastDimLike(
 }
 
 // Views whose rows TMA can address (unit last-dim stride, 16-byte aligned base
-// and strides) are read in place, e.g. one SoftDelta reader's q[:, :, i::2];
-// other layouts are made contiguous.
+// and strides) are read in place, e.g. a head slice of a larger tensor; other
+// layouts are made contiguous.
 torch::Tensor TmaReadable(const torch::Tensor& tensor) {
   bool readable = tensor.stride(-1) == 1 &&
       reinterpret_cast<std::uintptr_t>(tensor.data_ptr()) % 16 == 0;
@@ -131,10 +131,8 @@ void CheckBackwardTensors(
       "Causal attention SM90 y_grad and y must be 4D tensors");
   TORCH_CHECK(
       y_grad.scalar_type() == q.scalar_type() &&
-          (y.scalar_type() == q.scalar_type() ||
-           y.scalar_type() == at::kFloat),
-      "Causal attention SM90 y_grad dtype must match q and y must either match "
-      "q or be the float32 backward output state");
+          y.scalar_type() == q.scalar_type(),
+      "Causal attention SM90 y_grad and y dtypes must match q");
   TORCH_CHECK(
       y_grad.sizes() == y.sizes(),
       "Causal attention SM90 y_grad and y shapes must match");
@@ -201,10 +199,8 @@ void CheckVarlenBackwardTensors(
       "Causal attention SM90 varlen y_grad/y must be packed 3D tensors");
   TORCH_CHECK(
       y_grad.scalar_type() == q.scalar_type() &&
-          (y.scalar_type() == q.scalar_type() ||
-           y.scalar_type() == at::kFloat),
-      "Causal attention SM90 varlen y_grad dtype must match q and y must either "
-      "match q or be the float32 backward output state");
+          y.scalar_type() == q.scalar_type(),
+      "Causal attention SM90 varlen y_grad and y dtypes must match q");
   TORCH_CHECK(
       y_grad.sizes() == y.sizes() &&
           y_grad.size(0) == q.size(0) &&
@@ -231,7 +227,6 @@ void FillFwdParams(
   params.k_ptr = k.data_ptr();
   params.v_ptr = v.data_ptr();
   params.o_ptr = y.data_ptr();
-  params.output_fp32 = y.scalar_type() == at::kFloat;
   if (output_state.has_value()) {
     const torch::Tensor& state = output_state.value();
     params.o_state_ptr = state.data_ptr<float>();
@@ -292,7 +287,6 @@ void FillBwdParams(
     torch::Tensor& dk, torch::Tensor& dv,
     const int64_t* q_segment_idx, const int64_t* k_segment_idx,
     int64_t k_segment_len, int window_size_right,
-    int odd_head_window_right_delta,
     AttentionBwdParams& params) {
   std::memset(&params, 0, sizeof(params));
 
@@ -301,7 +295,6 @@ void FillBwdParams(
   params.v_ptr = v.data_ptr();
   params.dy_ptr = dy.data_ptr();
   params.y_ptr = y.data_ptr();
-  params.y_is_fp32 = y.scalar_type() == at::kFloat;
   params.lse_ptr = lse.data_ptr<float>();
   params.dq_ptr = dq.data_ptr();
   params.dk_ptr = dk.data_ptr();
@@ -348,7 +341,6 @@ void FillBwdParams(
   params.scale_softmax = scale;
   params.window_size_left = static_cast<int>(window_size);
   params.window_size_right = window_size_right;
-  params.odd_head_window_right_delta = odd_head_window_right_delta;
   params.attention_chunk = 0;
   params.q_segment_idx = q_segment_idx;
   params.k_segment_idx = k_segment_idx;
@@ -379,7 +371,6 @@ void FillVarlenFwdParams(
   params.k_ptr = k.data_ptr();
   params.v_ptr = v.data_ptr();
   params.o_ptr = y.data_ptr();
-  params.output_fp32 = y.scalar_type() == at::kFloat;
   if (output_state.has_value()) {
     const torch::Tensor& state = output_state.value();
     params.o_state_ptr = state.data_ptr<float>();
@@ -449,7 +440,6 @@ void FillVarlenBwdParams(
   params.v_ptr = v.data_ptr();
   params.dy_ptr = dy.data_ptr();
   params.y_ptr = y.data_ptr();
-  params.y_is_fp32 = y.scalar_type() == at::kFloat;
   params.lse_ptr = lse.data_ptr<float>();
   params.dq_ptr = dq.data_ptr();
   params.dk_ptr = dk.data_ptr();
@@ -803,8 +793,7 @@ void DispatchCausalFlashAttnBwd(
       (params.d == 160 && params.dv == 128) ||
       (params.d == 160 && params.dv == 160);
   const int mixed_square_dim =
-      params.seqlen_q == params.seqlen_k &&
-              params.odd_head_window_right_delta == 0
+      params.seqlen_q == params.seqlen_k
           ? CausalFlashAttnBwdMixedSquareDim(params.d, params.dv, deterministic)
           : 0;
   // Deterministic short-Q GQA uses BN48 for the D192 shared-memory budget.
@@ -846,11 +835,11 @@ void DispatchCausalFlashAttnBwd(
 bool UseNativeWindow160Bwd(
     int d, int dv, int batch, int length_q, int length_k,
     int heads_q, int heads_k, int window_left, int window_right,
-    int odd_head_delta, bool deterministic) {
+    bool deterministic) {
   return !deterministic && d == 160 && dv == 160 && batch == 1 &&
       length_q == length_k && length_q >= 4096 && heads_q == 8 &&
       (heads_k == 1 || heads_k == 2) && window_left == 255 &&
-      window_right == 0 && odd_head_delta == 0;
+      window_right == 0;
 }
 
 template <typename Element>
@@ -861,7 +850,7 @@ void DispatchBwd(
   const bool native_window160 = dense && UseNativeWindow160Bwd(
       params.d, params.dv, params.b, params.seqlen_q, params.seqlen_k,
       params.h, params.h_k, params.window_size_left, params.window_size_right,
-      params.odd_head_window_right_delta, deterministic);
+      deterministic);
   const bool use_d192 =
       dense && !native_window160 &&
       ((params.d == 192 && params.dv == 128) ||
@@ -1044,7 +1033,7 @@ std::tuple<torch::Tensor, torch::Tensor> CausalAttentionSM90Fwd(
     const c10::optional<torch::Tensor>& k_segment_idx,
     bool strict_past,
     const c10::optional<torch::Tensor>& output_state,
-    bool causal_flash_attn, bool use_fast_reciprocal, bool output_fp32) {
+    bool causal_flash_attn, bool use_fast_reciprocal, bool high_precision) {
   const int arch = CurrentDeviceArch(q);
   TORCH_CHECK(
       arch == 90, "Causal attention SM90 FWD requires Hopper sm90, got sm",
@@ -1097,8 +1086,6 @@ std::tuple<torch::Tensor, torch::Tensor> CausalAttentionSM90Fwd(
   const int64_t L = q.size(1);
   const int64_t H = q.size(2);
   const int64_t V = v.size(3);
-  TORCH_CHECK(!output_fp32 || !output_state.has_value(),
-              "FP32-only output and output_state are mutually exclusive");
   if (output_state.has_value()) {
     const torch::Tensor& state = output_state.value();
     TORCH_CHECK(
@@ -1111,8 +1098,7 @@ std::tuple<torch::Tensor, torch::Tensor> CausalAttentionSM90Fwd(
   }
   torch::Tensor y = torch::empty(
       {B, L, H, V},
-      v.options().dtype(output_fp32 ? at::kFloat : v.scalar_type())
-          .memory_format(at::MemoryFormat::Contiguous));
+      v.options().memory_format(at::MemoryFormat::Contiguous));
   torch::Tensor lse = torch::empty(
       {B, H, L},
       q.options().dtype(at::kFloat).memory_format(
@@ -1125,6 +1111,7 @@ std::tuple<torch::Tensor, torch::Tensor> CausalAttentionSM90Fwd(
       q_segment_idx_data, k_segment_idx_data, k_segment_len,
       strict_past ? -1 : 0, params);
   params.use_fast_reciprocal = use_fast_reciprocal;
+  params.high_precision = high_precision;
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   const bool use_full_visibility =
       causal_flash_attn && !segment_metadata.enabled();
@@ -1257,7 +1244,7 @@ void AttentionSM90FwdInto(
 std::tuple<
     torch::Tensor, torch::Tensor, torch::Tensor,
     c10::optional<torch::Tensor>, c10::optional<torch::Tensor>>
-CausalAttentionSM90BwdWithHeadBoundary(
+CausalAttentionSM90Bwd(
     const torch::Tensor& y_grad, const torch::Tensor& q,
     const torch::Tensor& k, const torch::Tensor& v,
     const torch::Tensor& y, const torch::Tensor& lse,
@@ -1266,25 +1253,19 @@ CausalAttentionSM90BwdWithHeadBoundary(
     const c10::optional<torch::Tensor>& prev_v,
     const c10::optional<torch::Tensor>& q_segment_idx,
     const c10::optional<torch::Tensor>& k_segment_idx,
-    bool deterministic, bool strict_past,
-    int odd_head_window_right_delta, bool causal_flash_attn) {
+    bool deterministic, bool strict_past, bool causal_flash_attn,
+    bool fp32_kv_grads) {
   const int arch = CurrentDeviceArch(q);
   TORCH_CHECK(
       arch == 90, "Causal attention SM90 BWD requires Hopper sm90, got sm",
       arch);
   TORCH_CHECK(
+      !fp32_kv_grads || q.size(2) != k.size(2),
+      "Causal attention FP32 dK / dV gradients need grouped query heads");
+  TORCH_CHECK(
       window_size >= 0 &&
           window_size <= std::numeric_limits<int>::max(),
       "Causal attention SM90 BWD window_size must fit int32");
-  TORCH_CHECK(
-      odd_head_window_right_delta == 0 ||
-          odd_head_window_right_delta == -1,
-      "Causal attention SM90 BWD odd-head boundary delta must be 0 or -1");
-  TORCH_CHECK(
-      odd_head_window_right_delta == 0 ||
-          (!strict_past && q.size(2) % 2 == 0),
-      "Causal attention SM90 BWD odd-head boundary mode requires inclusive "
-      "base semantics and interleaved head pairs");
   TORCH_CHECK(
       prev_k.has_value() == prev_v.has_value(),
       "Causal attention prev_k and prev_v must both be provided or both be None");
@@ -1344,7 +1325,7 @@ CausalAttentionSM90BwdWithHeadBoundary(
   // Use runtime dimensions whenever their static alignment permits it.
   // Sequence length does not select the padding strategy.
   const bool use_runtime_head_dims =
-      use_full_visibility && !has_prev && odd_head_window_right_delta == 0 &&
+      use_full_visibility && !has_prev &&
       bucket_dim_qk == bucket_dim_v &&
       (bucket_dim_qk == 64 || bucket_dim_qk == 128) &&
       D % 8 == 0 && V % 8 == 0;
@@ -1369,8 +1350,7 @@ CausalAttentionSM90BwdWithHeadBoundary(
   const bool native_window160 = dense && !use_full_visibility &&
       UseNativeWindow160Bwd(
           kernel_d, kernel_v, q.size(0), q.size(1), k_c.size(1), q.size(2), k.size(2),
-          window_size, strict_past ? -1 : 0, odd_head_window_right_delta,
-          deterministic);
+          window_size, strict_past ? -1 : 0, deterministic);
   const bool use_d192 =
       dense && !native_window160 &&
       ((kernel_d == 192 && kernel_v == 128) || (kernel_d == 160 && kernel_v == 128) ||
@@ -1382,7 +1362,6 @@ CausalAttentionSM90BwdWithHeadBoundary(
   // grouped gradients directly into their actual D/V shape.
   const bool trim_grouped_grads =
       use_full_visibility && !has_prev &&
-      odd_head_window_right_delta == 0 &&
       ((D == 160 && V == 160) ||
        CausalFlashAttnBwdMixedSquareDim(q_c.size(3), v_c.size(3), deterministic) != 0);
   const bool pad_grouped_k_grad =
@@ -1403,7 +1382,13 @@ CausalAttentionSM90BwdWithHeadBoundary(
       dy_c, q_c, k_c, v_c, y_c, lse_c, window_size,
       static_cast<float>(scale), dq_pad, dk_total_pad, dv_total_pad,
       q_segment_idx_data, k_segment_idx_data, k_segment_len,
-      strict_past ? -1 : 0, odd_head_window_right_delta, params);
+      strict_past ? -1 : 0, params);
+  torch::Tensor dk_accum;
+  torch::Tensor dv_accum;
+  if (fp32_kv_grads) {
+    params.dk_accum_out = &dk_accum;
+    params.dv_accum_out = &dv_accum;
+  }
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   if (q.scalar_type() == at::kHalf) {
     if (use_full_visibility) {
@@ -1422,6 +1407,10 @@ CausalAttentionSM90BwdWithHeadBoundary(
   torch::Tensor dq = needs_qk_dim_pad
       ? dq_pad.narrow(3, 0, D).contiguous()
       : dq_pad;
+  if (fp32_kv_grads) {
+    dk_total_pad = dk_accum.narrow(3, 0, D);
+    dv_total_pad = dv_accum.narrow(3, 0, V);
+  }
   torch::Tensor dk;
   torch::Tensor dv;
   c10::optional<torch::Tensor> dprev_k = c10::nullopt;
@@ -1463,25 +1452,6 @@ CausalAttentionSM90BwdWithHeadBoundary(
       std::move(dprev_k), std::move(dprev_v));
 }
 
-std::tuple<
-    torch::Tensor, torch::Tensor, torch::Tensor,
-    c10::optional<torch::Tensor>, c10::optional<torch::Tensor>>
-CausalAttentionSM90Bwd(
-    const torch::Tensor& y_grad, const torch::Tensor& q,
-    const torch::Tensor& k, const torch::Tensor& v,
-    const torch::Tensor& y, const torch::Tensor& lse,
-    int64_t window_size, double scale,
-    const c10::optional<torch::Tensor>& prev_k,
-    const c10::optional<torch::Tensor>& prev_v,
-    const c10::optional<torch::Tensor>& q_segment_idx,
-    const c10::optional<torch::Tensor>& k_segment_idx,
-    bool deterministic, bool strict_past, bool causal_flash_attn) {
-  return CausalAttentionSM90BwdWithHeadBoundary(
-      y_grad, q, k, v, y, lse, window_size, scale, prev_k, prev_v,
-      q_segment_idx, k_segment_idx, deterministic, strict_past,
-      0 /*odd_head_window_right_delta*/, causal_flash_attn);
-}
-
 std::tuple<torch::Tensor, torch::Tensor> CausalAttentionSM90VarlenFwd(
     const torch::Tensor& q, const torch::Tensor& k,
     const torch::Tensor& v,
@@ -1489,7 +1459,7 @@ std::tuple<torch::Tensor, torch::Tensor> CausalAttentionSM90VarlenFwd(
     const torch::Tensor& cu_seqlens_k,
     int64_t max_seqlen_q, int64_t max_seqlen_k,
     int64_t window_size, double scale, bool strict_past,
-    const c10::optional<torch::Tensor>& output_state, bool output_fp32) {
+    const c10::optional<torch::Tensor>& output_state, bool high_precision) {
   const int arch = CurrentDeviceArch(q);
   TORCH_CHECK(
       arch == 90,
@@ -1516,8 +1486,6 @@ std::tuple<torch::Tensor, torch::Tensor> CausalAttentionSM90VarlenFwd(
   const int64_t total_q = q.size(0);
   const int64_t H = q.size(1);
   const int64_t V = v.size(2);
-  TORCH_CHECK(!output_fp32 || !output_state.has_value(),
-              "FP32-only output and output_state are mutually exclusive");
   if (output_state.has_value()) {
     const torch::Tensor& state = output_state.value();
     TORCH_CHECK(
@@ -1530,8 +1498,7 @@ std::tuple<torch::Tensor, torch::Tensor> CausalAttentionSM90VarlenFwd(
   }
   torch::Tensor y = torch::empty(
       {total_q, H, V},
-      v.options().dtype(output_fp32 ? at::kFloat : v.scalar_type())
-          .memory_format(at::MemoryFormat::Contiguous));
+      v.options().memory_format(at::MemoryFormat::Contiguous));
   torch::Tensor lse = torch::empty(
       {H, total_q},
       q.options().dtype(at::kFloat).memory_format(
@@ -1543,6 +1510,7 @@ std::tuple<torch::Tensor, torch::Tensor> CausalAttentionSM90VarlenFwd(
       output_state,
       cu_q_c.data_ptr<int>(), cu_k_aligned, metadata.num_sequences,
       max_seqlen_q, max_seqlen_k, strict_past, params);
+  params.high_precision = high_precision;
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   if (q.scalar_type() == at::kHalf) {
     DispatchVarlenFwd<cutlass::half_t>(params, stream);

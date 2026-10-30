@@ -27,7 +27,7 @@ other PyTorch projects.
 
 | Feature | Capabilities |
 | --- | --- |
-| **Attention precision** | Five precision correction levels, with unchanged output and gradient dtypes. |
+| **Attention precision** | `high_precision_level=0` or `1`; outputs and gradients retain the input dtype. |
 | **Flexible segment-aware attention masking** | Isolates packed sequences using segment IDs or BOS masks.|
 
 ## Supported Attention

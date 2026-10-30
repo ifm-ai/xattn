@@ -1,7 +1,6 @@
 from ._attention_core import validate_sm90_dimensions, validate_attention_scale
 from ._backward_precision import _dispatch_nonpositive_scale
-from ._backward_precision import validate_backward_precision, validate_attention_saved_state
-from ._backward_precision import require_precision_backward
+from ._backward_precision import validate_attention_output, validate_attention_saved_state
 from ._backward_precision import validate_high_precision_level
 # Author: Shicheng Wen
 
@@ -13,10 +12,6 @@ import torch
 from torch import Tensor
 from torch.autograd.function import FunctionCtx
 
-from ._backward_precision import (
-    allocate_backward_output_state,
-    use_high_precision_level,
-)
 from ._bos_routing_heuristics import (
     select_flash_sca_bos_routes as _select_bos_routes,
 )
@@ -81,18 +76,11 @@ class _FlashSCAFunc(torch.autograd.Function):
         backend: str = "auto",
         reset_chunk_pos_per_seq: bool = False,
         deterministic: bool = False,
-        high_precision_level: int = 0,
     ) -> Tensor:
-        ctx.high_precision_level = high_precision_level
         route = "segment" if q_segment_idx is not None else "dense"
         ctx.fwd_route = route
         ctx.bwd_route = route
-        output_state = (
-            allocate_backward_output_state(q, v)
-            if high_precision_level
-            else None
-        )
-        args = (
+        y, lse = _extension_ops().flash_sca_fwd(
             q,
             k,
             v,
@@ -105,14 +93,11 @@ class _FlashSCAFunc(torch.autograd.Function):
             backend,
             reset_chunk_pos_per_seq,
         )
-        if output_state is not None:
-            args = (*args, output_state)
-        y, lse = _extension_ops().flash_sca_fwd(*args)
         ctx.save_for_backward(
             q,
             k,
             v,
-            output_state if output_state is not None else y,
+            y,
             lse,
             prev_k,
             prev_v,
@@ -131,7 +116,6 @@ class _FlashSCAFunc(torch.autograd.Function):
         ctx: FunctionCtx,
         y_grad: Tensor,
     ) -> tuple:
-        require_precision_backward(ctx.high_precision_level)
         (
             q,
             k,
@@ -175,7 +159,6 @@ class _FlashSCAFunc(torch.autograd.Function):
             None,
             None,
             None,
-            None,
         )
 
 
@@ -202,14 +185,7 @@ class _FlashSCAVarlenFunc(torch.autograd.Function):
         k_run_lengths: Optional[Tensor],
         k_prefix_ends: Optional[Tensor],
         k_row_length: int,
-        high_precision_level: int,
     ) -> Tensor:
-        ctx.high_precision_level = high_precision_level
-        output_state = (
-            allocate_backward_output_state(q, v)
-            if high_precision_level
-            else None
-        )
         y, lse = _flash_sca_varlen_fwd(
             q,
             k,
@@ -225,13 +201,12 @@ class _FlashSCAVarlenFunc(torch.autograd.Function):
             reset_chunk_pos_per_seq=reset_chunk_pos_per_seq,
             _k_run_starts=k_run_starts,
             _k_run_lengths=k_run_lengths,
-            output_state=output_state,
         )
         ctx.save_for_backward(
             q,
             k,
             v,
-            output_state if output_state is not None else y,
+            y,
             lse,
             cu_seqlens_q,
             cu_seqlens_k,
@@ -252,7 +227,6 @@ class _FlashSCAVarlenFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx: FunctionCtx, y_grad: Tensor) -> tuple:
-        require_precision_backward(ctx.high_precision_level)
         (
             q,
             k,
@@ -306,7 +280,6 @@ class _FlashSCAVarlenFunc(torch.autograd.Function):
             None,
             None,
             None,
-            None,
         )
 
 
@@ -334,14 +307,7 @@ class _FlashSCABosFunc(torch.autograd.Function):
         deterministic: bool,
         fwd_use_varlen: bool,
         bwd_use_varlen: bool,
-        high_precision_level: int,
     ) -> Tensor:
-        ctx.high_precision_level = high_precision_level
-        output_state = (
-            allocate_backward_output_state(q, v)
-            if high_precision_level
-            else None
-        )
         if fwd_use_varlen:
             y, lse = _flash_sca_fwd(
                 q,
@@ -359,10 +325,9 @@ class _FlashSCABosFunc(torch.autograd.Function):
                 cu_seqlens_k=cu_seqlens_k,
                 max_seqlen_q=max_seqlen_q,
                 max_seqlen_k=max_seqlen_k,
-                output_state=output_state,
             )
         else:
-            args = (
+            y, lse = _extension_ops().flash_sca_fwd(
                 q,
                 k,
                 v,
@@ -375,14 +340,11 @@ class _FlashSCABosFunc(torch.autograd.Function):
                 backend,
                 reset_chunk_pos_per_seq,
             )
-            if output_state is not None:
-                args = (*args, output_state)
-            y, lse = _extension_ops().flash_sca_fwd(*args)
         ctx.save_for_backward(
             q,
             k,
             v,
-            output_state if output_state is not None else y,
+            y,
             lse,
             prev_k,
             prev_v,
@@ -405,7 +367,6 @@ class _FlashSCABosFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx: FunctionCtx, y_grad: Tensor) -> tuple:
-        require_precision_backward(ctx.high_precision_level)
         (
             q,
             k,
@@ -472,7 +433,6 @@ class _FlashSCABosFunc(torch.autograd.Function):
             None,
             prev_k_grad,
             prev_v_grad,
-            None,
             None,
             None,
             None,
@@ -926,7 +886,6 @@ def _resolve_public_bos_route(
     deterministic: bool,
     for_backward: bool,
     api_name: str,
-    high_precision_level: int = 0,
 ) -> Tuple[
     Optional[Tensor],
     Optional[Tensor],
@@ -969,7 +928,6 @@ def _resolve_public_bos_route(
         for_backward,
         reset_chunk_pos_per_seq=reset_chunk_pos_per_seq,
         has_previous=prev_k is not None,
-        high_precision_level=high_precision_level,
         previous_length=0 if prev_k is None else prev_k.shape[1],
         num_k_runs=num_k_runs,
         max_seqlen_k=max_seqlen_k,
@@ -1177,7 +1135,6 @@ def _flash_sca_varlen(
     reset_chunk_pos_per_seq: bool = False,
     deterministic: bool = False,
     attn_method: str = "default",
-    high_precision_level: int = 0,
 ) -> Tensor:
     """Run autograd on packed varlen Q/K/V."""
     _check_attn_method_supported(attn_method)
@@ -1195,11 +1152,6 @@ def _flash_sca_varlen(
         None,
         None,
         reset_chunk_pos_per_seq,
-    )
-    use_fp32_state = use_high_precision_level(
-        high_precision_level,
-        (q, k, v),
-        api_name="_flash_sca_varlen",
     )
     return _FlashSCAVarlenFunc.apply(
         q,
@@ -1219,7 +1171,6 @@ def _flash_sca_varlen(
         None,
         None,
         0,
-        use_fp32_state,
     )
 
 
@@ -1245,15 +1196,9 @@ def _flash_sca(
     max_seqlen_k: Optional[int] = None,
     position_offsets: Optional[Tensor] = None,
     attn_method: str = "default",
-    high_precision_level: int = 0,
 ) -> Tensor:
-    """Run FlashSCA with batched Q/K/V and autograd."""
+    """Run FlashSCA with batched Q/K/V and autograd (level 0)."""
     _check_attn_method_supported(attn_method)
-    use_fp32_state = use_high_precision_level(
-        high_precision_level,
-        (q, k, v, prev_k, prev_v),
-        api_name="flash_sca",
-    )
     if bos_mask is not None:
         if (
             q_segment_idx is not None
@@ -1365,7 +1310,6 @@ def _flash_sca(
                 backend,
                 reset_chunk_pos_per_seq,
                 deterministic,
-                use_fp32_state,
             )
         fwd_use_varlen, bwd_use_varlen = _select_bos_routes(
             q,
@@ -1378,7 +1322,6 @@ def _flash_sca(
             needs_backward,
             reset_chunk_pos_per_seq=reset_chunk_pos_per_seq,
             has_previous=prev_k is not None,
-            high_precision_level=use_fp32_state,
             previous_length=0 if prev_k is None else prev_k.shape[1],
             num_k_runs=num_k_runs,
             max_seqlen_k=max_seqlen_k,
@@ -1405,7 +1348,6 @@ def _flash_sca(
             deterministic,
             fwd_use_varlen,
             bwd_use_varlen,
-            use_fp32_state,
         )
     k_length = k.shape[1] + (0 if prev_k is None else prev_k.shape[1])
     q_segment_idx, k_segment_idx = _resolve_segment_indices(
@@ -1494,7 +1436,6 @@ def _flash_sca(
             k_run_lengths,
             k_prefix_ends,
             k_row_length,
-            use_fp32_state,
         )
         return _restore_varlen_output(y_packed, q, v)
     return _FlashSCAFunc.apply(
@@ -1510,7 +1451,6 @@ def _flash_sca(
         backend,
         reset_chunk_pos_per_seq,
         deterministic,
-        use_fp32_state,
     )
 
 
@@ -1533,10 +1473,10 @@ def _flash_sca_varlen_fwd(
     _k_run_lengths: Optional[Tensor] = None,
     strict_past: bool = False,
     output_state: Optional[Tensor] = None,
-    output_fp32: bool = False,
+    high_precision: bool = False,
 ) -> Tuple[Tensor, Tensor]:
     """Run forward on packed varlen Q/K/V."""
-    output_options = {"output_fp32": True} if output_fp32 else {}
+    output_options = {"high_precision": True} if high_precision else {}
     _check_attn_method_supported(attn_method)
     _validate_qkv_heads(
         q, k, v, packed=True, api_name="_flash_sca_varlen_fwd"
@@ -1630,9 +1570,9 @@ def _flash_sca_fwd(
     position_offsets: Optional[Tensor] = None,
     strict_past: bool = False,
     output_state: Optional[Tensor] = None,
-    output_fp32: bool = False,
+    high_precision: bool = False,
 ) -> Tuple[Tensor, Tensor]:
-    output_options = {"output_fp32": True} if output_fp32 else {}
+    output_options = {"high_precision": True} if high_precision else {}
     _check_attn_method_supported(attn_method)
     is_varlen = _validate_metadata_representation(
         q_segment_idx,
@@ -1883,7 +1823,10 @@ def _flash_sca_bwd(
     max_seqlen_k: Optional[int] = None,
     position_offsets: Optional[Tensor] = None,
     strict_past: bool = False,
+    fp32_kv_grads: bool = False,
 ) -> Tuple[Tensor, Tensor, Tensor, Optional[Tensor], Optional[Tensor]]:
+    """``fp32_kv_grads`` (grouped query heads, dense routes, not ``strict_past``):
+    dK / dV and their previous-chunk parts come back as the FP32 accumulators."""
     _check_attn_method_supported(attn_method)
     is_varlen = _validate_metadata_representation(
         q_segment_idx,
@@ -1927,6 +1870,8 @@ def _flash_sca_bwd(
         max_seqlen_k = None
         position_offsets = None
         is_varlen = False
+    if fp32_kv_grads and (is_varlen or strict_past):
+        raise ValueError("FP32 dK / dV output needs the dense, non-strict FlashSCA backward")
     if is_varlen:
         q_packed, k_combined, v_combined = _pack_batched_varlen_inputs(
             q, k, v, prev_k, prev_v
@@ -2002,6 +1947,7 @@ def _flash_sca_bwd(
         deterministic,
         backend,
         reset_chunk_pos_per_seq,
+        **({"fp32_kv_grads": True} if fp32_kv_grads else {}),
     )
 
 
@@ -2098,7 +2044,6 @@ def _prepare_fwd_metadata_plan(
             False,
             reset_chunk_pos_per_seq=reset_chunk_pos_per_seq,
             has_previous=prev_k is not None,
-            high_precision_level=0,
             previous_length=0 if prev_k is None else prev_k.shape[1],
             num_k_runs=num_k_runs,
             max_seqlen_k=max_seqlen_k,
@@ -2381,15 +2326,15 @@ def flash_sca(
     ``scale`` multiplies QK logits before softmax and defaults to
     ``1 / sqrt(q.shape[-1])``.
 
-    ``high_precision_level=1`` saves FP32 attention state for backward.
-    The public output keeps the input dtype.
+    ``high_precision_level=1`` runs the forward softmax in high precision and
+    the precision-repair backward. The output keeps the input dtype.
     """
     validate_high_precision_level(high_precision_level, api_name="flash_sca")
     validate_attention_scale(scale)
     validate_sm90_dimensions(q, v, backend, api_name="flash_sca")
     if scale is not None and float(scale) <= 0:
         return _dispatch_nonpositive_scale(flash_sca, locals())
-    if high_precision_level >= 2:
+    if high_precision_level:
         from ._precision_backend import apply as precision_apply
         return precision_apply(q, k, v, visibility=2, chunk_size=chunk_size, prev_k=prev_k, prev_v=prev_v, reset_chunk_pos_per_seq=reset_chunk_pos_per_seq, attn_method=attn_method,
             scale=scale, q_segment_idx=q_segment_idx, k_segment_idx=k_segment_idx,
@@ -2400,7 +2345,7 @@ def flash_sca(
         return _matched_reset_forward(
             q, k, v, chunk_size, scale, prev_k, prev_v,
             q_segment_idx, k_segment_idx, backend, attn_method,
-            high_precision_level, deterministic, autograd=True,
+            0, deterministic, autograd=True,
         )
     return _flash_sca(
         q,
@@ -2418,7 +2363,6 @@ def flash_sca(
         reset_chunk_pos_per_seq=reset_chunk_pos_per_seq,
         deterministic=deterministic,
         attn_method=attn_method,
-        high_precision_level=high_precision_level,
     )
 
 
@@ -2439,13 +2383,12 @@ def flash_sca_fwd(
     reset_chunk_pos_per_seq: bool = False,
     attn_method: str = "default",
     high_precision_level: int = 0,
-) -> Tuple[Tensor, Optional[Tensor], Tensor]:
-    """Return ``(y, y_fp32, lse)``; ``y_fp32`` is None without high precision.
+) -> Tuple[Tensor, Tensor]:
+    """Return ``(y, lse)``.
 
-    ``y`` keeps the input dtype; ``y_fp32`` has the same shape and FP32 dtype.
-    LSE is FP32. Both outputs are written by one forward, including in no_grad
-    and inference mode. Pass ``y_fp32`` to backward for high-precision state;
-    ``y_grad`` must retain the Q/K/V dtype. No autograd bridge is created.
+    ``y`` keeps the input dtype; ``lse`` is FP32 with shape ``[B, Hq, Lq]``.
+    ``high_precision_level=1`` runs the softmax in high precision, also in
+    no_grad/inference mode. No autograd bridge is created.
     """
     validate_high_precision_level(high_precision_level, api_name="flash_sca_fwd")
     validate_attention_scale(scale)
@@ -2454,16 +2397,15 @@ def flash_sca_fwd(
         return _dispatch_nonpositive_scale(flash_sca_fwd, locals())
     if _needs_matched_reset(q, q_segment_idx, k_segment_idx,
                             reset_chunk_pos_per_seq, segment_idx, bos_mask):
-        return _matched_reset_forward(
+        y, _, lse = _matched_reset_forward(
             q, k, v, chunk_size, scale, prev_k, prev_v,
             q_segment_idx, k_segment_idx, backend, attn_method,
             high_precision_level,
         )
-    validate_high_precision_level(high_precision_level)
+        return y, lse
     if high_precision_level and q.dtype not in (torch.float16, torch.bfloat16):
-        raise ValueError("flash_sca_fwd FP32 output requires fp16/bf16 inputs")
-    output_state = allocate_backward_output_state(q, v) if high_precision_level else None
-    output_options = {"output_state": output_state} if output_state is not None else {}
+        raise ValueError("flash_sca_fwd high precision requires fp16/bf16 inputs")
+    output_options = {"high_precision": True} if high_precision_level else {}
     resolved_scale = _resolve_scale(q, scale) if scale is None else scale
     if bos_mask is not None:
         _check_attn_method_supported(attn_method)
@@ -2494,7 +2436,7 @@ def flash_sca_fwd(
                 reset_chunk_pos_per_seq,
             )
             if cached_result is not None:
-                return cached_result[0], None, cached_result[1]
+                return cached_result
             result = _prepare_store_and_execute_inference_bos_plan(
                 q,
                 k,
@@ -2509,7 +2451,7 @@ def flash_sca_fwd(
                 attn_method,
             )
             if result is not None:
-                return result[0], None, result[1]
+                return result
         (
             q_segment_idx,
             k_segment_idx,
@@ -2530,9 +2472,8 @@ def flash_sca_fwd(
             deterministic=False,
             for_backward=False,
             api_name="flash_sca_fwd",
-            high_precision_level=high_precision_level,
         )
-        result = _flash_sca_fwd(
+        return _flash_sca_fwd(
             q,
             k,
             v,
@@ -2551,7 +2492,6 @@ def flash_sca_fwd(
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
         )
-        return result[0], output_state, result[1]
 
     if segment_idx is not None:
         k_length = k.shape[1] + (
@@ -2565,7 +2505,7 @@ def flash_sca_fwd(
             q_length=q.shape[1],
             k_length=k_length,
         )
-    result = _flash_sca_fwd(
+    return _flash_sca_fwd(
         q,
         k,
         v,
@@ -2580,8 +2520,6 @@ def flash_sca_fwd(
         attn_method=attn_method,
         **output_options,
     )
-
-    return result[0], output_state, result[1]
 
 
 def flash_sca_bwd(
@@ -2608,18 +2546,19 @@ def flash_sca_bwd(
 ) -> Tuple[Tensor, Tensor, Tensor, Optional[Tensor], Optional[Tensor]]:
     """Run FlashSCA BWD with dense, segment, or BOS metadata.
 
-    ``high_precision_level`` selects the algorithm; ``y`` must have its matching state dtype.
-    ``y_grad`` must retain the Q/K/V dtype.
+    Pass ``y`` and ``lse`` from :func:`flash_sca_fwd` with the same level.
+    ``y`` and ``y_grad`` have the Q/K/V dtype; level 1 recomputes the
+    softmax statistics and does not read ``y`` or ``lse``.
     """
     validate_high_precision_level(high_precision_level, api_name="flash_sca_bwd")
     validate_attention_scale(scale)
     validate_sm90_dimensions(q, v, backend, api_name="flash_sca_bwd")
-    validate_backward_precision(high_precision_level, y, q)
-    if high_precision_level >= 2:
+    validate_attention_output(y, q)
+    if high_precision_level:
         _check_attn_method_supported(attn_method)
         validate_attention_saved_state(y, lse, q, v)
         from ._precision_backend import backward as precision_backward
-        return precision_backward(y_grad, q, k, v, level=high_precision_level,
+        return precision_backward(y_grad, q, k, v,
             visibility=2, span=chunk_size, scale=scale, prev_k=prev_k, prev_v=prev_v,
             q_segment_idx=q_segment_idx, k_segment_idx=k_segment_idx,
             segment_idx=segment_idx, bos_mask=bos_mask, reset=reset_chunk_pos_per_seq,
@@ -2663,7 +2602,6 @@ def flash_sca_bwd(
             deterministic=deterministic,
             for_backward=True,
             api_name="flash_sca_bwd",
-            high_precision_level=int(y.dtype == torch.float32),
         )
         return _flash_sca_bwd(
             y_grad,

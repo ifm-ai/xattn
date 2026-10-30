@@ -1,59 +1,30 @@
-from typing import Iterable, Optional
-
 import torch
 from torch import Tensor
 
 
 def validate_high_precision_level(level: int, *, api_name: str = "attention") -> int:
-    """Validate the algorithm selector without accepting bool as an integer."""
+    """Validate the precision selector: 0, or 1 for the high-precision softmax and
+    the precision-repair backward. Bool is not accepted as an integer."""
     if isinstance(level, bool) or not isinstance(level, int):
-        raise TypeError(f"{api_name} high_precision_level must be an int in [0, 4]")
-    if not 0 <= level <= 4:
-        raise ValueError(f"{api_name} high_precision_level must be in [0, 4], got {level}")
+        raise TypeError(f"{api_name} high_precision_level must be 0 or 1")
+    if level not in (0, 1):
+        raise ValueError(f"{api_name} high_precision_level must be 0 or 1, got {level}")
     return level
 
 
-def use_high_precision_level(
-    requested: int,
-    tensors: Iterable[Optional[Tensor]],
-    *,
-    api_name: str,
-) -> int:
-    """Keep the algorithm level intact, including standalone/inference forward.
-
-    A level is not a state-width boolean: levels 1--4 all save FP32 state,
-    but their backwards select different numerical algorithms.
-    """
-    return validate_high_precision_level(requested, api_name=api_name)
+def validate_attention_output(y: Tensor, q: Tensor) -> None:
+    """A standalone backward takes the forward's output ``y`` in the Q/K/V dtype."""
+    if y.dtype != q.dtype:
+        raise ValueError(f"attention output y must have the Q/K/V dtype {q.dtype}, got {y.dtype}")
 
 
 def allocate_backward_output_state(q: Tensor, v: Tensor) -> Tensor:
-    """Allocate the generic FP32 attention output state consumed by BWD."""
+    """An FP32 output buffer [*q.shape[:-1], V] for a high-precision forward."""
     return torch.empty(
         (*q.shape[:-1], v.shape[-1]),
         dtype=torch.float32,
         device=q.device,
     )
-
-
-def require_precision_backward(level: int) -> None:
-    """Prevent advanced levels from entering a legacy packed backward bridge."""
-    validate_high_precision_level(level)
-    if level >= 2:
-        raise NotImplementedError(
-            f"high_precision_level={level} is unsupported by this legacy packed bridge; "
-            "use the public precision-level API instead of a legacy packed bridge"
-        )
-
-
-def validate_backward_precision(level: int, state: Tensor, q: Tensor) -> None:
-    validate_high_precision_level(level)
-    expected = torch.float32 if level else q.dtype
-    if state.dtype != expected:
-        raise ValueError(
-            f"high_precision_level={level} requires saved state dtype {expected}, "
-            f"got {state.dtype}; pass the same level to forward and backward"
-        )
 
 
 def validate_attention_saved_state(state: Tensor, lse: Tensor, q: Tensor, v: Tensor) -> None:

@@ -1,8 +1,9 @@
-"""Validate precision repair levels 1-4, with level 0 as the baseline.
+"""Validate high_precision_level 0 and 1, with level 0 as the baseline.
 
-Covers the public API contract, SBS saved state, FP64 numerical parity,
-padded gradients, live previous KV, and advanced repair regressions.
-Specialized level 2-4 regressions retain their algorithm-specific domains.
+Covers the public API contract of every attention family, the SBS forward,
+and, for causal / window / chunk attention, FP64 numerical parity, padded
+gradients, live previous KV, and precision-repair regressions. SoftDelta
+numerics live in tests/softdelta.
 """
 import inspect
 import math
@@ -11,31 +12,31 @@ import pytest
 import torch
 import xattn
 from tests._numerics import (
-    Case, OPERATIONS, _allowed_masks, _attention_from_mask, assert_gradients,
-    assert_output, cases_for, check_case, make_inputs, options_and_segments,
-    oracle, require_device,
+    Case, LEVELS, OPERATIONS, _allowed_masks, _attention_from_mask,
+    assert_gradients, assert_output, cases_for, check_case,
+    make_inputs, options_and_segments, oracle, require_device,
 )
-from xattn.ops._backward_precision import validate_backward_precision
 
-REPAIR_LEVELS = (1, 2, 3, 4)
-ALL_LEVELS = (0, *REPAIR_LEVELS)
-
+STANDARD_FAMILIES = ('causal_flash_attn', 'flash_sca', 'flash_swa')
 FAMILIES = (
-    'causal_flash_attn', 'flash_sca', 'flash_swa', 'softdelta_attention',
+    *STANDARD_FAMILIES, 'softdelta_attention',
     'sliding_chunk_softdelta_attention', 'sliding_window_softdelta_attention',
-    'group_softdelta_attention', 'sliding_window_group_softdelta_attention',
-    'sliding_chunk_group_softdelta_attention',
 )
 ENTRIES = [getattr(xattn, name + suffix) for name in FAMILIES
            for suffix in ('', '_fwd', '_bwd')]
+INVALID_LEVELS = ((-1, ValueError), (2, ValueError), (4, ValueError), (100, ValueError),
+                  (False, TypeError), (True, TypeError), (1.0, TypeError),
+                  ('1', TypeError), (None, TypeError))
+ENTRY_LEVELS = [(fn, level) for fn in ENTRIES for level in LEVELS]
 
 
-@pytest.mark.parametrize('fn', ENTRIES, ids=lambda fn: fn.__name__)
-@pytest.mark.parametrize('value,error', [
-    (-1, ValueError), (5, ValueError), (100, ValueError),
-    (False, TypeError), (True, TypeError), (1.0, TypeError),
-    ('1', TypeError), (None, TypeError),
-])
+def _name(value):
+    return getattr(value, '__name__', repr(value))
+
+
+@pytest.mark.parametrize('fn,value,error',
+                         [(fn, *invalid) for fn in ENTRIES for invalid in INVALID_LEVELS],
+                         ids=_name)
 def test_invalid_level_rejected_before_tensor_access(fn, value, error):
     signature = inspect.signature(fn)
     kwargs = {n: None for n, p in signature.parameters.items()
@@ -45,35 +46,37 @@ def test_invalid_level_rejected_before_tensor_access(fn, value, error):
         fn(**kwargs)
 
 
-@pytest.mark.parametrize('level,dtype', [(0, torch.float32), (1, torch.bfloat16)])
-def test_mismatched_saved_state_rejected(level, dtype):
-    q = torch.empty(1, dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match='same level'):
-        validate_backward_precision(level, torch.empty(1, dtype=dtype), q)
+@pytest.mark.parametrize('name', STANDARD_FAMILIES)
+@pytest.mark.parametrize('level', (0, 1))
+def test_standard_backward_rejects_fp32_output(name, level):
+    device = require_device()
+    q = torch.zeros(1, 8, 2, 64, device=device, dtype=torch.bfloat16)
+    k = v = torch.zeros(1, 8, 1, 64, device=device, dtype=torch.bfloat16)
+    y = torch.zeros(1, 8, 2, 64, device=device, dtype=torch.float32)
+    lse = torch.zeros(1, 2, 8, device=device, dtype=torch.float32)
+    span = {'flash_sca': dict(chunk_size=8), 'flash_swa': dict(window_size=8)}.get(name, {})
+    with pytest.raises(ValueError, match='Q/K/V dtype'):
+        getattr(xattn, name + '_bwd')(y.to(q.dtype), q, k, v, y, lse, **span,
+                                      backend='sm90', high_precision_level=level)
 
 
-@pytest.mark.parametrize('fn', ENTRIES, ids=lambda fn: fn.__name__)
-@pytest.mark.parametrize('level', ALL_LEVELS)
+@pytest.mark.parametrize('fn,level', ENTRY_LEVELS, ids=_name)
 @pytest.mark.parametrize('dimensions', ((7, 16), (16, 13), (264, 16), (16, 264)))
 def test_sm90_invalid_dimensions_rejected_before_launch(fn, level, dimensions):
     if not torch.cuda.is_available():
         pytest.skip('CUDA unavailable')
     d, width = dimensions
-    # SoftDelta: interleaved q1/q2 heads and value groups; Group SoftDelta takes plain q / v.
-    soft = 'softdelta' in fn.__name__ and 'group' not in fn.__name__
     signature = inspect.signature(fn)
     kwargs = {n: None for n, p in signature.parameters.items()
               if p.default is inspect.Parameter.empty}
-    kwargs.update(q=torch.empty(1, 1, 2 if soft else 1, d, device='cuda', dtype=torch.bfloat16),
-                  v=torch.empty((1, 1, 1, 1, width) if soft else (1, 1, 1, width),
-                                device='cuda', dtype=torch.bfloat16),
+    kwargs.update(q=torch.empty(1, 1, 1, d, device='cuda', dtype=torch.bfloat16),
+                  v=torch.empty(1, 1, 1, width, device='cuda', dtype=torch.bfloat16),
                   backend='sm90', high_precision_level=level)
     with pytest.raises(ValueError, match='multiples of 8'):
         fn(**kwargs)
 
 
-@pytest.mark.parametrize('fn', ENTRIES, ids=lambda fn: fn.__name__)
-@pytest.mark.parametrize('level', ALL_LEVELS)
+@pytest.mark.parametrize('fn,level', ENTRY_LEVELS, ids=_name)
 @pytest.mark.parametrize('scale', (float('inf'), float('-inf'), float('nan')))
 def test_nonfinite_scale_rejected(fn, level, scale):
     kwargs = {n: None for n, p in inspect.signature(fn).parameters.items()
@@ -83,16 +86,15 @@ def test_nonfinite_scale_rejected(fn, level, scale):
         fn(**kwargs)
 
 
-@pytest.mark.parametrize("mechanism", ["full", "sca", "swa", "sda", "scsda", "swsda"])
+@pytest.mark.parametrize("mechanism", ("full", "sca", "swa", "sda", "scsda", "swsda"))
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("level", REPAIR_LEVELS)
-def test_high_precision_single_key_state(mechanism, dtype, level):
+def test_high_precision_single_key_state(mechanism, dtype):
     if not torch.cuda.is_available():
         pytest.skip("requires FlashSCA SM90")
     if torch.cuda.get_device_capability()[0] != 9:
         pytest.skip("requires SM90")
 
-    # Large, exactly representable QK. With one visible key, HP saved state
+    # Large, exactly representable QK. With one visible key, the HP output
     # must equal V: SBS makes the unnormalized maximum term exactly exp2(0).
     # A pre-rounded scaled maximum followed by FMA need not have this property.
     q = torch.zeros(1, 1, 4, 128, device="cuda", dtype=dtype)
@@ -103,7 +105,7 @@ def test_high_precision_single_key_state(mechanism, dtype, level):
     k[..., 0] = 65536 if dtype == torch.bfloat16 else 4096
     v = torch.linspace(-1, 1, 256, device="cuda", dtype=torch.float32)
     v = v.reshape(1, 1, 2, 128).to(dtype)
-    options = dict(backend="sm90", high_precision_level=level)
+    options = dict(backend="sm90", high_precision_level=1)
     functions = {
         "full": xattn.causal_flash_attn_fwd,
         "sca": xattn.flash_sca_fwd,
@@ -119,40 +121,41 @@ def test_high_precision_single_key_state(mechanism, dtype, level):
     expected = v.float().repeat_interleave(2, dim=2)
     args = (q, k, v)
     if "sd" in mechanism:
-        args = (q, k, v.reshape(1, 1, 2, 4, 32),
-                torch.zeros(1, 1, 2, 4, 1, device="cuda", dtype=dtype))
-        expected[:, :, 1::2] = 0  # strict-past readers have no visible key
-        expected = expected.reshape(1, 1, 4, 4, 32)
+        args = (q, k, None, v, torch.zeros(1, 1, 4, device="cuda", dtype=dtype))
 
     # Explicit standalone HP remains active even without an autograd graph.
     with torch.no_grad():
-        output, state, _ = functions[mechanism](*args, **options)
+        result = functions[mechanism](*args, **options)
+    output = result[0]
     assert output.dtype == dtype
-    assert state.dtype == torch.float32
     assert torch.isfinite(output).all()
-    torch.testing.assert_close(state, expected, atol=0, rtol=0)
+    torch.testing.assert_close(output.float(), expected, atol=0, rtol=0)
+    if "sd" in mechanism:
+        # The strict-past reader has no visible key.
+        neg_read = result[1]
+        assert len(result) == 3 and neg_read.dtype == torch.float32
+        assert torch.count_nonzero(neg_read) == 0
+    else:
+        assert len(result) == 2
 
 
-@pytest.mark.parametrize('operation', tuple(OPERATIONS))
+@pytest.mark.parametrize('operation', OPERATIONS)
+@pytest.mark.parametrize('level', LEVELS)
 @pytest.mark.parametrize('dtype', (torch.bfloat16, torch.float16))
 @pytest.mark.parametrize('deterministic', (False, True))
-@pytest.mark.parametrize('level', ALL_LEVELS)
 @pytest.mark.parametrize('dimensions', ((40, 72), (136, 120), (152, 152), (56, 248)))
 def test_padded_gqa_gradients(operation, dtype, deterministic, level, dimensions):
     device = require_device()
     case = Case('padded-gqa', 17, 33, *dimensions, span=16, batch=1)
     inputs = make_inputs(operation, case, dtype, 2, device)
     options, qi, ki = options_and_segments(operation, case, inputs, 'sm90')
-    refs, expected, _ = oracle(operation, case, inputs, qi, ki)
-    soft = operation.startswith('softdelta_')
-    base = inputs[:4 if soft else 3]
+    refs, expected = oracle(operation, case, inputs, qi, ki)
     dy = torch.randn_like(expected, dtype=dtype)
     reference = torch.autograd.grad(expected, refs, dy.double())
     name = OPERATIONS[operation]
-    output, saved, lse = getattr(xattn, name + '_fwd')(
-        *base, **options, high_precision_level=level)
+    y, lse = getattr(xattn, name + '_fwd')(*inputs, **options, high_precision_level=level)
     gradients = getattr(xattn, name + '_bwd')(
-        dy, *base, saved if soft or level else output, lse,
+        dy, *inputs, y, lse,
         **options, deterministic=deterministic, high_precision_level=level)[:len(inputs)]
     for actual, ref in zip(gradients, reference):
         assert actual.dtype == dtype and actual.shape == ref.shape
@@ -161,25 +164,23 @@ def test_padded_gqa_gradients(operation, dtype, deterministic, level, dimensions
         assert error <= .015 * ref.norm() + 1e-6
 
 
-@pytest.mark.parametrize('operation,reset', (
-    ('window', False), ('chunk', False), ('chunk', True),
-    ('softdelta_full', False), ('softdelta_window', False),
-    ('softdelta_chunk', False), ('softdelta_chunk', True),
-))
+@pytest.mark.parametrize('operation,reset,level', [
+    (operation, reset, level)
+    for operation, reset in (('window', False), ('chunk', False), ('chunk', True))
+    for level in LEVELS
+])
 @pytest.mark.parametrize('dtype', (torch.bfloat16, torch.float16))
 @pytest.mark.parametrize('kv_heads', (1, 2, 4))
 @pytest.mark.parametrize('deterministic', (False, True))
-@pytest.mark.parametrize('level', ALL_LEVELS)
 def test_live_bos_previous_gradients(operation, reset, dtype, kv_heads, deterministic, level):
     device = require_device()
     case = Case('live-bos-previous', 129, 129, 128, 96, metadata='bos',
                 previous=64, span=64, reset=reset, batch=1)
     inputs = make_inputs(operation, case, dtype, kv_heads, device)
     options, qi, ki = options_and_segments(operation, case, inputs, 'sm90')
-    refs, expected, _ = oracle(operation, case, inputs, qi, ki)
-    soft = operation.startswith('softdelta_')
+    refs, expected = oracle(operation, case, inputs, qi, ki)
     actual = getattr(xattn, OPERATIONS[operation])(
-        *inputs[:4 if soft else 3], **options,
+        *inputs[:3], **options,
         high_precision_level=level, deterministic=deterministic)
     dy = torch.randn_like(actual)
     reference = torch.autograd.grad(expected, refs, dy.double())
@@ -193,35 +194,30 @@ def test_live_bos_previous_gradients(operation, reset, dtype, kv_heads, determin
 
 @pytest.mark.parametrize('operation', OPERATIONS)
 @pytest.mark.parametrize('dtype', (torch.bfloat16, torch.float16))
-@pytest.mark.parametrize('level', REPAIR_LEVELS)
 @pytest.mark.parametrize('deterministic', (False, True))
 @pytest.mark.parametrize('case_name', ('dense-uneven', 'segment', 'bos', 'short-independent', 'empty-rows'))
-def test_precision_kernel(operation, dtype, level, case_name, deterministic):
+def test_precision_kernel(operation, dtype, case_name, deterministic):
     case = next(c for c in cases_for(operation) if c.name == case_name)
-    check_case(operation, case, dtype, 1, deterministic, level)
+    check_case(operation, case, dtype, 1, deterministic, 1)
 
 
-@pytest.mark.parametrize('operation', ('full', 'softdelta_full'))
-@pytest.mark.parametrize('level', (2, 3, 4))
-def test_deterministic_long_segments(operation, level):
+def test_deterministic_long_segments():
     """Deterministic segment backward with more key tiles than resident CTAs."""
     case = Case('long-segment', 4096, 4096, metadata='segment', segment_length=2048, batch=4)
-    check_case(operation, case, torch.bfloat16, 4, True, level)
+    check_case('full', case, torch.bfloat16, 4, True, 1)
 
 
-@pytest.mark.parametrize('operation', ('chunk', 'softdelta_chunk'))
 @pytest.mark.parametrize('dtype', (torch.bfloat16, torch.float16))
-@pytest.mark.parametrize('level', REPAIR_LEVELS)
 @pytest.mark.parametrize('deterministic', (False, True))
 @pytest.mark.parametrize('case_name', ('reset', 'short-reset', 'reset-long-q-run', 'chunk-wide'))
-def test_precision_chunk_boundaries(operation, dtype, level, case_name, deterministic):
-    case = next(c for c in cases_for(operation) if c.name == case_name)
-    check_case(operation, case, dtype, 1, deterministic, level)
+def test_precision_chunk_boundaries(dtype, case_name, deterministic):
+    case = next(c for c in cases_for('chunk') if c.name == case_name)
+    check_case('chunk', case, dtype, 1, deterministic, 1)
 
 
 @pytest.mark.parametrize('operation', OPERATIONS)
+@pytest.mark.parametrize('level', LEVELS)
 @pytest.mark.parametrize('dtype', (torch.bfloat16, torch.float16))
-@pytest.mark.parametrize('level', ALL_LEVELS)
 @pytest.mark.parametrize('scale_sign', (0, -1))
 def test_precision_nonpositive_scale(operation, dtype, level, scale_sign):
     case = Case('scale-edge', 65, 65, 64, 64, span=32, batch=1)
@@ -230,30 +226,18 @@ def test_precision_nonpositive_scale(operation, dtype, level, scale_sign):
     scale = scale_sign * case.dim ** -0.5
     options['scale'] = scale
     refs = [x.detach().double().requires_grad_() for x in inputs]
-    masks = _allowed_masks(65, 65, 1, inputs[0].device,
-                           operation.removeprefix('softdelta_'), 32, qi, ki, False)
-    soft = operation.startswith('softdelta_')
-    reads = None
-    if soft:
-        reads = [
-            _attention_from_mask(refs[0][:, :, i::2], refs[1], refs[2].flatten(3),
-                                 masks[i], scale).reshape(1, 65, 4, 4, 16)
-            for i in (0, 1)
-        ]
-        expected = reads[0] - refs[3].sigmoid() * reads[1]
-    else:
-        expected = _attention_from_mask(*refs, masks[0], scale)
+    masks = _allowed_masks(65, 65, 1, inputs[0].device, operation, 32, qi, ki, False)
+    expected = _attention_from_mask(*refs, masks[0], scale)
     fn = OPERATIONS[operation]
     y = getattr(xattn, fn)(*inputs, **options, high_precision_level=level)
-    assert_output(y, expected, dtype, reads, inputs[3] if soft else None)
+    assert_output(y, expected, dtype)
     dy = torch.randn_like(y) / y.numel() ** 0.5
     reference = torch.autograd.grad(expected, refs, dy.double())
     assert_gradients(torch.autograd.grad(y, inputs, dy), reference, dtype)
-    explicit, saved, lse = getattr(xattn, fn + '_fwd')(
-        *inputs, **options, high_precision_level=level)
-    assert_output(explicit, expected, dtype, reads, inputs[3] if soft else None)
+    explicit, lse = getattr(xattn, fn + '_fwd')(*inputs, **options, high_precision_level=level)
+    assert_output(explicit, expected, dtype)
     gradients = getattr(xattn, fn + '_bwd')(
-        dy, *inputs, explicit if saved is None else saved, lse, **options, high_precision_level=level)[:len(inputs)]
+        dy, *inputs, explicit, lse, **options, high_precision_level=level)[:len(inputs)]
     assert_gradients(gradients, reference, dtype)
     if scale == 0:
         assert torch.count_nonzero(gradients[0]) == 0
@@ -263,32 +247,26 @@ def test_precision_nonpositive_scale(operation, dtype, level, scale_sign):
 @pytest.mark.parametrize('operation', OPERATIONS)
 @pytest.mark.parametrize('dtype', (torch.bfloat16, torch.float16))
 @pytest.mark.parametrize('deterministic', (False, True))
-@pytest.mark.parametrize('level', (2, 3, 4))
-def test_precision_constant_key_support(operation, dtype, deterministic, level):
+def test_precision_constant_key_support(operation, dtype, deterministic):
     device = require_device()
     torch.manual_seed(927)
-    soft = operation.startswith('softdelta_')
-    visibility = operation.removeprefix('softdelta_')
     n, d = 384, 64
-    q = torch.zeros(1, n, 8 if soft else 4, d, device=device, dtype=dtype)
+    q = torch.zeros(1, n, 4, d, device=device, dtype=dtype)
     q[..., 0] = 1
     k = torch.zeros(1, n, 2, d, device=device, dtype=dtype)
-    if visibility == 'full':
+    if operation == 'full':
         k[..., 0] = 800  # Every supported K is identical: dQ is exactly zero.
         start = 0
     else:
         k[:, 0, :, 0] = 800
         start = 256  # Outlier has left the SCA/SWA support completely.
-    shape = (1, n, 2, 4, 16) if soft else (1, n, 2, d)
-    v = (torch.randn(shape, device=device) * (1e30 if dtype == torch.bfloat16 else 1024)).to(dtype)
+    v = (torch.randn(1, n, 2, d, device=device) * (1e30 if dtype == torch.bfloat16 else 1024)).to(dtype)
     q.requires_grad_(); k.requires_grad_(); v.requires_grad_()
     inputs = [q, k, v]
-    if soft:
-        inputs.append(torch.zeros(1, n, 4, 4, 1, device=device, dtype=dtype, requires_grad=True))
-    options = dict(backend='sm90', high_precision_level=level, deterministic=deterministic)
-    if visibility == 'chunk':
+    options = dict(backend='sm90', high_precision_level=1, deterministic=deterministic)
+    if operation == 'chunk':
         options['chunk_size'] = 128
-    elif visibility == 'window':
+    elif operation == 'window':
         options['window_size'] = 127
     out = getattr(xattn, OPERATIONS[operation])(*inputs, **options)
     gradients = torch.autograd.grad(out, inputs, torch.ones_like(out))
@@ -297,10 +275,9 @@ def test_precision_constant_key_support(operation, dtype, deterministic, level):
     assert torch.count_nonzero(gradients[0][:, start:]) == 0
 
 
-@pytest.mark.parametrize('level', (2, 3, 4))
 @pytest.mark.parametrize('deterministic', (False, True))
 @pytest.mark.parametrize('operation', ('full', 'chunk'))
-def test_precision_tiny_probability_large_value(level, deterministic, operation):
+def test_precision_tiny_probability_large_value(deterministic, operation):
     """A tiny P times a huge dP is representable and must not vanish early."""
     device = require_device()
     torch.manual_seed(31415)
@@ -327,17 +304,16 @@ def test_precision_tiny_probability_large_value(level, deterministic, operation)
     inputs = [t.requires_grad_() for t in (q, k, v)]
     options = dict(chunk_size=128) if operation == 'chunk' else {}
     y = getattr(xattn, OPERATIONS[operation])(
-        *inputs, **options, backend='sm90', deterministic=deterministic, high_precision_level=level)
+        *inputs, **options, backend='sm90', deterministic=deterministic, high_precision_level=1)
     for actual, ref in zip(torch.autograd.grad(y, inputs, g), refs):
         assert actual.dtype == torch.bfloat16 and torch.isfinite(actual).all()
         assert (actual.double() - ref).norm() <= .01 * ref.norm()
 
 
-@pytest.mark.parametrize('level', (2, 3, 4))
 @pytest.mark.parametrize('deterministic', (False, True))
 @pytest.mark.parametrize('operation,reset', (
     ('full', False), ('window', False), ('chunk', False), ('chunk', True)))
-def test_precision_segment_constant_keys(level, deterministic, operation, reset):
+def test_precision_segment_constant_keys(deterministic, operation, reset):
     device = require_device()
     torch.manual_seed(927)
     n, d = 257, 64
@@ -351,7 +327,7 @@ def test_precision_segment_constant_keys(level, deterministic, operation, reset)
                'chunk': dict(chunk_size=64, reset_chunk_pos_per_seq=reset)}.get(operation, {})
     y = getattr(xattn, OPERATIONS[operation])(
         q, k, v, **options, segment_idx=ids, backend='sm90',
-        deterministic=deterministic, high_precision_level=level)
+        deterministic=deterministic, high_precision_level=1)
     dq, = torch.autograd.grad(y, q, g)
     assert torch.count_nonzero(dq) == 0
 
@@ -373,34 +349,8 @@ def _llm_like_inputs(operation, case, dtype, kv_heads, device):
     return inputs
 
 
-@pytest.mark.parametrize('operation', ('full', 'chunk', 'softdelta_chunk'))
 @pytest.mark.parametrize('dtype', (torch.bfloat16, torch.float16))
-@pytest.mark.parametrize('deterministic', (False, True))
-@pytest.mark.parametrize('pattern', ('sink', 'flat'))
-def test_level3_row_sum_repair_not_worse_than_level2(operation, dtype, deterministic, pattern):
-    """The variance-weighted zero-sum repair must not lose to level 2 on sink or flat rows."""
-    device = require_device()
-    previous = 128 if operation != 'full' else 0
-    case = Case(f'ladder-{pattern}', 512, 512, 128, 128, previous=previous, span=128, batch=1)
-    inputs = (_llm_like_inputs if pattern == 'sink' else make_inputs)(operation, case, dtype, 1, device)
-    options, qi, ki = options_and_segments(operation, case, inputs, 'sm90')
-    refs, expected, _ = oracle(operation, case, inputs, qi, ki)
-    dy = (torch.randn(expected.shape, device=device) / expected.numel() ** 0.5).to(dtype)
-    want = torch.autograd.grad(expected, refs, dy.double())
-    fn = getattr(xattn, OPERATIONS[operation])
-    errors = {}
-    for level in (2, 3):
-        out = fn(*inputs[:4 if operation.startswith('softdelta_') else 3], **options,
-                 deterministic=deterministic, high_precision_level=level)
-        got = torch.autograd.grad(out, inputs, dy)
-        errors[level] = [float((g.double() - w).norm() / w.norm()) for g, w in zip(got, want)]
-    for e2, e3 in zip(errors[2], errors[3]):
-        assert e3 <= e2 * 1.02 + 1e-7
-
-
-@pytest.mark.parametrize('level', (3, 4))
-@pytest.mark.parametrize('dtype', (torch.bfloat16, torch.float16))
-def test_deterministic_sink_anchor_repair(level, dtype):
+def test_deterministic_sink_anchor_repair(dtype):
     """Thousands of rows anchored at one key span many repair chunks; the ordered
     reduction stays bitwise repeatable and matches the unordered path."""
     device = require_device()
@@ -410,7 +360,7 @@ def test_deterministic_sink_anchor_repair(level, dtype):
     dy = torch.randn(1, 700, 4, 64, device=device, dtype=dtype) / 700 ** 0.5
     results = {}
     for deterministic in (True, True, False):
-        out = xattn.causal_flash_attn(*inputs, **options, deterministic=deterministic, high_precision_level=level)
+        out = xattn.causal_flash_attn(*inputs, **options, deterministic=deterministic, high_precision_level=1)
         results.setdefault(deterministic, []).append(torch.autograd.grad(out, inputs, dy))
     for first, second in zip(*results[True]):
         torch.testing.assert_close(first, second, atol=0, rtol=0)

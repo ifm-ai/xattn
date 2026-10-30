@@ -1,4 +1,3 @@
-from ._backward_precision import validate_high_precision_level
 """Match independent reset-position segments before calling packed FlashSCA."""
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -129,11 +128,12 @@ def _restore(t, indices, batch, length):
 
 
 def matched_forward(q, k, v, chunk_size, scale, prev_k, prev_v, q_idx, k_idx,
-                    backend, attn_method, high_precision_level, deterministic=False,
-                    *, autograd=False, strict_past=False):
+                    backend, attn_method, high_precision=False, deterministic=False,
+                    *, autograd=False, strict_past=False, fp32_state=False):
+    """``(y, FP32 state or None, lse)``, or y alone with ``autograd``. ``high_precision``
+    selects the high-precision softmax; ``fp32_state`` also returns the FP32 output."""
     sca, plan, packed, opts, scale, _, _ = _prepare(
         q, k, v, chunk_size, scale, prev_k, prev_v, q_idx, k_idx, backend, attn_method)
-    validate_high_precision_level(high_precision_level)
     batch, length, heads = q.shape[:3]
     if not plan.max_q:
         y = q.new_zeros((batch, length, heads, v.shape[-1]))
@@ -143,18 +143,18 @@ def matched_forward(q, k, v, chunk_size, scale, prev_k, prev_v, q_idx, k_idx,
                 if x is not None:
                     y = y + (x.sum(dtype=torch.float32) * 0).to(y.dtype)
             return y
-        state = y.float() if high_precision_level else None
+        state = y.float() if fp32_state else None
         return y, state, q.new_full((batch, heads, length), float("inf"), dtype=torch.float32)
     if autograd:
         yp = sca._flash_sca_varlen(*packed, chunk_size, scale, **opts,
-                                  deterministic=deterministic,
-                                  high_precision_level=high_precision_level)
+                                  deterministic=deterministic)
         return _restore(yp, plan.q_indices, batch, length)
     state_packed = (torch.empty((*packed[0].shape[:2], v.shape[-1]),
                                device=q.device, dtype=torch.float32)
-                    if high_precision_level else None)
+                    if fp32_state else None)
     yp, lp = sca._flash_sca_varlen_fwd(*packed, chunk_size, scale, **opts,
-                                     output_state=state_packed, strict_past=strict_past)
+                                     output_state=state_packed, strict_past=strict_past,
+                                     high_precision=bool(high_precision) and not fp32_state)
     y = _restore(yp, plan.q_indices, batch, length)
     state = None if state_packed is None else _restore(state_packed, plan.q_indices, batch, length)
     lf = lp.new_full((heads, batch * length), float("inf"))

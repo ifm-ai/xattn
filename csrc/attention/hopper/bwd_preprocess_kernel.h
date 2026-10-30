@@ -19,8 +19,7 @@ namespace flash {
 using namespace cute;
 
 template <class TileShape_MK_, int kHeadDimQ_, class Element, class ElementAccum,
-          class ArchTag_, bool Clear_dQaccum, bool Varlen,
-          bool OutputStateFp32 = false>
+          class ArchTag_, bool Clear_dQaccum, bool Varlen>
 class AttentionBwdPreprocess {
 
 public:
@@ -91,8 +90,6 @@ public:
         int* dq_semaphore;
         int const* cu_seqlens = nullptr;
         int const* seqused = nullptr;
-        // Optional FP32 backward state follows the fixed argument prefix.
-        float const* ptr_O_state = nullptr;
         // Fixed-point deterministic dQ: max_j |V_j|, max |K| in, row exponents out.
         float const* ptr_fixed_bounds = nullptr;
         int* ptr_dq_exponent = nullptr;
@@ -120,7 +117,6 @@ public:
         int* dq_semaphore;
         int const* cu_seqlens = nullptr;
         int const* seqused = nullptr;
-        float const* ptr_O_state = nullptr;
         float const* ptr_fixed_bounds = nullptr;
         int* ptr_dq_exponent = nullptr;
     };
@@ -150,7 +146,6 @@ public:
             args.dq_semaphore,
             args.cu_seqlens,
             args.seqused,
-            args.ptr_O_state,
             args.ptr_fixed_bounds,
             args.ptr_dq_exponent
         };
@@ -209,42 +204,20 @@ public:
         // Reshape from e.g. (8, kBlockM / 32, kHeadDim / 64) to (kBlockM / 32, (8, kHeadDim / 64))
         Layout l = make_layout(get<1>(tOrO.layout()), make_layout(get<0>(tOrO.layout()), get<2>(tOrO.layout())));
         Tensor tOrO_l = make_tensor(tOrO.data(), l);
+        Tensor mO = make_tensor(
+            make_gmem_ptr(params.ptr_O), params.shape_O,
+            params.stride_O)(_, _, bidh, !is_varlen ? bidb : 0);
+        Tensor gO = local_tile(
+            cute::domain_offset(
+                make_coord(seqlen_info.offset, _0{}), mO),
+            TileShape_MK{}, make_coord(m_block, _0{}));
+        Tensor tOgO = gmem_thr_copy_O.partition_S(gO);
+        flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false,
+                    /*Clear_OOB_MN=*/true, /*Clearn_OOB_K=*/true>(
+            gmem_tiled_copy_O, tOgO, tOrO, tOcO, tOpO,
+            seqlen_o - m_block * kBlockM);
         Tensor o_fp32 = make_tensor_like<float>(tOrO_l);
-        if constexpr (OutputStateFp32) {
-            Tensor mO_state = make_tensor(
-                make_gmem_ptr(params.ptr_O_state), params.shape_O,
-                params.stride_O)(_, _, bidh, !is_varlen ? bidb : 0);
-            Tensor gO_state = local_tile(
-                cute::domain_offset(
-                    make_coord(seqlen_info.offset, _0{}), mO_state),
-                TileShape_MK{}, make_coord(m_block, _0{}));
-            Tensor tOrO_state = make_tensor(o_fp32.data(), tOrO.layout());
-            #pragma unroll
-            for (int i = 0; i < size(tOrO_state); ++i) {
-                auto const coord = tOcO(i);
-                int const row = get<0>(coord);
-                int const col = get<1>(coord);
-                tOrO_state(i) =
-                    row < seqlen_o - m_block * kBlockM &&
-                            col < get<1>(params.shape_O)
-                        ? gO_state(row, col)
-                        : 0.0f;
-            }
-        } else {
-            Tensor mO = make_tensor(
-                make_gmem_ptr(params.ptr_O), params.shape_O,
-                params.stride_O)(_, _, bidh, !is_varlen ? bidb : 0);
-            Tensor gO = local_tile(
-                cute::domain_offset(
-                    make_coord(seqlen_info.offset, _0{}), mO),
-                TileShape_MK{}, make_coord(m_block, _0{}));
-            Tensor tOgO = gmem_thr_copy_O.partition_S(gO);
-            flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false,
-                        /*Clear_OOB_MN=*/true, /*Clearn_OOB_K=*/true>(
-                gmem_tiled_copy_O, tOgO, tOrO, tOcO, tOpO,
-                seqlen_o - m_block * kBlockM);
-            flash::convert_type_out(tOrO_l, o_fp32);
-        }
+        flash::convert_type_out(tOrO_l, o_fp32);
         Tensor tOrdO_l = make_tensor(tOrdO.data(), l);
         Tensor do_fp32 = make_tensor_like<float>(tOrdO_l);
         flash::convert_type_out(tOrdO_l, do_fp32);

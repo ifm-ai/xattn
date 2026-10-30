@@ -111,7 +111,7 @@ public:
     using ShapedQaccum = cute::Shape<int64_t, int32_t, int32_t>;  // (seqlen_q * d, head, batch)
     using StridedQaccum = cute::Stride<_1, int64_t, int64_t>;
 
-    // Negative-query readers (group_softdelta): dQaccum head l = g * readers + r. r > 0
+    // Negative-query readers (softdelta): dQaccum head l = g * readers + r. r > 0
     // writes dQ head g * (readers - 1) + r - 1; r = 0 writes head g of dNegQ, plus
     // the FP32 dK accumulator rows (same head and rows, rounded once) when
     // ptr_dK_accum is set; dNegQ is then dK itself.

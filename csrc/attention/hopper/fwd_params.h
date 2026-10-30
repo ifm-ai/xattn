@@ -73,10 +73,11 @@ struct AttentionFwdParams {
 
   // Opt-in approximate normalization; composed readers use precise normalization.
   bool use_fast_reciprocal;
-  // Internal FP32-only output mode.
-  bool output_fp32;
+  // Subtract-before-scale softmax without the FP32 state (a set o_state_ptr also
+  // selects it).
+  bool high_precision;
 
-  // Negative-query readers (group_softdelta): [B, Lq, Hkv, D] queries of the
+  // Negative-query readers (softdelta): [B, Lq, Hkv, D] queries of the
   // first logical head of every KV group; h then counts logical heads.
   void* __restrict__ neg_q_ptr;
   index_t neg_q_batch_stride;

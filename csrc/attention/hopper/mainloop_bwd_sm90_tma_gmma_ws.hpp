@@ -81,24 +81,22 @@ template <int Stages, int Stages_dO, int Stages_dS, class ClusterShape_, class T
         bool Mma_dP_is_RS=false, bool TwoComponentDV_=false,
         bool ReaderPairKVReuse_=false,
         bool DirectChunkTile_=IsSlidingChunk_,
-        bool HeadPairParallel_=false,
-        bool HeadPairClusterKVReuse_=false,
-        bool HeadPairPrivateKVGrad_=false, bool SplitDQ_=false, int PrecisionLevel_=0,
+        bool SplitDQ_=false, bool PrecisionRepair_=false,
         bool StageDqExp_=true,
         bool NegQReaders_=false>
 struct CollectiveMainloopBwdSm90 {
 
-    static constexpr int PrecisionLevel = PrecisionLevel_;
-    static_assert(PrecisionLevel >= 0 && PrecisionLevel <= 4);
-    // Negative-query readers (group SoftDelta): logical head l = g * R + r over KV head g with
+    // The precision-repair backward: split row statistics, anchored softmax
+    // gradient, hi/lo dS operands and exact dS / P row sums.
+    static constexpr bool PrecisionRepair = PrecisionRepair_;
+    // Negative-query readers (SoftDelta): logical head l = g * R + r over KV head g with
     // R = logical / KV heads. r = 0 reads head g of the negative-query Q / dO
     // descriptors over the strict past; r > 0 reads Q / dO head
     // g * (R - 1) + r - 1 with the inclusive boundary. LSE, dPsum and dQaccum
     // stay logical.
     static constexpr bool NegQReaders = NegQReaders_;
     static_assert(!NegQReaders ||
-                  (!Varlen_ && !HeadPairParallel_ && !HeadPairClusterKVReuse_ &&
-                   PrecisionLevel_ < 2));
+                  (!Varlen_ && !PrecisionRepair_));
     static constexpr int kStages = Stages;
     static constexpr bool SplitDQ = SplitDQ_;
     static constexpr int kStages_dO = Stages_dO;
@@ -144,25 +142,12 @@ struct CollectiveMainloopBwdSm90 {
         }
     }
     static constexpr bool TwoComponentDV = TwoComponentDV_;
+    // Reader groups: one work tile per key tile and KV head over the negative-query
+    // reader and its query readers (head-independent M ranges, also segment-masked;
+    // the strict reader masks one more position per row).
     static constexpr bool ReaderPairKVReuse = ReaderPairKVReuse_;
-    static constexpr bool HeadPairParallel = HeadPairParallel_;
-    static constexpr bool HeadPairClusterKVReuse =
-        HeadPairClusterKVReuse_;
-    static constexpr bool HeadPairPrivateKVGrad =
-        HeadPairPrivateKVGrad_;
-
-    // Negative-query reader groups also run segment-masked rows (head-independent
-    // M ranges; the strict reader masks one more position per row).
-    static_assert(!ReaderPairKVReuse || (!Varlen_ && (!HasSegment_ || NegQReaders_)),
-                  "reader-pair K/V reuse requires dense inputs");
-    static_assert(!HeadPairParallel || (!Varlen_ && !HasSegment_),
-                  "parallel head-pair execution requires dense inputs");
-    static_assert(!HeadPairClusterKVReuse || HeadPairParallel,
-                  "cluster K/V reuse requires parallel head-pair execution");
-    static_assert(!HeadPairPrivateKVGrad || HeadPairParallel,
-                  "private K/V gradients require parallel head-pair execution");
-    static_assert(!(ReaderPairKVReuse && HeadPairParallel),
-                  "same-CTA and parallel head-pair execution are exclusive");
+    static_assert(!ReaderPairKVReuse || (NegQReaders_ && !Varlen_),
+                  "reader groups run the negative-query readers on dense inputs");
 
     static constexpr bool SdP_swapAB = SdP_swapAB_;
     static constexpr bool dKV_swapAB = dKV_swapAB_;
@@ -196,31 +181,16 @@ struct CollectiveMainloopBwdSm90 {
     CUTLASS_DEVICE
     static int q_head_for_reader(int const kv_head, int const reader,
                                  int const readers_per_kv_head) {
-        if constexpr (ReaderPairKVReuse || HeadPairParallel) {
+        if constexpr (ReaderPairKVReuse) {
             return kv_head * readers_per_kv_head + reader;
         } else {
             return kv_head;
         }
     }
 
-    CUTLASS_DEVICE
-    static int head_pair_reader_index() {
-        if constexpr (HeadPairClusterKVReuse) {
-            return int(cute::block_rank_in_cluster());
-        } else if constexpr (HeadPairParallel) {
-            // Non-cluster head pairs use two complete reader planes.
-            return int(blockIdx.x / (gridDim.x / 2));
-        } else {
-            return 0;
-        }
-    }
-
     static_assert(ArchTag::kMinComputeCapability >= 90);
     static_assert(get<2>(ClusterShape{}) == 1);
-    static_assert(
-        get<0>(ClusterShape{}) == 1 ||
-        (HeadPairClusterKVReuse && get<0>(ClusterShape{}) == 2 &&
-         get<1>(ClusterShape{}) == 1));
+    static_assert(get<0>(ClusterShape{}) == 1);
 
     static constexpr int NumMmaThreads = NumMmaWarpGroups * cutlass::NumThreadsPerWarpGroup;
     static constexpr int NumProducerThreads = cutlass::NumThreadsPerWarp * 2;
@@ -380,13 +350,7 @@ struct CollectiveMainloopBwdSm90 {
     >;
 
     using GmemTiledCopyQdO = decltype(cutlass::gemm::collective::detail::sm90_cluster_shape_to_tma_atom(shape<1>(ClusterShape{})));
-    using GmemTiledCopyKV = std::conditional_t<
-        HeadPairClusterKVReuse,
-        decltype(cutlass::gemm::collective::detail::
-                     sm90_cluster_shape_to_tma_atom(shape<0>(ClusterShape{}))),
-        cute::SM90_TMA_LOAD>;
-    using TmaCopyClusterShape = std::conditional_t<
-        HeadPairClusterKVReuse, Shape<_1, _1, _1>, ClusterShape>;
+    using GmemTiledCopyKV = cute::SM90_TMA_LOAD;
 
     using ShapeQKV = cute::Shape<int32_t, int32_t, int32_t, int32_t>;  // (seqlen, d, head, batch)
     using StrideQKV = cute::Stride<int64_t, _1, int64_t, int64_t>;
@@ -414,14 +378,14 @@ struct CollectiveMainloopBwdSm90 {
         make_tensor(make_gmem_ptr(static_cast<Element const*>(nullptr)), ShapeQKV{}, StrideQKV{}),
         SmemLayoutK{},
         TileShape_MNK{},
-        TmaCopyClusterShape{}));
+        ClusterShape{}));
 
     using TMA_V = decltype(make_tma_copy_B_sm90(
         GmemTiledCopyKV{},
         make_tensor(make_gmem_ptr(static_cast<Element const*>(nullptr)), ShapeQKV{}, StrideQKV{}),
         SmemLayoutV{},
         TileShape_MNK_V{},
-        TmaCopyClusterShape{}));
+        ClusterShape{}));
 
     using MainloopPipeline = typename cutlass::PipelineTmaAsync<kStages>;
     using PipelineState = typename MainloopPipeline::PipelineState;
@@ -434,46 +398,23 @@ struct CollectiveMainloopBwdSm90 {
     static constexpr uint32_t TmaTransactionBytesK = static_cast<uint32_t>(size(SmemLayoutK{}) * cutlass::sizeof_bits_v<Element> / 8);
     static constexpr uint32_t TmaTransactionBytesV = static_cast<uint32_t>(size(SmemLayoutV{}) * cutlass::sizeof_bits_v<Element> / 8);
     static constexpr uint32_t TmaTransactionBytesLSE = static_cast<uint32_t>(size(select<0>(SmemLayoutLSE{})) * cutlass::sizeof_bits_v<ElementAccum> / 8);
-    // Advanced precision stages each row's raw maximum with Q, and its
-    // anchored dP (plus the level-4 dO scale) with dO, via the LSE bulk copy.
-    static constexpr bool HPStageRows = PrecisionLevel >= 2;
+    // Precision repair stages each row's raw maximum (and anchor key) with Q,
+    // and its anchored dP and dO scale with dO, via the LSE bulk copy.
+    static constexpr bool HPStageRows = PrecisionRepair;
     // Low-precision deterministic dQ (D <= 128, D = V = 192; must match the
     // launcher): order-free int32 sums on a per-row grid.
-    static constexpr bool kFixedDQ = Deterministic && PrecisionLevel < 2 &&
+    static constexpr bool kFixedDQ = Deterministic && !PrecisionRepair &&
         (kHeadDim <= 128 || (kHeadDim == 192 && kHeadDimV_ == 192));
     static constexpr uint32_t TmaTransactionBytesHPdO =
-        HPStageRows ? (PrecisionLevel == 4 ? 2 : 1) * TmaTransactionBytesLSE : 0;
+        HPStageRows ? 2 * TmaTransactionBytesLSE : 0;
 
-    // Clustered paired readers keep one K/V tile per CTA and use one pipeline
-    // stage. Owner-ranked K and V pipelines arm every multicast destination
-    // before issue. Non-paired kernels use one combined transaction barrier.
-    static constexpr int kStagesKV = 1;
-    using MainloopPipelineKCluster =
-        cutlass::PipelineTmaAsyncSplitMulticast<
-            kStagesKV, 0, TmaTransactionBytesK>;
-    using MainloopPipelineVCluster =
-        cutlass::PipelineTmaAsyncSplitMulticast<
-            kStagesKV, 1, TmaTransactionBytesV>;
-    using MainloopPipelineK = std::conditional_t<
-        HeadPairClusterKVReuse, MainloopPipelineKCluster, decltype(nullptr)>;
-    using MainloopPipelineV = std::conditional_t<
-        HeadPairClusterKVReuse, MainloopPipelineVCluster, decltype(nullptr)>;
-    using PipelineStateKV = cutlass::PipelineState<kStagesKV>;
-
-    struct CombinedKVSharedStorage : cute::aligned_struct<16> {
+    // K and V of a work tile arrive under one transaction barrier.
+    struct KVSharedStorage : cute::aligned_struct<16> {
         alignas(16) cutlass::arch::ClusterTransactionBarrier barrier_KV;
     };
-    struct ClusterKVSharedStorage : cute::aligned_struct<16> {
-        alignas(16) typename MainloopPipelineKCluster::SharedStorage pipeline_k;
-        alignas(16) typename MainloopPipelineVCluster::SharedStorage pipeline_v;
-    };
-    using KVSharedStorage = std::conditional_t<
-        HeadPairClusterKVReuse,
-        ClusterKVSharedStorage,
-        CombinedKVSharedStorage>;
 
     // Separate causal-mask iterations for selected head dimensions.
-    static constexpr bool SeparateMaskingIterations = PrecisionLevel < 2 && kHeadDim <= 64;
+    static constexpr bool SeparateMaskingIterations = !PrecisionRepair && kHeadDim <= 64;
     // ShuffleLSE distributes row statistics across eight threads.
     static constexpr bool ShuffleLSE = SdP_swapAB && kHeadDim <= 64;
     static constexpr bool ShuffledPsum = SdP_swapAB && kHeadDim <= 64;
@@ -482,7 +423,7 @@ struct CollectiveMainloopBwdSm90 {
         !Deterministic || dQacc_use_TMA,
         "Deterministic attention BWD must not use unordered dQ atomicAdd");
     // Split hdim256 dQ MMA into two 128-column slices with separate atomic adds.
-    static constexpr bool Slice_dQKV_Mma = PrecisionLevel != 4 && kHeadDim == 256 && kHeadDimV == 256 && !dQacc_use_TMA && dQ_swapAB && AtomLayoutMdQ == 1 && NumMmaWarpGroups == 2;
+    static constexpr bool Slice_dQKV_Mma = !PrecisionRepair && kHeadDim == 256 && kHeadDimV == 256 && !dQacc_use_TMA && dQ_swapAB && AtomLayoutMdQ == 1 && NumMmaWarpGroups == 2;
     static_assert(!(Deterministic && Slice_dQKV_Mma), "Deterministic mode not supported with Slice_dQKV_Mma");
 
     static constexpr size_t SmemAlignmentP = cutlass::detail::alignment_for_swizzle(SmemLayoutPdS{});
@@ -514,8 +455,8 @@ struct CollectiveMainloopBwdSm90 {
     struct TensorStorageHP : TensorStorageLP {
         cute::array_aligned<ElementAccum, cute::cosize_v<SmemLayoutLSE>, 128> smem_hpmax;
         cute::array_aligned<ElementAccum, cute::cosize_v<SmemLayoutLSE>, 128> smem_hpanchor;
-        cute::array_aligned<ElementAccum, PrecisionLevel == 4 ? cute::cosize_v<SmemLayoutLSE> : 1, 128> smem_hpscale;
-        cute::array_aligned<ElementAccum, PrecisionLevel == 4 ? cute::cosize_v<SmemLayoutLSE> : 1, 128> smem_hpanchoridx;
+        cute::array_aligned<ElementAccum, PrecisionRepair ? cute::cosize_v<SmemLayoutLSE> : 1, 128> smem_hpscale;
+        cute::array_aligned<ElementAccum, PrecisionRepair ? cute::cosize_v<SmemLayoutLSE> : 1, 128> smem_hpanchoridx;
     };
     // Low-precision deterministic dQ: one staged row array (fixed-point exponents).
     struct TensorStorageFixedDQ : TensorStorageLP {
@@ -528,7 +469,7 @@ struct CollectiveMainloopBwdSm90 {
     static constexpr bool kStageDqExp = kFixedDQ && StageDqExp_;
     using TensorStorage = std::conditional_t<HPStageRows, TensorStorageHP,
         std::conditional_t<kStageDqExp, TensorStorageFixedDQ, TensorStorageLP>>;
-    static constexpr uint32_t TmaTransactionBytesHPQ = HPStageRows ? (PrecisionLevel == 4 ? 2 : 1) * TmaTransactionBytesLSE
+    static constexpr uint32_t TmaTransactionBytesHPQ = HPStageRows ? 2 * TmaTransactionBytesLSE
         : (kStageDqExp ? TmaTransactionBytesLSE : 0);
 
     // Host side kernel arguments
@@ -570,8 +511,6 @@ struct CollectiveMainloopBwdSm90 {
         int const* const q_chunk_positions = nullptr;
         int const reset_attention_chunk = 0;
         int const* const deterministic_segment_ranges = nullptr;
-        // Paired-reader state extends the fixed SWA/SCA argument prefix.
-        int const odd_head_window_right_delta = 0;
         int const dq_slots = 1;
         int64_t const dq_slot_stride = 0;
         float* hp_rho = nullptr;
@@ -637,9 +576,6 @@ struct CollectiveMainloopBwdSm90 {
         int const* const q_chunk_positions = nullptr;
         cutlass::FastDivmod reset_attention_chunk_divmod;
         int const* const deterministic_segment_ranges = nullptr;
-        // Paired-reader state extends the fixed device-parameter prefix and is
-        // compiled out of ordinary kernels.
-        int const odd_head_window_right_delta = 0;
         int const dq_slots = 1;
         int64_t const dq_slot_stride = 0;
         float* hp_rho = nullptr;
@@ -669,9 +605,6 @@ struct CollectiveMainloopBwdSm90 {
                 int group, reader;
                 qhead_per_khead_divmod.fast_divmod(group, reader, bidh);
                 return window_size_right + (reader == 0 ? -1 : 0);
-            } else if constexpr (ReaderPairKVReuse || HeadPairParallel) {
-                return window_size_right +
-                    ((bidh & 1) ? odd_head_window_right_delta : 0);
             } else {
                 return window_size_right;
             }
@@ -710,14 +643,14 @@ struct CollectiveMainloopBwdSm90 {
             mK,
             SmemLayoutK{},
             TileShape_MNK{},
-            TmaCopyClusterShape{});
+            ClusterShape{});
         Tensor mV = make_tensor(make_gmem_ptr(args.ptr_V), args.shape_V, args.stride_V);
         TMA_V tma_load_V = make_tma_copy_B_sm90(
             GmemTiledCopyKV{},
             mV,
             SmemLayoutV{},
             TileShape_MNK_V{},
-            TmaCopyClusterShape{});
+            ClusterShape{});
         if constexpr (Deterministic) { assert(args.dq_semaphore != nullptr); }
         if constexpr (Deterministic && !kFixedDQ && Has_segment) {
             assert(args.deterministic_segment_ranges != nullptr);
@@ -768,7 +701,6 @@ struct CollectiveMainloopBwdSm90 {
                 args.q_position_offsets, args.q_chunk_positions,
                 reset_attention_chunk_divmod,
                 args.deterministic_segment_ranges,
-                args.odd_head_window_right_delta,
                 args.dq_slots, args.dq_slot_stride, args.hp_rho, args.hp_mass,
                 args.hp_row_max, args.hp_row_anchor, args.hp_row_scale, args.hp_row_anchor_index,
                 args.hp_rho_exponent, args.dq_exponent,
@@ -851,16 +783,12 @@ struct CollectiveMainloopBwdSm90 {
     cute::tuple<int32_t, int32_t>
     get_m_block_range(Params const& params,
                       cute::tuple<int32_t, int32_t, int32_t> block_coord) const {
-        int const kv_head = get<1>(block_coord);
-        int const reader = HeadPairParallel
-            ? head_pair_reader_index()
-            : 0;
         // Grouped readers share the coarse M-tile range; their element masks
         // differ by one position. BWD tile widths are multiples of 16.
         return get_m_block_range_for_q_head(
             params, block_coord,
             q_head_for_reader(
-                kv_head, reader,
+                get<1>(block_coord), 0,
                 params.qhead_per_khead_divmod.divisor));
     }
 
@@ -1081,11 +1009,8 @@ struct CollectiveMainloopBwdSm90 {
     load(Params const& params,
          MainloopPipeline pipeline_q,
          MainloopPipeline_dO pipeline_do,
-         MainloopPipelineK pipeline_k,
-         MainloopPipelineV pipeline_v,
          PipelineState& smem_pipe_write,
          PipelineState_dO& smem_pipe_write_do,
-         PipelineStateKV& smem_pipe_write_kv,
          SharedStorage &shared_storage,
          SchedulerPrefetch const& scheduler_prefetch,
          cute::tuple<int32_t, int32_t, int32_t> block_coord,
@@ -1101,7 +1026,7 @@ struct CollectiveMainloopBwdSm90 {
         }
 
         int const n_block = get<0>(block_coord);
-        int const scheduled_head = get<1>(block_coord);
+        int const bidh = get<1>(block_coord);
         int const bidb = get<2>(block_coord);
         SeqlenInfo_t seqlen_info{
             bidb, get<0>(params.shape_Q), size<0>(params.shape_K),
@@ -1128,14 +1053,7 @@ struct CollectiveMainloopBwdSm90 {
         uint32_t block_rank_in_cluster = cute::block_rank_in_cluster();
         constexpr uint32_t cluster_shape_x = get<0>(ClusterShape());
         uint2 cluster_local_block_id = {block_rank_in_cluster % cluster_shape_x, block_rank_in_cluster / cluster_shape_x};
-        int const bidh = HeadPairParallel
-            ? q_head_for_reader(
-                  scheduled_head, head_pair_reader_index(),
-                  params.qhead_per_khead_divmod.divisor)
-            : scheduled_head;
-        int const bidh_kv = HeadPairParallel
-            ? scheduled_head
-            : params.qhead_per_khead_divmod.divide(bidh);
+        int const bidh_kv = params.qhead_per_khead_divmod.divide(bidh);
         bool const is_varlen_q = Varlen && params.cu_seqlens_q;
         bool const is_varlen_k = Varlen && params.cu_seqlens_k;
         QdOLoad const qdo = qdo_load(params, bidh);
@@ -1178,7 +1096,7 @@ struct CollectiveMainloopBwdSm90 {
             if constexpr (HPStageRows) {
                 Tensor sHP = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_hpmax.data()), SmemLayoutLSE{});
                 copy(bulk_copy.with(barrier), hp_rows(params.hp_row_max)(_, m_block_), sHP(_, stage));
-                if constexpr (PrecisionLevel == 4) {
+                if constexpr (PrecisionRepair) {
                     Tensor sIdx = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_hpanchoridx.data()), SmemLayoutLSE{});
                     copy(bulk_copy.with(barrier), hp_rows(params.hp_row_anchor_index)(_, m_block_), sIdx(_, stage));
                 }
@@ -1191,7 +1109,7 @@ struct CollectiveMainloopBwdSm90 {
             if constexpr (HPStageRows) {
                 Tensor sHP = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_hpanchor.data()), SmemLayoutLSE{});
                 copy(bulk_copy.with(barrier), hp_rows(params.hp_row_anchor)(_, m_block_), sHP(_, stage));
-                if constexpr (PrecisionLevel == 4) {
+                if constexpr (PrecisionRepair) {
                     Tensor sScale = make_tensor(make_smem_ptr(shared_storage.tensors.mainloop.smem_hpscale.data()), SmemLayoutLSE{});
                     copy(bulk_copy.with(barrier), hp_rows(params.hp_row_scale)(_, m_block_), sScale(_, stage));
                 }
@@ -1205,14 +1123,7 @@ struct CollectiveMainloopBwdSm90 {
                 mcast_mask_qdo |= (uint16_t(1) << block_layout(cluster_local_block_id.x, n, _0{}));
             }
         }
-        uint16_t mcast_mask_kv = 0;
-        if constexpr (cute::is_same_v<GmemTiledCopyKV, SM90_TMA_LOAD_MULTICAST>) {
-            auto block_layout = Layout<ClusterShape>{};
-            for (int m = 0; m < size<0>(block_layout); ++m) {
-                mcast_mask_kv |= uint16_t(1) <<
-                    block_layout(m, cluster_local_block_id.y, _0{});
-            }
-        }
+        uint16_t const mcast_mask_kv = 0;
 
         int m_block = m_block_min;
 
@@ -1228,41 +1139,19 @@ struct CollectiveMainloopBwdSm90 {
         }
 
         if (lane_predicate) {
-            // Copy K tile and V tile from GMEM to SMEM. The clustered path
-            // arms both the local and peer full barriers before issuing the
-            // complete-box multicast transaction owned by each rank.
-            if constexpr (HeadPairClusterKVReuse) {
-                if (cluster_local_block_id.x == 0) {
-                    pipeline_k.producer_acquire(smem_pipe_write_kv);
-                    copy(params.tma_load_K.with(
-                             *pipeline_k.producer_get_barrier(
-                                 smem_pipe_write_kv),
-                             mcast_mask_kv),
-                         tKgK, tKsK);
-                }
-                if (cluster_local_block_id.x == 1) {
-                    pipeline_v.producer_acquire(smem_pipe_write_kv);
-                    copy(params.tma_load_V.with(
-                             *pipeline_v.producer_get_barrier(
-                                 smem_pipe_write_kv),
-                             mcast_mask_kv),
-                         tVgV, tVsV);
-                }
-                ++smem_pipe_write_kv;
-            } else {
-                shared_storage.pipelines.kv.barrier_KV.arrive_and_expect_tx(
-                    TmaTransactionBytesK + TmaTransactionBytesV);
-                copy(params.tma_load_K.with(
-                         reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(
-                             shared_storage.pipelines.kv.barrier_KV),
-                         mcast_mask_kv),
-                     tKgK, tKsK);
-                copy(params.tma_load_V.with(
-                         reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(
-                             shared_storage.pipelines.kv.barrier_KV),
-                         mcast_mask_kv),
-                     tVgV, tVsV);
-            }
+            // Copy K tile and V tile from GMEM to SMEM.
+            shared_storage.pipelines.kv.barrier_KV.arrive_and_expect_tx(
+                TmaTransactionBytesK + TmaTransactionBytesV);
+            copy(params.tma_load_K.with(
+                     reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(
+                         shared_storage.pipelines.kv.barrier_KV),
+                     mcast_mask_kv),
+                 tKgK, tKsK);
+            copy(params.tma_load_V.with(
+                     reinterpret_cast<cutlass::arch::ClusterTransactionBarrier::ValueType&>(
+                         shared_storage.pipelines.kv.barrier_KV),
+                     mcast_mask_kv),
+                 tVgV, tVsV);
 
             #pragma unroll (kHeadDim < 256 && kHeadDimV < 256 ? 2 : 1)
             for (; m_block < m_block_max - 1; ++m_block) {
@@ -1317,23 +1206,13 @@ struct CollectiveMainloopBwdSm90 {
     /// Perform a Producer Epilogue to prevent early exit of blocks in a Cluster
     CUTLASS_DEVICE void
     load_tail(MainloopPipeline pipeline_q, MainloopPipeline_dO pipeline_do,
-              MainloopPipelineK pipeline_k, MainloopPipelineV pipeline_v,
               PipelineState& smem_pipe_write,
-              PipelineState_dO& smem_pipe_write_do,
-              PipelineStateKV& smem_pipe_write_kv) {
+              PipelineState_dO& smem_pipe_write_do) {
         // Issue the epilogue waits
         if (cute::elect_one_sync()) {
             // Wait for every pipeline stage to be released or unused.
             pipeline_q.producer_tail(smem_pipe_write);
             pipeline_do.producer_tail(smem_pipe_write_do);
-            if constexpr (HeadPairClusterKVReuse) {
-                if (cute::block_rank_in_cluster() == 0) {
-                    pipeline_k.producer_tail(smem_pipe_write_kv);
-                }
-                if (cute::block_rank_in_cluster() == 1) {
-                    pipeline_v.producer_tail(smem_pipe_write_kv);
-                }
-            }
         }
     }
 
@@ -1623,14 +1502,6 @@ struct CollectiveMainloopBwdSm90 {
                     params, shared_storage, block_coord, m_block_range,
                     q_head);
             }
-        } else if constexpr (HeadPairParallel) {
-            int const kv_head = get<1>(block_coord);
-            int const q_head = q_head_for_reader(
-                kv_head, head_pair_reader_index(),
-                params.qhead_per_khead_divmod.divisor);
-            store_dq_for_q_head(
-                params, shared_storage, block_coord, m_block_range,
-                q_head);
         } else {
             store_dq_for_q_head(
                 params, shared_storage, block_coord, m_block_range,
@@ -1833,14 +1704,12 @@ struct CollectiveMainloopBwdSm90 {
         if constexpr (InitializeAccumulators) {
             clear(tdKrdK);
             clear(tdVrdV);
-            if constexpr (!HeadPairClusterKVReuse) {
-                cutlass::ConsumerToken barrier_token =
-                    static_cast<cutlass::BarrierStatus>(
-                        shared_storage.pipelines.kv.barrier_KV.try_wait(
-                            work_idx % 2));
-                if (barrier_token == cutlass::BarrierStatus::WaitAgain) {
-                    shared_storage.pipelines.kv.barrier_KV.wait(work_idx % 2);
-                }
+            cutlass::ConsumerToken barrier_token =
+                static_cast<cutlass::BarrierStatus>(
+                    shared_storage.pipelines.kv.barrier_KV.try_wait(
+                        work_idx % 2));
+            if (barrier_token == cutlass::BarrierStatus::WaitAgain) {
+                shared_storage.pipelines.kv.barrier_KV.wait(work_idx % 2);
             }
         }
 
@@ -1939,7 +1808,7 @@ struct CollectiveMainloopBwdSm90 {
                 }();
                 #pragma unroll
                 for (int ni = 0; ni < size<1>(scores); ++ni) {
-                    if constexpr (PrecisionLevel >= 2) {
+                    if constexpr (PrecisionRepair) {
                     // Split maximum/log-normalizer avoids cancellation in reconstructed P.
                     float shifted = __fmul_rn(__fsub_rn(scores(mi,ni), hp_max), params.softmax_scale_log2);
                     scores(mi, ni) = flash::attention_exp2f<UseFastExp2>(0.5f * (shifted - lse_scaled));
@@ -1968,7 +1837,7 @@ struct CollectiveMainloopBwdSm90 {
                 else return 0;
             }();
             auto tHPrScale = [&] {
-                if constexpr (PrecisionLevel == 4) return hp_read(shared_storage.tensors.mainloop.smem_hpscale.data(), smem_pipe_read_do_cur.index());
+                if constexpr (PrecisionRepair) return hp_read(shared_storage.tensors.mainloop.smem_hpscale.data(), smem_pipe_read_do_cur.index());
                 else return 0;
             }();
             #pragma unroll
@@ -1981,17 +1850,16 @@ struct CollectiveMainloopBwdSm90 {
                     if constexpr (HPStageRows) return hp_value(tHPrAnchor, mi);
                     else return 0.f;
                 }();
-                // Levels 2/3 receive the exact unit scale; level 4 stages it.
                 float const row_scale = [&] {
-                    if constexpr (PrecisionLevel == 4) return hp_value(tHPrScale, mi);
+                    if constexpr (PrecisionRepair) return hp_value(tHPrScale, mi);
                     else return 1.f;
                 }();
                 #pragma unroll
                 for (int ni = 0; ni < size<1>(dS); ++ni) {
-                    if constexpr (PrecisionLevel >= 2) {
-                    // Staged sqrt(P) multiplication also protects level 2 tails
-                    // from exp2 underflow before a large dP rescales them.
-                    if constexpr (PrecisionLevel >= 2) {
+                    if constexpr (PrecisionRepair) {
+                    // Staged sqrt(P) multiplication protects the tails from exp2
+                    // underflow before a large dP rescales them.
+                    if constexpr (PrecisionRepair) {
                     dS(mi, ni) = __fmul_rn(scores(mi, ni), __fmul_rn(scores(mi, ni), (__fsub_rn(__fmul_rn(dS(mi, ni),row_scale), hp_dp_anchor) - dP_sum_cur)));
                     float scaled_root = __fmul_rn(scores(mi, ni), __int_as_float((__float_as_int(row_scale) >> 1) + 0x1fc00000));
                     scores(mi, ni) = __fmul_rn(scaled_root, scaled_root);
@@ -2031,19 +1899,18 @@ struct CollectiveMainloopBwdSm90 {
             Tensor rdS = make_tensor_like<Element>(tdPrdP);
             flash::convert_type_out(tdPrdP, rdS);
             Tensor rdSLo = make_tensor_like<Element>(tdPrdP);
-            if constexpr (PrecisionLevel == 4) {
+            if constexpr (PrecisionRepair) {
                 #pragma unroll
                 for (int i = 0; i < size(rdS); ++i) { tdPrdP(i) -= static_cast<float>(rdS(i)); }
                 flash::convert_type_out(tdPrdP, rdSLo);
             }
-            if constexpr (PrecisionLevel >= 3) {
+            if constexpr (PrecisionRepair) {
             if (params.hp_rho != nullptr) {
-                // Row sums of the actual dS operand (level 4: hi+lo, P mass and
-                // anchor probability, unscaled) in FP64: each element is exact
+                // Row sums of the actual dS operand (hi+lo), its P mass and
+                // anchor probability (unscaled) in FP64: each element is exact
                 // in FP32 (hi+lo, P hi+residual), so the FP64 sums are exact.
-                // Level 3 also sums dS^2, the rounding-variance weight of its
-                // zero-sum repair. A vector butterfly reduces all rows across
-                // the lanes sharing them in log2(L) levels.
+                // A vector butterfly reduces all rows across the lanes sharing
+                // them in log2(L) levels.
                 Tensor coord = thread_mma_SdP.partition_C(make_identity_tensor(select<!SdP_swapAB ? 0 : 1, !SdP_swapAB ? 1 : 0>(TileShape_MNK{})));
                 Tensor rc = make_tensor(coord.data(), flash::convert_layout_acc_rowcol</*Transposed=*/SdP_swapAB>(coord.layout()));
                 Tensor hirow = make_tensor(rdS.data(), scores.layout());
@@ -2055,23 +1922,21 @@ struct CollectiveMainloopBwdSm90 {
                 constexpr int First = SdP_swapAB ? 4 : 1;
                 static_assert((R & (R - 1)) == 0, "row partial count must be a power of two");
                 auto tHPrAnchorIdx = [&] {
-                    if constexpr (PrecisionLevel == 4) return hp_read(shared_storage.tensors.mainloop.smem_hpanchoridx.data(), smem_pipe_read.index());
+                    if constexpr (PrecisionRepair) return hp_read(shared_storage.tensors.mainloop.smem_hpanchoridx.data(), smem_pipe_read.index());
                     else return 0;
                 }();
                 double sr[R];
-                [[maybe_unused]] double s2[PrecisionLevel == 3 ? R : 1];
-                [[maybe_unused]] double pm[PrecisionLevel == 4 ? R : 1], pa[PrecisionLevel == 4 ? R : 1];
+                [[maybe_unused]] double pm[PrecisionRepair ? R : 1], pa[PrecisionRepair ? R : 1];
                 #pragma unroll
                 for (int mi = 0; mi < R; ++mi) {
                     sr[mi] = 0.0;
-                    if constexpr (PrecisionLevel == 3) { s2[mi] = 0.0; }
-                    if constexpr (PrecisionLevel == 4) { pm[mi] = 0.0; pa[mi] = 0.0; }
+                    if constexpr (PrecisionRepair) { pm[mi] = 0.0; pa[mi] = 0.0; }
                     [[maybe_unused]] float anchor_col = 0.f;
-                    if constexpr (PrecisionLevel == 4) { anchor_col = hp_value(tHPrAnchorIdx, mi); }
+                    if constexpr (PrecisionRepair) { anchor_col = hp_value(tHPrAnchorIdx, mi); }
                     #pragma unroll
                     for (int ni = 0; ni < size<1>(scores); ++ni) {
                         float h = static_cast<float>(hirow(mi, ni));
-                        if constexpr (PrecisionLevel == 4) {
+                        if constexpr (PrecisionRepair) {
                             // hi + lo is exact in FP32, as is P hi + P residual.
                             h += static_cast<float>(lorow(mi, ni));
                             float pv = static_cast<float>(prow(mi, ni));
@@ -2081,9 +1946,8 @@ struct CollectiveMainloopBwdSm90 {
                             if (float(col) == anchor_col) { pa[mi] += static_cast<double>(pv); }
                         }
                         sr[mi] += static_cast<double>(h);
-                        if constexpr (PrecisionLevel == 3) { s2[mi] += static_cast<double>(h) * static_cast<double>(h); }
                     }
-                    if constexpr (PrecisionLevel == 4) {
+                    if constexpr (PrecisionRepair) {
                         // Power-of-two inverse dO scale: exact unless underflow.
                         double const inv_scale = __int_as_float(0x7f000000 - __float_as_int(hp_value(tHPrScale, mi)));
                         pm[mi] *= inv_scale; pa[mi] *= inv_scale;
@@ -2091,8 +1955,7 @@ struct CollectiveMainloopBwdSm90 {
                 }
                 int const lane = thread_idx % cutlass::NumThreadsPerWarp;
                 hp_butterfly<R, First, First * L>(sr, lane);
-                if constexpr (PrecisionLevel == 3) { hp_butterfly<R, First, First * L>(s2, lane); }
-                if constexpr (PrecisionLevel == 4) {
+                if constexpr (PrecisionRepair) {
                     hp_butterfly<R, First, First * L>(pm, lane);
                     hp_butterfly<R, First, First * L>(pa, lane);
                 }
@@ -2112,24 +1975,20 @@ struct CollectiveMainloopBwdSm90 {
                         if (row < seqlen_q) {
                             if constexpr (Deterministic) {
                                 // Integer sums commute: each tile partial rounds once to
-                                // a fixed per-row grid (2^(e-62) for dS, 2^(2e-68) for
-                                // dS^2, 2^-60 for the P masses, which are at most ~1),
+                                // a fixed per-row grid (2^(e-62) for dS, 2^-60 for the
+                                // P masses, which are at most ~1),
                                 // so the totals are bitwise reproducible under any CTA
                                 // order.
                                 auto* fixed = reinterpret_cast<unsigned long long*>(rho);
                                 int const e = params.hp_rho_exponent[base + row];
                                 atomicAdd(fixed + base + row, static_cast<unsigned long long>(__double2ll_rn(scalbn(sr[k], 62 - e))));
-                                if constexpr (PrecisionLevel == 3) {
-                                    atomicAdd(fixed + 2 * count + base + row, static_cast<unsigned long long>(__double2ll_rn(scalbn(s2[k], 68 - 2 * e))));
-                                }
-                                if constexpr (PrecisionLevel == 4) {
+                                if constexpr (PrecisionRepair) {
                                     atomicAdd(fixed + count + base + row, static_cast<unsigned long long>(__double2ll_rn(scalbn(pm[k], 60))));
                                     atomicAdd(fixed + 3 * count + base + row, static_cast<unsigned long long>(__double2ll_rn(scalbn(pa[k], 60))));
                                 }
                             } else {
                                 atomicAdd(rho + base + row, sr[k]);
-                                if constexpr (PrecisionLevel == 3) { atomicAdd(rho + 2 * count + base + row, s2[k]); }
-                                if constexpr (PrecisionLevel == 4) {
+                                if constexpr (PrecisionRepair) {
                                     atomicAdd(rho + count + base + row, pm[k]);
                                     atomicAdd(rho + 3 * count + base + row, pa[k]);
                                 }
@@ -2186,7 +2045,7 @@ struct CollectiveMainloopBwdSm90 {
                     flash::gemm</*zero_init=*/false, /*wg_wait=*/1, /*SwapAB=*/dKV_swapAB>(tiled_mma_dK, tdKrdS_cur, tdKrQ(_, _, _, smem_pipe_read.index()), tdKrdK);
                 }
 
-                if constexpr (PrecisionLevel == 4) {
+                if constexpr (PrecisionRepair) {
                 static_assert(!Slice_dQKV_Mma, "HP D64/D128 unsliced dK");
                 warpgroup_wait<0>();
                 cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<uint32_t>(AttentionBwdNamedBarrier::PdS));
@@ -2402,11 +2261,8 @@ struct CollectiveMainloopBwdSm90 {
     mma(Params const& params,
         MainloopPipeline pipeline_q,
         MainloopPipeline_dO pipeline_do,
-        MainloopPipelineK pipeline_k,
-        MainloopPipelineV pipeline_v,
         PipelineState& smem_pipe_read,
         PipelineState_dO& smem_pipe_read_do,
-        PipelineStateKV& smem_pipe_read_kv,
         FrgTensordK& tdKrdK,
         FrgTensordV& tdVrdV,
         int thread_idx,
@@ -2448,38 +2304,11 @@ struct CollectiveMainloopBwdSm90 {
             ++work_idx;
             return true;
         } else {
-            int const scheduled_head = get<1>(block_coord);
-            int const q_head = HeadPairParallel
-                ? q_head_for_reader(
-                      scheduled_head, head_pair_reader_index(),
-                      params.qhead_per_khead_divmod.divisor)
-                : scheduled_head;
-            if constexpr (HeadPairClusterKVReuse) {
-                if constexpr (Is_causal || Is_local || Varlen) {
-                    if (get<1>(m_block_range) <= get<0>(m_block_range)) {
-                        return false;
-                    }
-                }
-                auto token_k =
-                    pipeline_k.consumer_try_wait(smem_pipe_read_kv);
-                auto token_v =
-                    pipeline_v.consumer_try_wait(smem_pipe_read_kv);
-                pipeline_k.consumer_wait(smem_pipe_read_kv, token_k);
-                pipeline_v.consumer_wait(smem_pipe_read_kv, token_v);
-            }
-            bool const tile_valid = mma_for_q_head<true, true>(
+            return mma_for_q_head<true, true>(
                 params, pipeline_q, pipeline_do, smem_pipe_read,
                 smem_pipe_read_do, tdKrdK, tdVrdV, thread_idx, work_idx,
                 block_coord, m_block_range, shared_storage,
-                q_head);
-            if constexpr (HeadPairClusterKVReuse) {
-                if (tile_valid) {
-                    pipeline_k.consumer_release(smem_pipe_read_kv);
-                    pipeline_v.consumer_release(smem_pipe_read_kv);
-                    ++smem_pipe_read_kv;
-                }
-            }
-            return tile_valid;
+                get<1>(block_coord));
         }
     }
 

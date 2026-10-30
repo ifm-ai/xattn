@@ -518,10 +518,10 @@ def test_flash_sca_routes_match_reference(
         )
 
 
-def test_flash_sca_high_precision_varlen_matches_fp64_reference():
+def test_flash_sca_packed_varlen_bos_matches_fp64_reference():
     requires_xattn_cuda()
     if torch.cuda.get_device_capability()[0] != 9:
-        pytest.skip("the high-precision varlen test requires SM90")
+        pytest.skip("the packed varlen test requires SM90")
 
     torch.manual_seed(20260827)
     dtype = torch.bfloat16
@@ -580,7 +580,6 @@ def test_flash_sca_high_precision_varlen_matches_fp64_reference():
         position_offsets=packed["position_offsets"],
         backend="sm90",
         deterministic=True,
-        high_precision_level=int(True),
     )
     expected = y_ref.flatten(0, 1).index_select(
         0, packed["q_dense_indices"]
@@ -784,7 +783,7 @@ def test_flash_sca_global_chunk_positions(
         False,
     )
 
-    y, _, lse = flash_sca_fwd(
+    y, lse = flash_sca_fwd(
         q,
         k,
         v,

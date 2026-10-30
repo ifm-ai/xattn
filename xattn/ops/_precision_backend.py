@@ -1,17 +1,14 @@
-"""Shared advanced-precision reader backward for the six SM90 families.
-
-The visible-support policy is independent of numerical level. SoftDelta calls
-this for each reader and combines FP32 accumulators before the public cast.
+"""Precision-repair backward (high_precision_level=1) shared by the SM90 attention
+families. SoftDelta calls it for each read and combines the FP32 accumulators
+before the public cast.
 """
-from typing import Optional
 import torch
-from ._backward_precision import validate_high_precision_level
 from ._segment_metadata import resolve_segment_indices, validate_segment_indices
 from ._attention_core import resolve_scale
 
 
-# Level 3/4 zero-sum repair spreads the non-anchor share of each row's dS
-# operand residual over its last ZERO_SUM_WINDOW admitted keys.
+# The zero-sum repair spreads the non-anchor share of each row's dS operand
+# residual over its last ZERO_SUM_WINDOW admitted keys.
 ZERO_SUM_WINDOW = 64
 _PRESCALE_TARGET = 2.0 ** 13
 
@@ -25,17 +22,14 @@ def _ops():
             '_attention_precision_ordered_backward',
             '_attention_precision_key_runs',
             '_attention_precision_enforce_constant_keys')):
-        raise RuntimeError('high_precision_level >= 2 requires rebuilding the xattn SM90 CUDA extension')
+        raise RuntimeError('high_precision_level=1 requires rebuilding the xattn SM90 CUDA extension')
     return ops
 
 
-def backward(dy, q, k, v, *, level, visibility, span=None, scale=None,
+def backward(dy, q, k, v, *, visibility, span=None, scale=None,
              prev_k=None, prev_v=None, q_segment_idx=None, k_segment_idx=None,
              segment_idx=None, bos_mask=None, reset=False, strict=False,
              deterministic=False, backend='sm90', return_fp32=False):
-    validate_high_precision_level(level)
-    if level < 2:
-        raise ValueError('advanced precision backward requires level 2..4')
     if backend.strip().lower() not in ('', 'auto', 'sm90'):
         raise ValueError('advanced precision requires the SM90 backend')
     if not q.is_cuda or torch.cuda.get_device_capability(q.device)[0] != 9:
@@ -84,7 +78,7 @@ def backward(dy, q, k, v, *, level, visibility, span=None, scale=None,
     if reset and qi is not None:
         from ._sca_segment_alignment import needs_matched_reset
         if needs_matched_reset(q, qi, ki, True):
-            outputs = _matched_backward(dy, q, kt, vt, qi, ki, level, span, scale, strict, deterministic)
+            outputs = _matched_backward(dy, q, kt, vt, qi, ki, span, scale, strict, deterministic)
             outputs = _restore_scale_gradients(outputs, original_scale)
             return _finish(outputs, q.dtype, previous, return_fp32)
     q, kt, vt, dy = (x.contiguous() for x in (q, kt, vt, dy))
@@ -132,47 +126,37 @@ def backward(dy, q, k, v, *, level, visibility, span=None, scale=None,
     vc, _ = ops._attention_precision_center(vt)
     dy, inverse_prescale = _prescale_fp16(dy, vc)
     delta, logz, metadata = ops._attention_precision_row_statistics(q, kc, vc, dy, left, right, qi, ki, scale, exact)
-    if level == 4:
-        scaled_dy, factors = ops._attention_precision_scale_do(dy)
-        metadata[2].copy_(factors)
-    else:
-        scaled_dy = dy
-    # Row statistics of the dS operand: sum (rho), P mass, sum of squares
-    # (level 3 only: the rounding-variance weight of the anchor share) and
-    # anchor probability mass.
+    scaled_dy, factors = ops._attention_precision_scale_do(dy)
+    metadata[2].copy_(factors)
+    # Row statistics of the dS operand: sum (rho), P mass, an unused plane and
+    # the anchor probability mass.
     stats = torch.zeros((4, b, h, nq), dtype=torch.float64, device=q.device)
-    variance = (stats[2], delta) if level == 3 else (None, None)
     if deterministic:
-        # dS is in unscaled dO units: level 4's row scale cancels in-kernel.
-        exponent = _rho_exponent(dy, vc) if level >= 3 else None
+        # dS is in unscaled dO units: the row scale cancels in-kernel.
+        exponent = _rho_exponent(dy, vc)
         dq, dk, dv = ops._attention_precision_ordered_backward(
             q, kc, vc, scaled_dy, delta, logz, stats, metadata, qi, ki, q_positions,
-            scale, level, visibility, span or 0, strict, reset, exponent)
-        if level >= 3:
-            _decode_fixed_statistics(stats, exponent, level)
-            # The uniform shares need no atomics; the anchor share left in
-            # stats[0] goes through the ordered repair below.
-            ops._attention_precision_zero_sum_repair(
-                q, kc, stats[0], metadata, logz, ki, ZERO_SUM_WINDOW, False, stats[0], dq, dk, scale,
-                *variance)
-            # Stable order within each KV head makes anchor scatter reductions
-            # independent of CTA scheduling without an N² workspace.
-            order = torch.argsort(metadata[3].reshape(b, kt.shape[2], -1), dim=-1, stable=True)
-            flags = ops._attention_precision_deterministic_repair(
-                q, kc, dy, stats, metadata, order, dq, dk, dv, scale, level)
+            scale, visibility, span or 0, strict, reset, exponent)
+        _decode_fixed_statistics(stats, exponent)
+        # The uniform shares need no atomics; the anchor share left in
+        # stats[0] goes through the ordered repair below.
+        ops._attention_precision_zero_sum_repair(
+            q, kc, stats[0], metadata, logz, ki, ZERO_SUM_WINDOW, False, stats[0], dq, dk, scale)
+        # Stable order within each KV head makes anchor scatter reductions
+        # independent of CTA scheduling without an N² workspace.
+        order = torch.argsort(metadata[3].reshape(b, kt.shape[2], -1), dim=-1, stable=True)
+        flags = ops._attention_precision_deterministic_repair(
+            q, kc, dy, stats, metadata, order, dq, dk, dv, scale)
     else:
         dq, dk, dv = ops._attention_precision_main_backward(
             q, kc, vc, scaled_dy, delta, logz, stats, metadata, qi, ki, q_positions,
-            scale, level, visibility, span or 0, strict, reset)
-        if level >= 3:
-            ops._attention_precision_zero_sum_repair(
-                q, kc, stats[0], metadata, logz, ki, ZERO_SUM_WINDOW, True,
-                torch.empty_like(stats[0]), dq, dk, scale, *variance)
-        if level == 4:
-            flags = ops._attention_precision_probability_repair(dy, stats, metadata, dv)
-    if level == 4:
-        ops._attention_precision_fallback_dv(q, kc, scaled_dy, left, right, logz,
-                                           metadata, flags, dv, qi, ki, scale)
+            scale, visibility, span or 0, strict, reset)
+        ops._attention_precision_zero_sum_repair(
+            q, kc, stats[0], metadata, logz, ki, ZERO_SUM_WINDOW, True,
+            torch.empty_like(stats[0]), dq, dk, scale)
+        flags = ops._attention_precision_probability_repair(dy, stats, metadata, dv)
+    ops._attention_precision_fallback_dv(q, kc, scaled_dy, left, right, logz,
+                                       metadata, flags, dv, qi, ki, scale)
     # Output-space subtraction can leave a huge FP32 cancellation residual
     # when all visible keys coincide and dO/V have a very large range.
     # Equality runs prove the exact dQ=0 invariant in O(ND), without an
@@ -196,7 +180,7 @@ def _rho_exponent(dy, vc):
 
     |dS_ij| <= P_ij (|dP_ij - dP_ia| + |D'_i|) <= 4 P_ij |dO_i| max_j |V_j|, and
     2^(e-5) exceeds |dO_i| max|V_j|, so the deterministic kernel's int64 sums on
-    the 2^(e-62) grid (2^(2e-68) for sum_j dS_ij^2) cannot overflow. Finite
+    the 2^(e-62) grid cannot overflow. Finite
     16-bit inputs give |e| < 300; the clamp keeps both grids normal FP64.
     """
     g = torch.linalg.vector_norm(dy, dim=-1, dtype=torch.float32).double()
@@ -207,15 +191,12 @@ def _rho_exponent(dy, vc):
     return e.to(torch.int32).transpose(1, 2).contiguous()
 
 
-def _decode_fixed_statistics(stats, exponent, level):
+def _decode_fixed_statistics(stats, exponent):
     """Convert the deterministic kernel's int64 planes back to FP64 in place."""
     fixed = stats.view(torch.int64)
     rho = fixed[0].double() * _power_of_two(exponent.long() - 62)
-    if level == 3:
-        stats[2].copy_(fixed[2].double() * _power_of_two(2 * exponent.long() - 68))
-    if level == 4:
-        stats[1].copy_(fixed[1].double().mul_(2.0 ** -60))
-        stats[3].copy_(fixed[3].double().mul_(2.0 ** -60))
+    stats[1].copy_(fixed[1].double().mul_(2.0 ** -60))
+    stats[3].copy_(fixed[3].double().mul_(2.0 ** -60))
     stats[0].copy_(rho)
 
 
@@ -263,7 +244,7 @@ def _finish(outputs, dtype, previous, keep_fp32):
             dk[:, :previous].contiguous(), dv[:, :previous].contiguous())
 
 
-def _matched_backward(dy, q, k, v, qi, ki, level, chunk, scale, strict, deterministic):
+def _matched_backward(dy, q, k, v, qi, ki, chunk, scale, strict, deterministic):
     # Irregular independently aligned reset runs use the same exact packing
     # plan as the existing API. No N² mask is allocated. The common aligned
     # BOS path above remains entirely GPU-driven.
@@ -278,7 +259,7 @@ def _matched_backward(dy, q, k, v, qi, ki, level, chunk, scale, strict, determin
     for index in range(len(cq) - 1):
         qa, qb, ka, kb = cq[index], cq[index + 1], ck[index], ck[index + 1]
         a, b, c, _, _ = backward(gp[qa:qb][None], qp[qa:qb][None], kp[ka:kb][None], vp[ka:kb][None],
-                                level=level, visibility=2, span=chunk, scale=scale,
+                                visibility=2, span=chunk, scale=scale,
                                 strict=strict, deterministic=deterministic, return_fp32=True)
         oq[qa:qb], ok[ka:kb], ov[ka:kb] = a[0], b[0], c[0]
     result = []
@@ -302,20 +283,21 @@ class _Attention(torch.autograd.Function):
         forward_options.pop('deterministic', None)
         if visibility:
             forward_options.update(prev_k=prev_k, prev_v=prev_v)
-        y, saved, lse = functions[visibility](q, k, v, **forward_options)
-        ctx.save_for_backward(q, k, v, prev_k, prev_v, saved, lse)
+        # The backward recomputes the row statistics: neither y nor the LSE is saved.
+        y, _ = functions[visibility](q, k, v, **forward_options)
+        ctx.save_for_backward(q, k, v, prev_k, prev_v)
         ctx.visibility, ctx.options = visibility, options
         return y
 
     @staticmethod
     def backward(ctx, dy):
-        q, k, v, prev_k, prev_v, saved, lse = ctx.saved_tensors
+        q, k, v, prev_k, prev_v = ctx.saved_tensors
         opts = dict(ctx.options)
         span = opts.pop('window_size', opts.pop('chunk_size', None))
-        level = opts.pop('high_precision_level')
+        opts.pop('high_precision_level')
         reset = opts.pop('reset_chunk_pos_per_seq', False)
         opts.pop('attn_method', None)
-        grads = backward(dy, q, k, v, level=level, visibility=ctx.visibility, span=span,
+        grads = backward(dy, q, k, v, visibility=ctx.visibility, span=span,
                          prev_k=prev_k, prev_v=prev_v, reset=reset, **opts)
         return (*grads, None, None)
 

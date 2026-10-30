@@ -16,26 +16,6 @@ void RunFlashSWABwdSm90HeadDispatch(
     AttentionBwdParams& params, cudaStream_t stream) {
   TORCH_CHECK(params.h % params.h_k == 0,
               "FlashSWA SM90 BWD requires Hq divisible by Hkv");
-  if constexpr (!kVarlen && !kHasSegment) {
-    if (params.odd_head_window_right_delta != 0) {
-      if (params.h / 2 == params.h_k) {
-        RunAttentionBwdSm90Kernel<
-            kHeadDim, kHeadDimV, kBlockN, Element, kDeterministic,
-            false, false, kBlockM, false /*kGQA*/, false,
-            attention::semantics::CausalSlidingWindowVisibility,
-            flash::FlashSWABwdSm90, 0, 0, 0, false, false, false,
-            true /*kReaderPairKVReuse*/>(params, stream);
-      } else {
-        RunAttentionBwdSm90Kernel<
-            kHeadDim, kHeadDimV, kBlockN, Element, kDeterministic,
-            false, false, kBlockM, true /*kGQA*/, false,
-            attention::semantics::CausalSlidingWindowVisibility,
-            flash::FlashSWABwdSm90, 0, 0, 0, false, false, false,
-            true /*kReaderPairKVReuse*/>(params, stream);
-      }
-      return;
-    }
-  }
   if (params.h == params.h_k) {
     RunAttentionBwdSm90Kernel<
         kHeadDim, kHeadDimV, kBlockN, Element, kDeterministic, kVarlen,
@@ -158,38 +138,6 @@ void RunCausalFlashAttnBwdSm90HeadDispatch(
               "FlashSWA SM90 full BWD requires Hq divisible by Hkv");
   static constexpr int kStages =
       kDeterministic && kHeadDim == 192 && kHeadDimV == 192 ? 2 : 0;
-  if (params.odd_head_window_right_delta != 0) {
-    if (params.h / 2 == params.h_k) {
-      if constexpr (!kDeterministic && kHeadDim == 256 &&
-                    kHeadDimV == 256 &&
-                    std::is_same_v<Element, cutlass::bfloat16_t>) {
-        RunAttentionBwdSm90Kernel<
-            kHeadDim, kHeadDimV, kBlockN, Element, false,
-            false, false, kBlockM, true /*kGQA*/, false,
-            attention::semantics::CausalFullVisibility,
-            flash::FlashSWABwdSm90, kStages, 0, 0, false, false, false,
-            false /*kReaderPairKVReuse*/,
-            true /*kHeadPairParallel*/,
-            false /*kHeadPairClusterKVReuse*/,
-            true /*kHeadPairPrivateKVGrad*/>(params, stream);
-      } else {
-        RunAttentionBwdSm90Kernel<
-            kHeadDim, kHeadDimV, kBlockN, Element, kDeterministic,
-            false, false, kBlockM, false /*kGQA*/, false,
-            attention::semantics::CausalFullVisibility,
-            flash::FlashSWABwdSm90, kStages, 0, 0, false, false, false,
-            true /*kReaderPairKVReuse*/>(params, stream);
-      }
-    } else {
-      RunAttentionBwdSm90Kernel<
-          kHeadDim, kHeadDimV, kBlockN, Element, kDeterministic,
-          false, false, kBlockM, true /*kGQA*/, false,
-          attention::semantics::CausalFullVisibility,
-          flash::FlashSWABwdSm90, kStages, 0, 0, false, false, false,
-          true /*kReaderPairKVReuse*/>(params, stream);
-    }
-    return;
-  }
   if (params.h == params.h_k) {
     RunAttentionBwdSm90Kernel<
         kHeadDim, kHeadDimV, kBlockN, Element, kDeterministic,

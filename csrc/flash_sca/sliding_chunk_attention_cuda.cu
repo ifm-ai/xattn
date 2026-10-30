@@ -23,7 +23,7 @@ std::tuple<torch::Tensor, torch::Tensor> FlashSCACUDAFwd(
     const c10::optional<torch::Tensor>& k_segment_idx,
     const std::string& backend,
     bool reset_chunk_pos_per_seq,
-    const c10::optional<torch::Tensor>& output_state, bool output_fp32) {
+    const c10::optional<torch::Tensor>& output_state, bool high_precision) {
   flash_sca::CheckInputs(
       q, k, v, chunk_size, prev_k, prev_v, q_segment_idx, k_segment_idx);
   at::cuda::OptionalCUDAGuard guard(at::device_of(q));
@@ -31,7 +31,7 @@ std::tuple<torch::Tensor, torch::Tensor> FlashSCACUDAFwd(
   if (flash_sca::ShouldUseSM90(q, backend)) {
     return FlashSCASM90Fwd(
         q, k, v, chunk_size, scale, prev_k, prev_v, q_segment_idx,
-        k_segment_idx, reset_chunk_pos_per_seq, false, output_state, output_fp32);
+        k_segment_idx, reset_chunk_pos_per_seq, false, output_state, high_precision);
   }
 #else
   flash_sca::ShouldUseSM90(q, backend);
@@ -39,8 +39,8 @@ std::tuple<torch::Tensor, torch::Tensor> FlashSCACUDAFwd(
   TORCH_CHECK(q.size(1) == k.size(1),
               "FlashSCA unequal current Q/KV lengths require the SM90 backend");
   TORCH_CHECK(
-      !output_state.has_value() && !output_fp32,
-      "FlashSCA FP32 output/state requires the SM90 backend");
+      !output_state.has_value() && !high_precision,
+      "FlashSCA high precision requires the SM90 backend");
   TORCH_CHECK(!reset_chunk_pos_per_seq,
               "reset_chunk_pos_per_seq=true is only supported by the SM90 "
               "FlashSCA backend");

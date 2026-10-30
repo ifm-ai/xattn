@@ -2,9 +2,9 @@
 
 Run commands from the checkout root, after building xattn for the target GPU.
 The attention-family correctness modules cover causal attention, FlashSCA, FlashSWA,
-the three SoftDelta SM90 variants, and the three Group SoftDelta variants.
-Group SoftDelta exposes scalar gates; `tests/group_softdelta/test_value_groups.py`
-also covers its internal value-group layout (a gate per group of value channels).
+and the three SoftDelta variants. SoftDelta exposes scalar gates;
+`tests/softdelta/test_value_groups.py` also covers its internal value-group layout
+(18 representative cases by default; the complete matrix with `--full-matrix`).
 
 ```bash
 python -m pytest tests -q
@@ -17,21 +17,27 @@ Run the consolidated precision validation separately with:
 python -m pytest tests/test_high_precision.py -q
 ```
 
-This module covers repair levels 1–4 and the level 0 baseline: API validation,
-SBS saved state, FP64 output/gradient parity, chunk boundaries, padded GQA,
-and live previous KV. Advanced repair regressions retain their applicable
-level 2–4 coverage; tolerances are unchanged.
+This module covers `high_precision_level` 1 against the level 0 baseline. It
+checks API validation for every attention family, the SBS forward, and, for
+causal, sliding-window and sliding-chunk attention, FP64 output/gradient
+parity, chunk boundaries, padded GQA, live previous KV and precision-repair
+regressions. SoftDelta numerics at both levels live in `tests/softdelta`.
 
 The normal suite combines output and gradient checks, FP16/BF16, MHA/GQA/MQA,
 short queries, previous KV, segment/BOS inputs, noncontiguous inputs, chunk
-position resets, and high-precision backward state. Standalone forward/backward
+position resets, and the high-precision levels. Standalone forward/backward
 and autograd use the same quantized-input FP64 reference. Forward and backward
 have separate tolerances.
 
+SoftDelta default tests use representative D/V shapes; `--full-matrix` also
+includes its complete declared shape and internal value-group matrices. Large-batch
+checks for all families, including explicit `k_read` gradients, live in
+`tests/test_large_batch.py`.
+
 `--full-matrix` adds every D/V bucket (32, 64, 96, 128, 160, 192, 256), both
-precision settings and both backward determinism settings. SoftDelta also checks
-the paired-reader backward kernel on the short lengths. The full D/V matrix
-uses lengths 7, 193, 513, 4096, 16384, 32768, and 65536 for all six operations.
+precision settings and both backward determinism settings. The full D/V matrix
+uses lengths 7, 193, 513, 4096, 16384, 32768, and 65536 for causal,
+sliding-window and sliding-chunk attention.
 Lengths above 513 additionally require `--long`: these use B=1, sampled-row
 FP64 outputs against all keys, and full-sized gradients from sparse dO. Both
 backward determinism settings are exercised, with exact repeatability checked
@@ -55,11 +61,11 @@ For result validation, augment each inventory with `exit_code` and the absolute
 duplicated shard partitions and incomplete pytest results.
 
 ```bash
-python -m tests.softdelta.validate_flash_softdelta_shards --kind correctness \
+python -m tests.validate_shards --kind correctness \
   --output validated.json shard0.json shard1.json
 ```
 
-The four benchmark entrypoints measure xattn itself. Each timed case first checks
+The three benchmark entrypoints measure xattn itself. Each timed case first checks
 sampled outputs and sparse-dO gradients against FP64 using the actual timed
 inputs. Reports include forward/backward latency, throughput, separate backward
 determinism groups, physical GPU identity, binary hash and the case manifest.
@@ -69,7 +75,6 @@ Do not overlap benchmarks on the same physical GPU.
 python -m tests.causal_flash_attn.benchmark --dtype fp16 bf16
 python -m tests.sca.benchmark --cases dense segment previous short
 python -m tests.swa.benchmark --length 4096 --dims 96 64
-python -m tests.softdelta.benchmark --full-matrix --high-precision
 ```
 
 Use `--output` for an explicit report path; otherwise reports go to

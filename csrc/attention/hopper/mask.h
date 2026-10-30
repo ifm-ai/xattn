@@ -26,18 +26,12 @@ template <int kBlockM, int kBlockN, bool PackGQA, typename TiledMma,
           bool DenseTileFastPath=false, bool IsSlidingChunk=false,
           bool DirectChunkTileFastPath=IsSlidingChunk,
           bool AllowReset=HasSegment,
-          int BranchPairLogicalBlockM=0,
           bool SegmentTileRanges=true>
 struct Mask
     : xattn::ops::attention::hopper::semantics::
           SegmentPartitionStorage<HasSegment> {
 
     static_assert(!(PackGQA && SwapAB), "Cannot be both PackGQA and SwapAB");
-    static_assert(
-        BranchPairLogicalBlockM == 0 ||
-            kBlockM == 2 * BranchPairLogicalBlockM);
-    static_assert(BranchPairLogicalBlockM == 0 || !PackGQA);
-    static_assert(BranchPairLogicalBlockM == 0 || !SwapAB);
     using SegmentStorage = xattn::ops::attention::hopper::semantics::
         SegmentPartitionStorage<HasSegment>;
     using SegmentPartition = xattn::ops::attention::hopper::semantics::
@@ -94,7 +88,7 @@ struct Mask
     template <typename Engine, typename Layout>
     CUTLASS_DEVICE
     void apply_segment_rows(Tensor<Engine, Layout> &tSrS, const int m_block, const int n_block) const {
-        static_assert(HasSegment && !SwapAB && !PackGQA && BranchPairLogicalBlockM == 0);
+        static_assert(HasSegment && !SwapAB && !PackGQA);
         if (n_block >= segment_full_min && n_block < segment_full_max) { return; }
         auto thread_mma = TiledMma{}.get_thread_slice(thread_idx);
         auto thread0_mma = TiledMma{}.get_thread_slice(_0{});
@@ -125,7 +119,7 @@ struct Mask
     CUTLASS_DEVICE
     void apply_segment_intervals(Tensor<Engine, Layout> &tSrS, const int m_block, const int n_block,
                                  const int segment_relation) const {
-        static_assert(HasSegment && !PackGQA && BranchPairLogicalBlockM == 0);
+        static_assert(HasSegment && !PackGQA);
         if (segment_relation == SegmentPartition::kFull) { return; }
         static constexpr int Row = !SwapAB ? 0 : 1, Col = !SwapAB ? 1 : 0;
         auto thread_mma = TiledMma{}.get_thread_slice(thread_idx);
@@ -296,23 +290,10 @@ struct Mask
                     for (int m = 0; m < size<0>(tSrS_rowcol); ++m) {
                         int const row_in_tile =
                             get<Row>(tScS_rowcol(m, _0{}));
-                        int const branch = [&] {
-                            if constexpr (BranchPairLogicalBlockM == 0) {
-                                return 0;
-                            } else {
-                                return row_in_tile /
-                                    BranchPairLogicalBlockM;
-                            }
-                        }();
                         int const row_idx = !PackGQA
-                            ? (BranchPairLogicalBlockM == 0
-                                  ? row_in_tile + m_block * kBlockM
-                                  : row_in_tile -
-                                        branch * BranchPairLogicalBlockM +
-                                        m_block * BranchPairLogicalBlockM)
+                            ? row_in_tile + m_block * kBlockM
                             :  __shfl_sync(0xffffffff, mma_m_idx, m % kMmaThreadsPerRow, kMmaThreadsPerRow);
-                        int const row_boundary_offset =
-                            right_boundary_offset - branch;
+                        int const row_boundary_offset = right_boundary_offset;
                         int const col_limit_right = !Seqlenk_mask
                             ? row_idx + causal_row_offset + window_size_right +
                                   row_boundary_offset
@@ -334,24 +315,12 @@ struct Mask
                     for (int m = 0; m < size<0>(tSrS_rowcol); ++m) {
                         int const row_in_tile =
                             get<Row>(tScS_rowcol(m, _0{}));
-                        int const branch = [&] {
-                            if constexpr (BranchPairLogicalBlockM == 0) {
-                                return 0;
-                            } else {
-                                return row_in_tile /
-                                    BranchPairLogicalBlockM;
-                            }
-                        }();
                         int const row_idx = !PackGQA
-                            ? (BranchPairLogicalBlockM == 0
-                                  ? row_in_tile + m_block * kBlockM
-                                  : row_in_tile -
-                                        branch * BranchPairLogicalBlockM +
-                                        m_block * BranchPairLogicalBlockM)
+                            ? row_in_tile + m_block * kBlockM
                             :  __shfl_sync(0xffffffff, mma_m_idx, m % kMmaThreadsPerRow, kMmaThreadsPerRow);
                         int const local_row_offset_right =
                             causal_row_offset + window_size_right +
-                            right_boundary_offset - branch;
+                            right_boundary_offset;
                         int col_limit_right = !Seqlenk_mask
                             ? row_idx + local_row_offset_right
                             : __viaddmin_s32(row_idx, local_row_offset_right, seqlenk_col_limit);

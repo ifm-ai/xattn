@@ -2,6 +2,10 @@
 
 #include <cstdint>
 
+namespace at {
+class Tensor;
+}  // namespace at
+
 namespace xattn {
 namespace ops {
 
@@ -76,21 +80,15 @@ struct AttentionBwdParams {
   int* __restrict__ tile_count_semaphore;
   int num_sm;
 
-  // FP32 backward-state flag; preceding field offsets are fixed.
-  bool y_is_fp32;
-  // Optional per-head boundary adjustment for interleaved paired readers.
-  // Even heads use window_size_right; odd heads add this delta.
-  int odd_head_window_right_delta;
-  // Explicit advanced numerical path. LP and original FP32-state BWD use 0/1.
-  int high_precision_level = 0;
+  // Precision-repair workspace.
   const float* hp_delta = nullptr;
   float* hp_rho = nullptr;  // four planes of FP64 statistics (internal transport)
   float* hp_mass = nullptr; // max, anchored dP, scale, anchor, left, right
-  // Deterministic levels 3/4: per-row exponent e with sum_j |dS_ij| < 2^e; the
+  // Deterministic repair: per-row exponent e with sum_j |dS_ij| < 2^e; the
   // statistics planes then hold int64 sums on a fixed 2^(e-62) grid.
   const int* hp_rho_exponent = nullptr;
 
-  // Negative-query readers (group_softdelta): h counts logical heads
+  // Negative-query readers (softdelta): h counts logical heads
   // l = g * R + r; r = 0 reads negative query g (neg_q, [B, Lq, Hkv, D]) with
   // output gradient neg_dy ([B, Lq, Hkv, V]) and writes its query gradient
   // to dneg_q; r > 0 is query head g * (R - 1) + r - 1 of q / dy / dq. y and
@@ -115,6 +113,10 @@ struct AttentionBwdParams {
   // [B, Lk, Hkv, V], instance head dimensions) for the GQA backward; null:
   // allocated and zeroed by the launch.
   float* dkv_accum_ptr = nullptr;
+  // Grouped heads only: receive the FP32 dK / dV accumulators ([B, Lk, Hkv,
+  // instance head dimension]) in place of the cast into dk / dv (null: cast).
+  at::Tensor* dk_accum_out = nullptr;
+  at::Tensor* dv_accum_out = nullptr;
 };
 
 }  // namespace ops

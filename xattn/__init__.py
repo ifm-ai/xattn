@@ -1,4 +1,4 @@
-__version__ = '1.1.1'
+__version__ = '1.2.0'
 
 from .ops import (
     flash_sca,
@@ -11,15 +11,6 @@ from .ops import (
     causal_flash_attn,
     causal_flash_attn_bwd,
     causal_flash_attn_fwd,
-    group_softdelta_attention,
-    group_softdelta_attention_bwd,
-    group_softdelta_attention_fwd,
-    sliding_chunk_group_softdelta_attention,
-    sliding_chunk_group_softdelta_attention_bwd,
-    sliding_chunk_group_softdelta_attention_fwd,
-    sliding_window_group_softdelta_attention,
-    sliding_window_group_softdelta_attention_bwd,
-    sliding_window_group_softdelta_attention_fwd,
     sliding_chunk_softdelta_attention,
     sliding_chunk_softdelta_attention_bwd,
     sliding_chunk_softdelta_attention_fwd,
@@ -51,13 +42,4 @@ __all__ = [
     "sliding_chunk_softdelta_attention",
     "sliding_chunk_softdelta_attention_bwd",
     "sliding_chunk_softdelta_attention_fwd",
-    "group_softdelta_attention",
-    "group_softdelta_attention_bwd",
-    "group_softdelta_attention_fwd",
-    "sliding_window_group_softdelta_attention",
-    "sliding_window_group_softdelta_attention_bwd",
-    "sliding_window_group_softdelta_attention_fwd",
-    "sliding_chunk_group_softdelta_attention",
-    "sliding_chunk_group_softdelta_attention_bwd",
-    "sliding_chunk_group_softdelta_attention_fwd",
 ]

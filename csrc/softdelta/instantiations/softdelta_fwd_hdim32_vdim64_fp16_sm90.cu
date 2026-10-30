@@ -1,4 +1,3 @@
-#include "softdelta/fwd_all_visibility_row_pair_instantiation.cuh"
+#include "softdelta/fwd_template.cuh"
 
-XATTN_FLASH_SOFTDELTA_FWD_SM90_INSTANTIATE_ALL_VISIBILITY_ROW_PAIR(
-    cutlass::half_t, 32, 64)
+XATTN_SOFTDELTA_FWD_SM90_INSTANTIATE(cutlass::half_t, 32, 64)

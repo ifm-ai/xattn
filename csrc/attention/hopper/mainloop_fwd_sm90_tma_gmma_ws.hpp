@@ -39,9 +39,6 @@ template <int Stages, class ClusterShape_, class TileShape_MNK_, int kHeadDimV, 
         bool Is_causal_, bool Is_local_, bool Has_softcap_, bool Varlen_, bool PagedKVNonTMA_, bool AppendKV_, bool HasQv_,
         bool HasSegment_, bool MmaPV_is_RS, bool IntraWGOverlap, bool PackGQA_, bool Split_, bool V_colmajor_,
         bool UseFastExp2_=false, bool IsSlidingChunk_=true,
-        bool SoftDeltaPair_=false, bool SoftDeltaSingleCTA_=false,
-        bool SoftDeltaSplitKVMulticast_=false,
-        bool SoftDeltaClusteredRowPair_=false,
         bool NegQReaders_=false>
 struct CollectiveMainloopFwdSm90 {
 
@@ -64,29 +61,20 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr bool Has_segment = HasSegment_;
     static constexpr bool UseFastExp2 = UseFastExp2_;
     static constexpr bool Is_sliding_chunk = IsSlidingChunk_;
-    // Segment kernels masked from per-row key intervals only (no SCA reset,
-    // PackGQA or SoftDelta pairing); the launcher supplies the intervals.
+    // Segment kernels masked from per-row key intervals only (no SCA reset or
+    // PackGQA); the launcher supplies the intervals.
     static constexpr bool SegmentRowIntervals =
-        HasSegment_ && !PackGQA_ && !SoftDeltaPair_ && !SoftDeltaSingleCTA_ && !IsSlidingChunk_;
+        HasSegment_ && !PackGQA_ && !IsSlidingChunk_;
     // Precomputed key spans and full-tile ranges. Wide-V kernels without row
     // intervals keep the per-tile search: the extra live state spills them.
     static constexpr bool SegmentTileRanges =
         SegmentRowIntervals || (HasSegment_ && kHeadDimV <= 128);
-    static constexpr bool SoftDeltaPair = SoftDeltaPair_;
-    static constexpr bool SoftDeltaSingleCTA = SoftDeltaSingleCTA_;
-    static constexpr bool SoftDeltaSplitKVMulticast =
-        SoftDeltaSplitKVMulticast_;
-    static constexpr bool SoftDeltaClusteredRowPair =
-        SoftDeltaClusteredRowPair_;
-    // Negative-query readers (group SoftDelta): logical head l = g * R + r over KV head g with
+    // Negative-query readers (SoftDelta): logical head l = g * R + r over KV head g with
     // R = logical / KV heads. r = 0 reads head g of the second (negative-query)
     // descriptor over the strict past; r > 0 reads Q head g * (R - 1) + r - 1
     // with the inclusive boundary. The negative-query head leads its group, so a
     // scheduler that claims tiles in head order starts it before its queries.
     static constexpr bool NegQReaders = NegQReaders_;
-    using TmaCopyClusterShape = std::conditional_t<
-        SoftDeltaSplitKVMulticast,
-        Shape<_1, _1, _1>, ClusterShape>;
     static constexpr bool PackGQA = PackGQA_;
     static constexpr bool Split = Split_;
     static constexpr bool V_colmajor = V_colmajor_;
@@ -98,30 +86,8 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr bool SameHeadDim = get<2>(TileShape_MNK{}) == kHeadDimV;
     static constexpr bool LargeHeadDimV = kHeadDimV > 256;
 
-    static_assert(!SoftDeltaPair || !PackGQA);
-    static_assert(
-        !SoftDeltaPair ||
-        (SoftDeltaSingleCTA
-             ? size<0>(ClusterShape{}) ==
-                   (SoftDeltaClusteredRowPair ? 2 : 1)
-             : (size<0>(ClusterShape{}) == 1 ||
-                size<0>(ClusterShape{}) == 2)));
-    static_assert(!SoftDeltaSingleCTA || SoftDeltaPair);
-    static_assert(!SoftDeltaClusteredRowPair || SoftDeltaSingleCTA);
-    static_assert(!SoftDeltaClusteredRowPair || Is_causal);
-    static_assert(!SoftDeltaClusteredRowPair || !Is_local);
-    static_assert(!SoftDeltaClusteredRowPair || !Is_sliding_chunk);
-    static_assert(!SoftDeltaClusteredRowPair || !Varlen);
-    static_assert(!SoftDeltaClusteredRowPair || !Has_segment);
-    static_assert(!SoftDeltaSplitKVMulticast || SoftDeltaPair);
-    static_assert(!SoftDeltaSplitKVMulticast || !SoftDeltaSingleCTA ||
-                  SoftDeltaClusteredRowPair);
-    static_assert(!SoftDeltaSplitKVMulticast || !PagedKVNonTMA);
-    static_assert(!SoftDeltaSplitKVMulticast || !Transpose_V);
-    static_assert(!SoftDeltaSplitKVMulticast || size<0>(ClusterShape{}) == 2);
-    static_assert(!SoftDeltaPair || !PagedKVNonTMA);
     static_assert(!NegQReaders ||
-                  (!PackGQA && !SoftDeltaPair && !AppendKV && !HasQv &&
+                  (!PackGQA && !AppendKV && !HasQv &&
                    !PagedKVNonTMA && !Split));
 
     static_assert(ArchTag::kMinComputeCapability >= 90);
@@ -130,18 +96,16 @@ struct CollectiveMainloopFwdSm90 {
     static constexpr cute::GMMA::Major TmaMajorV = !V_colmajor ? GMMA::Major::MN : GMMA::Major::K;
 
     static constexpr int kBlockM = get<0>(TileShape_MNK{});
-    static constexpr int kLogicalBlockM =
-        SoftDeltaSingleCTA ? kBlockM / 2 : kBlockM;
     static constexpr int kBlockN = get<1>(TileShape_MNK{});
     static constexpr int kHeadDim = get<2>(TileShape_MNK{});
     using SeqlenInfo_t = flash::SeqlenInfoQKNewK<Varlen, AppendKV>;
     using AttentionRange = std::conditional_t<
         Is_sliding_chunk,
         xattn::ops::attention::hopper::semantics::SlidingChunkRangeAdapter<
-            SeqlenInfo_t, kLogicalBlockM, kBlockN, Is_causal, Is_local,
+            SeqlenInfo_t, kBlockM, kBlockN, Is_causal, Is_local,
             PackGQA, Split, Has_segment>,
         xattn::ops::attention::hopper::semantics::StandardRangeAdapter<
-            SeqlenInfo_t, kLogicalBlockM, kBlockN, Is_causal, Is_local,
+            SeqlenInfo_t, kBlockM, kBlockN, Is_causal, Is_local,
             PackGQA, Split>>;
     using SegmentPartition =
         xattn::ops::attention::hopper::semantics::SegmentPartitionAdapter<
@@ -197,33 +161,20 @@ struct CollectiveMainloopFwdSm90 {
     static_assert(NumMmaThreads % cutlass::NumThreadsPerWarpGroup == 0);
     static constexpr int NumMmaWarpGroups = NumMmaThreads / cutlass::NumThreadsPerWarpGroup;
     static_assert(NumMmaWarpGroups == 1 || NumMmaWarpGroups == 2 || NumMmaWarpGroups == 3);
-    static_assert(
-        !SoftDeltaSingleCTA ||
-        NumMmaWarpGroups == 2 || NumMmaWarpGroups == 3);
-    static_assert(
-        !SoftDeltaSingleCTA || kBlockM == 128 || kBlockM == 192);
 
     using TileShapeMNKQLoad = Shape<
-        Int<kLogicalBlockM>, decltype(get<1>(TileShape_MNK{})),
+        Int<kBlockM>, decltype(get<1>(TileShape_MNK{})),
         decltype(get<2>(TileShape_MNK{}))>;
     using SmemLayoutAtomQLoad = decltype(
         cutlass::gemm::collective::detail::ss_smem_selector<
-            GMMA::Major::K, Element, Int<kLogicalBlockM>,
+            GMMA::Major::K, Element, Int<kBlockM>,
             decltype(cute::get<2>(TileShape_MNK{}))>());
     using SmemLayoutQLoad = decltype(tile_to_shape(
         SmemLayoutAtomQLoad{}, select<0, 2>(TileShapeMNKQLoad{})));
     using SmemLayoutAtomQ = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, Element,
         decltype(cute::get<0>(TileShape_MNK{})), decltype(cute::get<2>(TileShape_MNK{}))>());
-    using SmemLayoutQDefault = decltype(tile_to_shape(
+    using SmemLayoutQ = decltype(tile_to_shape(
         SmemLayoutAtomQ{}, select<0, 2>(TileShape_MNK{})));
-    using SmemLayoutQBranchPair = decltype(coalesce(
-        blocked_product(
-            SmemLayoutQLoad{},
-            make_layout(make_shape(_2{}, _1{}))),
-        make_shape(_, _)));
-    using SmemLayoutQ = std::conditional_t<
-        SoftDeltaSingleCTA, SmemLayoutQBranchPair,
-        SmemLayoutQDefault>;
 
     using SmemLayoutAtomK = decltype(cutlass::gemm::collective::detail::ss_smem_selector<GMMA::Major::K, Element,
         decltype(cute::get<1>(TileShape_MNK{})), decltype(cute::get<2>(TileShape_MNK{}))>());
@@ -345,14 +296,14 @@ struct CollectiveMainloopFwdSm90 {
         make_tensor(make_gmem_ptr(static_cast<Element const*>(nullptr)), ShapeQKV{}, StrideQK{}),
         take<0, 2>(SmemLayoutK{}),
         TileShape_MNK{},
-        TmaCopyClusterShape{})); // mcast along M mode for this N load, if any
+        ClusterShape{})); // mcast along M mode for this N load, if any
 
     using TMA_V = decltype(make_tma_copy(
         GmemTiledCopyKV{},
         make_tensor(make_gmem_ptr(static_cast<Element const*>(nullptr)), ShapeQKV{}, select<1, 0, 2, 3>(StrideV{})),
         take<0, 2>(SmemLayoutVt{}),
         select<1, 2>(TileShape_MNK_PV{}),
-        size<0>(TmaCopyClusterShape{}))); // mcast along M mode for this N load, if any
+        size<0>(ClusterShape{}))); // mcast along M mode for this N load, if any
 
     using TMA_Qv_ = decltype(make_tma_copy_A_sm90(
         GmemTiledCopyQ{},
@@ -372,22 +323,8 @@ struct CollectiveMainloopFwdSm90 {
         CUTE_STATIC_V(size(ClusterShape{})) == 1,
         cutlass::PipelineTmaAsyncNoCluster<kStages>,
         cutlass::PipelineTmaAsync<kStages>>;
-    using MainloopPipelineK = std::conditional_t<
-        Use_TMA_KV,
-        std::conditional_t<
-            SoftDeltaSplitKVMulticast,
-            cutlass::PipelineTmaAsyncSplitMulticast<
-                kStages, 0, TmaTransactionBytesK>,
-            PipelineTmaAsync>,
-        typename cutlass::PipelineAsync<kStages>>;
-    using MainloopPipelineV = std::conditional_t<
-        !Transpose_V && Use_TMA_KV,
-        std::conditional_t<
-            SoftDeltaSplitKVMulticast,
-            cutlass::PipelineTmaAsyncSplitMulticast<
-                kStages, 1, TmaTransactionBytesV>,
-            PipelineTmaAsync>,
-        typename cutlass::PipelineAsync<kStages>>;
+    using MainloopPipelineK = std::conditional_t<Use_TMA_KV, PipelineTmaAsync, typename cutlass::PipelineAsync<kStages>>;
+    using MainloopPipelineV = std::conditional_t<!Transpose_V && Use_TMA_KV, PipelineTmaAsync, typename cutlass::PipelineAsync<kStages>>;
     using MainloopPipelineVt = std::conditional_t<Use_TMA_KV, PipelineTmaAsync, typename cutlass::PipelineAsync<kStages>>;
     // TMA loads for K_new and V_new.
     using MainloopPipelineKVNew = PipelineTmaAsync;
@@ -617,7 +554,7 @@ struct CollectiveMainloopFwdSm90 {
             mK,
             take<0, 2>(SmemLayoutK{}),
             TileShape_MNK{},
-            TmaCopyClusterShape{}); // mcast along M mode for this N load, if any
+            ClusterShape{}); // mcast along M mode for this N load, if any
         Tensor mV = make_tensor(make_gmem_ptr(args.ptr_V),
                                 make_shape(args.headdim_v, get<0>(args.shape_K), get<2>(args.shape_K), get<3>(args.shape_K)),
                                 select<1, 0, 2, 3>(args.stride_V));
@@ -626,14 +563,14 @@ struct CollectiveMainloopFwdSm90 {
             mV,
             take<0, 2>(SmemLayoutVt{}),
             select<1, 2>(TileShape_MNK_PV{}),
-            size<0>(TmaCopyClusterShape{})); // mcast along M mode for this N load, if any
+            size<0>(ClusterShape{})); // mcast along M mode for this N load, if any
         Tensor mKnew = make_tensor(make_gmem_ptr(args.ptr_K_new), args.shape_K_new, args.stride_K_new);
         TMA_K tma_load_K_new = make_tma_copy_B_sm90(
             GmemTiledCopyKV{},
             cute::conditional_return<AppendKV>(mKnew, mK),
             take<0, 2>(SmemLayoutK{}),
             TileShape_MNK{},
-            TmaCopyClusterShape{}); // mcast along M mode for this N load, if any
+            ClusterShape{}); // mcast along M mode for this N load, if any
         Tensor mVnew = make_tensor(make_gmem_ptr(args.ptr_V_new),
                                    make_shape(args.headdim_v, get<0>(args.shape_K_new), get<2>(args.shape_K_new), get<3>(args.shape_K_new)),
                                    select<1, 0, 2, 3>(args.stride_V_new));
@@ -642,7 +579,7 @@ struct CollectiveMainloopFwdSm90 {
             cute::conditional_return<AppendKV>(mVnew, mV),
             take<0, 2>(SmemLayoutVt{}),
             select<1, 2>(TileShape_MNK_PV{}),
-            size<0>(TmaCopyClusterShape{})); // mcast along M mode for this N load, if any
+            size<0>(ClusterShape{})); // mcast along M mode for this N load, if any
         auto shape_Qv = make_shape(get<0>(args.shape_Q), args.headdim_v, get<2>(args.shape_Q), get<3>(args.shape_Q));
         Tensor mQv = make_tensor(make_gmem_ptr(args.ptr_Qv), shape_Qv, args.stride_Qv);
         TMA_Qv tma_load_Qv = [&] {
@@ -768,20 +705,6 @@ struct CollectiveMainloopFwdSm90 {
         }
     }
 
-    CUTLASS_DEVICE
-    static int range_m_block(int m_block, int seqlen_q) {
-        if constexpr (SoftDeltaClusteredRowPair) {
-            constexpr int logical_block_m = kBlockM / 2;
-            const int num_blocks =
-                (seqlen_q + logical_block_m - 1) / logical_block_m;
-            if (cute::block_rank_in_cluster() == 1 &&
-                m_block + 1 < num_blocks) {
-                return m_block + 1;
-            }
-        }
-        return m_block;
-    }
-
     template <typename SchedulerPrefetch, typename SharedStorage>
     CUTLASS_DEVICE void
     load(Params const& params,
@@ -801,10 +724,8 @@ struct CollectiveMainloopFwdSm90 {
         int const bidh = get<1>(block_coord);
         int const bidb = get<2>(block_coord);
         int const split_idx = get<3>(block_coord);
-        int const range_m = range_m_block(
-            m_block, seqlen_info.seqlen_q);
         auto [n_block_min, n_block_max] = AttentionRange::fwd_n_block_range(
-            seqlen_info, range_m, bidb, split_idx, params.num_splits,
+            seqlen_info, m_block, bidb, split_idx, params.num_splits,
             params.window_size_left, params.window_size_right, params.attention_chunk_divmod,
             params.qhead_per_khead_divmod,
             params.get_chunk_position_offset(
@@ -812,14 +733,14 @@ struct CollectiveMainloopFwdSm90 {
         if constexpr (Has_segment) {
             if (SegmentTileRanges && params.segment_spans != nullptr) {
                 auto r = xattn::ops::attention::partition::segment_n_block_min_max_full_span<kBlockM, kBlockN>(
-                    n_block_min, n_block_max, range_m, seqlen_info.seqlen_q, seqlen_info.seqlen_k,
+                    n_block_min, n_block_max, m_block, seqlen_info.seqlen_q, seqlen_info.seqlen_k,
                     params.k_segment_len,
-                    params.segment_spans[bidb * ((seqlen_info.seqlen_q + kBlockM - 1) / kBlockM) + range_m]);
+                    params.segment_spans[bidb * ((seqlen_info.seqlen_q + kBlockM - 1) / kBlockM) + m_block]);
                 n_block_min = get<0>(r);
                 n_block_max = get<1>(r);
             } else {
                 auto segment_n_block_min_max = SegmentPartition::fwd_n_block_range(
-                    n_block_min, n_block_max, range_m, seqlen_info.seqlen_q, seqlen_info.seqlen_k,
+                    n_block_min, n_block_max, m_block, seqlen_info.seqlen_q, seqlen_info.seqlen_k,
                     params.q_segment_idx, params.k_segment_idx, params.k_segment_len, bidb);
                 n_block_min = get<0>(segment_n_block_min_max);
                 n_block_max = get<1>(segment_n_block_min_max);
@@ -907,13 +828,11 @@ struct CollectiveMainloopFwdSm90 {
                 return params.tma_load_Q.get_tma_tensor(params.shape_Q);
             }
         }()(_, _, q_load_head, !is_varlen_q ? bidb : 0);
-        Tensor mQ1 = params.tma_load_Q.get_tma_tensor(params.shape_Q)(_, _, bidh + (SoftDeltaSingleCTA ? 1 : 0), !is_varlen_q ? bidb : 0);
         Tensor mK_TMA = params.tma_load_K.get_tma_tensor(params.shape_K)(_, _, bidh_kv, _);
         auto shape_V = make_shape(params.headdim_v, get<0>(params.shape_K), get<2>(params.shape_K), get<3>(params.shape_K));
         Tensor mVt_TMA = params.tma_load_V.get_tma_tensor(shape_V)(_, _, bidh_kv, _);
 
         Tensor gQ0 = local_tile(domain_offset(make_coord(seqlen_info.offset_q, _0{}), mQ0), select<0, 2>(TileShapeMNKQLoad{}), make_coord(m_block, _0{}));  // (M, K)
-        Tensor gQ1 = local_tile(domain_offset(make_coord(seqlen_info.offset_q, _0{}), mQ1), select<0, 2>(TileShapeMNKQLoad{}), make_coord(m_block, _0{}));  // (M, K)
         Tensor gK_TMA = local_tile(domain_offset(make_coord(seqlen_info.offset_k, _0{}, _0{}), mK_TMA), select<1, 2>(TileShape_MNK{}), make_coord(_, _0{}, _));  // (N, K, _, _)
         Tensor gVt_TMA = local_tile(domain_offset(make_coord(_0{}, seqlen_info.offset_k, _0{}), mVt_TMA), select<1, 2>(TileShape_MNK_PV{}), make_coord(_0{}, _, _));  // (K, N, _, _)
 
@@ -921,23 +840,14 @@ struct CollectiveMainloopFwdSm90 {
         Tensor sQ0 = make_tensor(
             make_smem_ptr(shared_storage.tensors.mainloop.smem_q.data()),
             SmemLayoutQLoad{});
-        Tensor sQ1 = make_tensor(
-            make_smem_ptr(
-                shared_storage.tensors.mainloop.smem_q.data() +
-                cute::cosize_v<SmemLayoutQLoad>),
-            SmemLayoutQLoad{});
         Tensor tQgQ0 = group_modes<0, 3>(block_tma_Q.partition_S(gQ0));  // (TMA)
         Tensor tQsQ0 = group_modes<0, 3>(block_tma_Q.partition_D(sQ0));  // (TMA)
-        Tensor tQgQ1 = group_modes<0, 3>(block_tma_Q.partition_S(gQ1));  // (TMA)
-        Tensor tQsQ1 = group_modes<0, 3>(block_tma_Q.partition_D(sQ1));  // (TMA)
         if (Use_TMA_Q && thread_idx == 0) { prefetch(tma_load_Q, tQgQ0); }
         // Partition the position-independent swizzle view manually.
-        auto block_tma_K = params.tma_load_K.get_slice(
-            SoftDeltaSplitKVMulticast ? 0 : cluster_local_block_id.x);
+        auto block_tma_K = params.tma_load_K.get_slice(cluster_local_block_id.x);
         Tensor tKgK_TMA = group_modes<0, 3>(block_tma_K.partition_S(gK_TMA));  // (TMA, k, batch)
         Tensor tKsK_TMA = group_modes<0, 3>(block_tma_K.partition_D(sK));  // (TMA, PIPE)
-        auto block_tma_V = params.tma_load_V.get_slice(
-            SoftDeltaSplitKVMulticast ? 0 : cluster_local_block_id.x);
+        auto block_tma_V = params.tma_load_V.get_slice(cluster_local_block_id.x);
         Tensor tVgVt_TMA = group_modes<0, 3>(block_tma_V.partition_S(gVt_TMA));  // (TMA, k, batch)
         Tensor tVsVt_TMA = group_modes<0, 3>(block_tma_V.partition_D(sVt));  // (TMA, PIPE)
         auto [tQvgQv, tQvsQv] = [&] {
@@ -1059,12 +969,6 @@ struct CollectiveMainloopFwdSm90 {
         // Only the first warp executes this load path.
         static constexpr bool SingleProducerWarp = NumProducerThreads == cutlass::NumThreadsPerWarp;
         bool should_load_KV = !Use_TMA_KV || ((SingleProducerWarp || warp_idx_in_warpgroup == 0) && cute::elect_one_sync());
-        bool should_load_K = should_load_KV &&
-            (!SoftDeltaSplitKVMulticast ||
-             cluster_local_block_id.x == 0);
-        bool should_load_V = should_load_KV &&
-            (!SoftDeltaSplitKVMulticast ||
-             cluster_local_block_id.x == 1);
 
         if (should_load_KV) {
             if constexpr (PagedKVNonTMA) {
@@ -1072,10 +976,8 @@ struct CollectiveMainloopFwdSm90 {
             } else {
                 paged_kv_manager.template load_page_table_TMA<true /*First_iter*/>(n_block);
             }
-            if constexpr (Transpose_V) {
-                if (should_load_V) { load_V(n_block, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/); }
-            }
-            if (should_load_K) { load_K(n_block, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/); }
+            if constexpr (Transpose_V) { load_V(n_block, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/); }
+            load_K(n_block, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/);
         }
 
         if constexpr (Use_TMA_Q) {
@@ -1085,14 +987,9 @@ struct CollectiveMainloopFwdSm90 {
             }
 
             if ((SingleProducerWarp || warp_idx_in_warpgroup == 0) && cute::elect_one_sync()) {
-                shared_storage.pipelines.barrier_Q.arrive_and_expect_tx(
-                    TmaTransactionBytesQ * (SoftDeltaSingleCTA ? 2 : 1));
+                shared_storage.pipelines.barrier_Q.arrive_and_expect_tx(TmaTransactionBytesQ);
                 copy(tma_load_Q.with(reinterpret_cast<typename cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.pipelines.barrier_Q), 0 /*mcast_mask*/, !Split ? TMA::CacheHintSm90::EVICT_FIRST : TMA::CacheHintSm90::EVICT_LAST),
                     tQgQ0, tQsQ0);
-                if constexpr (SoftDeltaSingleCTA) {
-                    copy(params.tma_load_Q.with(reinterpret_cast<typename cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.pipelines.barrier_Q), 0 /*mcast_mask*/, !Split ? TMA::CacheHintSm90::EVICT_FIRST : TMA::CacheHintSm90::EVICT_LAST),
-                        tQgQ1, tQsQ1);
-                }
                 if constexpr (HasQv) {
                     shared_storage.pipelines.barrier_Qv.arrive_and_expect_tx(TmaTransactionBytesQv);
                     copy(params.tma_load_Qv.with(reinterpret_cast<typename cutlass::arch::ClusterTransactionBarrier::ValueType&>(shared_storage.pipelines.barrier_Qv), 0 /*mcast_mask*/, !Split ? TMA::CacheHintSm90::EVICT_FIRST : TMA::CacheHintSm90::EVICT_LAST),
@@ -1123,7 +1020,7 @@ struct CollectiveMainloopFwdSm90 {
         shared_storage.pipelines.barrier_O.wait((work_idx + 1) % 2);
 
         if constexpr (!Transpose_V && !IntraWGOverlap) {
-            if (should_load_V) { load_V(n_block, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/); }
+            if (should_load_KV) { load_V(n_block, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/); }
         }
         int n_block_prev = n_block;
         --n_block;
@@ -1137,15 +1034,13 @@ struct CollectiveMainloopFwdSm90 {
                 } else {
                     paged_kv_manager.load_page_table_TMA(n_block);
                 }
-                if constexpr (Transpose_V) {
-                    if (should_load_V) { load_V(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/); }
-                }
-                if (should_load_K) { load_K(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/); }
+                if constexpr (Transpose_V) { load_V(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/); }
+                load_K(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/);
                 if constexpr (!Transpose_V) {
                     if constexpr (IntraWGOverlap) {
-                        if (should_load_V) { load_V(n_block_prev, smem_pipe_write_v, cute::true_type{} /*Seqlenk_mask*/); }
+                        load_V(n_block_prev, smem_pipe_write_v, cute::true_type{} /*Seqlenk_mask*/);
                     } else {
-                        if (should_load_V) { load_V(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/); }
+                        load_V(n_block, smem_pipe_write, cute::false_type{} /*Seqlenk_mask*/);
                     }
                 }
             }
@@ -1154,7 +1049,7 @@ struct CollectiveMainloopFwdSm90 {
         }
         scheduler_prefetch();
         if constexpr (!Transpose_V && IntraWGOverlap) {
-            if (should_load_V) { load_V(n_block_prev, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/); }
+            if (should_load_KV) { load_V(n_block_prev, smem_pipe_write, cute::true_type{} /*Seqlenk_mask*/); }
         }
         if constexpr (Transpose_V) { copy_Vt_to_V(smem_pipe_write); }
         ++smem_pipe_write;
@@ -1175,14 +1070,8 @@ struct CollectiveMainloopFwdSm90 {
         // Issue the epilogue waits from one elected lane per producer warpgroup.
         if (warp_idx_in_warpgroup == 0 && cute::elect_one_sync()) {
             // Wait for every pipeline stage to be released or unused.
-            if (!SoftDeltaSplitKVMulticast ||
-                cute::block_rank_in_cluster() == 0) {
-                pipeline_k.producer_tail(smem_pipe_write);
-            }
-            if (!SoftDeltaSplitKVMulticast ||
-                cute::block_rank_in_cluster() == 1) {
-                pipeline_v.producer_tail(smem_pipe_write);
-            }
+            pipeline_k.producer_tail(smem_pipe_write);
+            pipeline_v.producer_tail(smem_pipe_write);
             if constexpr (Transpose_V) { pipeline_vt.producer_tail(smem_pipe_write); }
         }
     }
@@ -1250,10 +1139,8 @@ struct CollectiveMainloopFwdSm90 {
         int const bidb = get<2>(block_coord);
         int const split_idx = get<3>(block_coord);
         int const bidh_kv = !PackGQA ? params.qhead_per_khead_divmod.divide(bidh) : bidh;
-        int const range_m = range_m_block(
-            m_block, seqlen_info.seqlen_q);
         auto [n_block_min, n_block_max] = AttentionRange::fwd_n_block_range(
-            seqlen_info, range_m, bidb, split_idx, params.num_splits,
+            seqlen_info, m_block, bidb, split_idx, params.num_splits,
             params.window_size_left, params.window_size_right, params.attention_chunk_divmod,
             params.qhead_per_khead_divmod,
             params.get_chunk_position_offset(
@@ -1262,22 +1149,19 @@ struct CollectiveMainloopFwdSm90 {
         if constexpr (SegmentTileRanges) {
             auto segment_n_block_min_max = params.segment_spans != nullptr
                 ? xattn::ops::attention::partition::segment_n_block_min_max_full_span<kBlockM, kBlockN>(
-                      n_block_min, n_block_max, range_m, seqlen_info.seqlen_q, seqlen_info.seqlen_k,
+                      n_block_min, n_block_max, m_block, seqlen_info.seqlen_q, seqlen_info.seqlen_k,
                       params.k_segment_len,
-                      params.segment_spans[bidb * ((seqlen_info.seqlen_q + kBlockM - 1) / kBlockM) + range_m])
+                      params.segment_spans[bidb * ((seqlen_info.seqlen_q + kBlockM - 1) / kBlockM) + m_block])
                 : SegmentPartition::fwd_n_block_range_full(
-                      n_block_min, n_block_max, range_m, seqlen_info.seqlen_q, seqlen_info.seqlen_k,
+                      n_block_min, n_block_max, m_block, seqlen_info.seqlen_q, seqlen_info.seqlen_k,
                       params.q_segment_idx, params.k_segment_idx, params.k_segment_len, bidb);
             n_block_min = get<0>(segment_n_block_min_max);
             n_block_max = get<1>(segment_n_block_min_max);
-            // The full range is in range_m rows; the mask classifies m_block.
-            if (range_m == m_block) {
-                segment_full_min = get<2>(segment_n_block_min_max);
-                segment_full_max = get<3>(segment_n_block_min_max);
-            }
+            segment_full_min = get<2>(segment_n_block_min_max);
+            segment_full_max = get<3>(segment_n_block_min_max);
         } else if constexpr (Has_segment) {
             auto segment_n_block_min_max = SegmentPartition::fwd_n_block_range(
-                n_block_min, n_block_max, range_m, seqlen_info.seqlen_q, seqlen_info.seqlen_k,
+                n_block_min, n_block_max, m_block, seqlen_info.seqlen_q, seqlen_info.seqlen_k,
                 params.q_segment_idx, params.k_segment_idx, params.k_segment_len, bidb);
             n_block_min = get<0>(segment_n_block_min_max);
             n_block_max = get<1>(segment_n_block_min_max);
@@ -1288,7 +1172,7 @@ struct CollectiveMainloopFwdSm90 {
         }
         bool const split_aligned_chunk_mask =
             Is_sliding_chunk && Is_local && !Is_causal && !PackGQA &&
-            !Has_segment && !SoftDeltaSingleCTA &&
+            !Has_segment &&
             kBlockM == 128 && kBlockN == 128 && kHeadDimV <= 128 &&
             params.attention_chunk_divmod.divisor >= kBlockM &&
             params.attention_chunk_divmod.divisor % kBlockM == 0 &&
@@ -1367,26 +1251,12 @@ struct CollectiveMainloopFwdSm90 {
         int const seqlen_q = seqlen_info.seqlen_q;
         int const seqlen_k = seqlen_info.seqlen_k;
         int n_block = n_block_max - 1;
-        static constexpr bool SoftDeltaBranchPairMask =
-            SoftDeltaSingleCTA &&
-            (kLogicalBlockM % 64 != 0 ||
-             NumMmaWarpGroups * 64 != kBlockM);
-        int const softdelta_branch = SoftDeltaSingleCTA
-            ? (SoftDeltaBranchPairMask
-                   ? 0
-                   : warp_group_idx / (NumMmaWarpGroups / 2))
-            : (SoftDeltaPair ? bidh & 1 : 0);
-        int const mask_seqlen_q =
-            SoftDeltaSingleCTA && !SoftDeltaBranchPairMask
-            ? seqlen_q + (m_block + softdelta_branch) * kLogicalBlockM
-            : seqlen_q;
-
         xattn::ops::attention::hopper::semantics::AttentionMaskAdapter<
             Is_sliding_chunk, kBlockM, kBlockN, PackGQA,
             TiledMmaQK, false,
             Has_segment, false, Is_sliding_chunk, Has_segment,
-            SoftDeltaBranchPairMask ? kLogicalBlockM : 0, SegmentTileRanges> mask(
-            thread_idx, mask_seqlen_q, seqlen_k, params.window_size_left, params.window_size_right, 0 /*sink_token_length*/,
+            SegmentTileRanges> mask(
+            thread_idx, seqlen_q, seqlen_k, params.window_size_left, params.window_size_right, 0 /*sink_token_length*/,
             params.attention_chunk_divmod, params.qhead_per_khead_divmod,
             Has_segment ? params.q_segment_idx : nullptr,
             Has_segment ? params.k_segment_idx : nullptr,
@@ -1395,12 +1265,12 @@ struct CollectiveMainloopFwdSm90 {
             params.get_chunk_position_offset(bidb, seqlen_q, seqlen_k),
             Has_segment ? params.q_chunk_positions : nullptr,
             params.reset_attention_chunk_divmod,
-            (softdelta_branch || get<1>(neg_q_head(params, bidh))) ? -1 : 0
+            get<1>(neg_q_head(params, bidh)) ? -1 : 0
         );
         if constexpr (SegmentTileRanges) {
             mask.segment_full_min = segment_full_min;
             mask.segment_full_max = segment_full_max;
-            mask.segment_rows = range_m == m_block ? params.segment_rows : nullptr;
+            mask.segment_rows = params.segment_rows;
         }
 
         float softcap_val = params.softcap_val;
@@ -1806,17 +1676,15 @@ struct CollectiveMainloopFwdSm90 {
         int const m_block = get<0>(block_coord);
         int const bidb = get<2>(block_coord);
         int const split_idx = get<3>(block_coord);
-        int const range_m = range_m_block(
-            m_block, seqlen_info.seqlen_q);
         auto [n_block_min, n_block_max] = AttentionRange::fwd_n_block_range(
-            seqlen_info, range_m, bidb, split_idx, params.num_splits,
+            seqlen_info, m_block, bidb, split_idx, params.num_splits,
             params.window_size_left, params.window_size_right, params.attention_chunk_divmod,
             params.qhead_per_khead_divmod,
             params.get_chunk_position_offset(
                 bidb, seqlen_info.seqlen_q, seqlen_info.seqlen_k));
         if constexpr (Has_segment) {
             auto segment_n_block_min_max = SegmentPartition::fwd_n_block_range(
-                n_block_min, n_block_max, range_m, seqlen_info.seqlen_q, seqlen_info.seqlen_k,
+                n_block_min, n_block_max, m_block, seqlen_info.seqlen_q, seqlen_info.seqlen_k,
                 params.q_segment_idx, params.k_segment_idx, params.k_segment_len, bidb);
             n_block_min = get<0>(segment_n_block_min_max);
             n_block_max = get<1>(segment_n_block_min_max);

@@ -16,13 +16,11 @@ enum class DirectionKind : std::uint8_t {
 
 enum class FormulaKind : std::uint8_t {
   kStandard,
-  kSoftDelta,
 };
 
 enum class BoundaryKind : std::uint8_t {
   kInclusive,
   kStrictPast,
-  kInclusiveStrictPastPair,
 };
 
 enum class PositionKind : std::uint8_t {
@@ -57,23 +55,12 @@ struct StandardFormula {
   static constexpr FormulaKind kKind = FormulaKind::kStandard;
 };
 
-struct SoftDeltaFormula {
-  static constexpr FormulaKind kKind = FormulaKind::kSoftDelta;
-};
-
 struct InclusiveBoundary {
   static constexpr BoundaryKind kKind = BoundaryKind::kInclusive;
 };
 
 struct StrictPastBoundary {
   static constexpr BoundaryKind kKind = BoundaryKind::kStrictPast;
-};
-
-struct InclusiveStrictPastBoundaryPair {
-  static constexpr BoundaryKind kKind =
-      BoundaryKind::kInclusiveStrictPastPair;
-  using PrimaryBoundary = InclusiveBoundary;
-  using CorrectionBoundary = StrictPastBoundary;
 };
 
 struct GlobalPosition {

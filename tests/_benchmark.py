@@ -16,7 +16,7 @@ from tests._numerics import (
     Case, HEAD_DIMS, OPERATIONS, case_seed, make_inputs, options_and_segments,
     assert_output, assert_gradients,
 )
-from tests.softdelta.reference import _attention_from_mask
+from tests._reference import _attention_from_mask
 
 
 def measure(function, warmup, iterations, repeats):
@@ -37,8 +37,6 @@ def measure(function, warmup, iterations, repeats):
 
 def validate(operation, case, inputs, options, qi, ki, deterministic, high_precision):
     """FP64 sampled outputs and sparse-dO gradients on the actual timed inputs."""
-    soft = operation.startswith('softdelta_')
-    visibility = operation.removeprefix('softdelta_')
     refs = [t.detach().double().requires_grad_() for t in inputs]
     q, k, v = refs[:3]
     if case.previous:
@@ -47,33 +45,24 @@ def validate(operation, case, inputs, options, qi, ki, deterministic, high_preci
     qp = positions[:, None] + k.shape[1] - case.q_length
     kp = torch.arange(k.shape[1], device=q.device)[None]
     left = torch.ones_like(kp, dtype=torch.bool)
-    if visibility == 'window':left = kp >= qp - case.span
-    elif visibility == 'chunk':left = kp >= qp // case.span * case.span - case.span
-    reads = []
-    for branch in range(2 if soft else 1):
-        mask = (left & (kp <= qp-branch))[None].expand(case.batch, -1, -1)
-        if qi is not None:mask = mask & (qi[:, positions, None] == ki[:, None])
-        qr = q[:, positions, branch::2] if soft else q[:, positions]
-        part = _attention_from_mask(qr, k, v.flatten(3) if soft else v, mask, case.dim**-0.5)
-        reads.append(part.reshape(case.batch, len(positions), 4, case.groups, case.value_dim//case.groups) if soft else part)
-    gate = refs[3][:, positions] if soft else None
-    expected = reads[0] - gate.sigmoid()*reads[1] if soft else reads[0]
+    if operation == 'window':left = kp >= qp - case.span
+    elif operation == 'chunk':left = kp >= qp // case.span * case.span - case.span
+    mask = (left & (kp <= qp))[None].expand(case.batch, -1, -1)
+    if qi is not None:mask = mask & (qi[:, positions, None] == ki[:, None])
+    expected = _attention_from_mask(q[:, positions], k, v, mask, case.dim**-0.5)
     prefix = OPERATIONS[operation]
     fwd = getattr(xattn, prefix+'_fwd'); bwd = getattr(xattn, prefix+'_bwd')
-    base = inputs[:4 if soft else 3]
+    base = inputs[:3]
     fwd_options = dict(options, high_precision_level=int(high_precision))
-    if soft:fwd_options['deterministic'] = deterministic
-    low, state, lse = fwd(*base, **fwd_options)
-    assert_output(low[:, positions], expected, q.dtype if q.dtype != torch.float64 else inputs[0].dtype,
-                  reads if soft else None, gate)
+    low, lse = fwd(*base, **fwd_options)
+    assert_output(low[:, positions], expected, inputs[0].dtype)
     sparse_dy = torch.zeros_like(low)
     sparse_dy[:, positions] = torch.randn_like(low[:, positions]) / expected.numel()**0.5
-    saved = state if soft or high_precision else low
-    grads = bwd(sparse_dy, *base, saved, lse, **options, deterministic=deterministic,
+    grads = bwd(sparse_dy, *base, low, lse, **options, deterministic=deterministic,
                 high_precision_level=int(high_precision))[:len(inputs)]
     reference = torch.autograd.grad(expected, refs, sparse_dy[:, positions].double())
     assert_gradients(grads, reference, inputs[0].dtype)
-    return fwd, bwd, base, fwd_options, low, saved, lse
+    return fwd, bwd, base, fwd_options, low, lse
 
 
 def sha256(path):
@@ -102,8 +91,6 @@ def main(operations):
         parser.error('invalid shape or timing count')
     if any(op.endswith('chunk') for op in operations) and args.span==0:
         parser.error('chunk span must be positive')
-    if any(op.startswith('softdelta_') for op in operations) and args.dims[1]%4:
-        parser.error('SoftDelta value dimension must be divisible by four')
     if 'full' in operations and 'previous' in args.cases:
         parser.error('causal_flash_attn does not expose previous KV')
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()!=(9,0):
@@ -142,10 +129,10 @@ def main(operations):
         try:
             inputs=make_inputs(op,case,dtype,identity['kv_heads'],'cuda')
             options,qi,ki=options_and_segments(op,case,inputs,'sm90')
-            fwd,bwd,base,fwd_options,low,saved,lse=validate(op,case,inputs,options,qi,ki,det,args.high_precision)
+            fwd,bwd,base,fwd_options,low,lse=validate(op,case,inputs,options,qi,ki,det,args.high_precision)
             dy=torch.randn_like(low)
             forward=lambda:fwd(*base,**fwd_options)
-            backward=lambda:bwd(dy,*base,saved,lse,**options,deterministic=det,high_precision_level=int(args.high_precision))
+            backward=lambda:bwd(dy,*base,low,lse,**options,deterministic=det,high_precision_level=int(args.high_precision))
             with torch.no_grad():
                 fwd_result=measure(forward,args.warmup,args.iterations,args.repeats)
                 bwd_result=measure(backward,args.warmup,args.iterations,args.repeats)

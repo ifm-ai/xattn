@@ -396,41 +396,16 @@ FLASH_SWA_SM90_CSRCS = [
     *_flash_swa_sm90_instantiation_sources("bwd"),
 ]
 
-FLASH_SOFTDELTA_CSRCS = [
-    CSRC / "softdelta" / "composition.cc",
+SOFTDELTA_CSRCS = [
     CSRC / "softdelta" / "gate.cu",
-    CSRC / "softdelta" / "gate_bindings.cc",
-    CSRC / "softdelta" / "gradient_merge.cu",
-    CSRC / "group_softdelta" / "gate.cu",
-    CSRC / "group_softdelta" / "bindings.cc",
+    CSRC / "softdelta" / "bindings.cc",
 ]
 
-
-def _flash_softdelta_sm90_instantiation_sources():
-    sources = []
-    for dtype in ("fp16", "bf16"):
-        for head_dim in sm90_head_dims():
-            for head_dim_v in sm90_head_dims():
-                name = (
-                    f"softdelta_fwd_hdim{head_dim}_"
-                    f"vdim{head_dim_v}_{dtype}_sm90.cu"
-                )
-                sources.append(
-                    CSRC / "softdelta" / "instantiations" / name
-                )
-    return sources
-
-FLASH_SOFTDELTA_SM90_CSRCS = [
+SOFTDELTA_SM90_CSRCS = [
     CSRC / "softdelta" / "fwd.cu",
-    CSRC / "softdelta" / "fwd_bindings.cc",
-    *_flash_softdelta_sm90_instantiation_sources(),
-]
-
-GROUP_SOFTDELTA_SM90_CSRCS = [
-    CSRC / "group_softdelta" / "fwd.cu",
-    CSRC / "group_softdelta" / "bwd.cu",
-    CSRC / "group_softdelta" / "preprocess.cu",
-    *sorted((CSRC / "group_softdelta" / "instantiations").glob("*.cu")),
+    CSRC / "softdelta" / "bwd.cu",
+    CSRC / "softdelta" / "preprocess.cu",
+    *sorted((CSRC / "softdelta" / "instantiations").glob("*.cu")),
 ]
 
 ATTENTION_PRECISION_CSRCS = [
@@ -456,9 +431,8 @@ if BUILD_ONLY_SM90:
         *CAUSAL_ATTENTION_CSRCS,
         *FLASH_SCA_SM90_CSRCS,
         *FLASH_SWA_SM90_CSRCS,
-        *FLASH_SOFTDELTA_CSRCS,
-        *FLASH_SOFTDELTA_SM90_CSRCS,
-        *GROUP_SOFTDELTA_SM90_CSRCS,
+        *SOFTDELTA_CSRCS,
+        *SOFTDELTA_SM90_CSRCS,
     ]
 elif BUILD_HAS_SM90:
     CSRCS = [
@@ -467,15 +441,14 @@ elif BUILD_HAS_SM90:
         *CAUSAL_ATTENTION_CSRCS,
         *FLASH_SCA_SM90_CSRCS,
         *FLASH_SWA_SM90_CSRCS,
-        *FLASH_SOFTDELTA_CSRCS,
-        *FLASH_SOFTDELTA_SM90_CSRCS,
-        *GROUP_SOFTDELTA_SM90_CSRCS,
+        *SOFTDELTA_CSRCS,
+        *SOFTDELTA_SM90_CSRCS,
     ]
 else:
     CSRCS = [
         *FLASH_SCA_CSRCS,
         *CAUSAL_ATTENTION_CSRCS,
-        *FLASH_SOFTDELTA_CSRCS,
+        *SOFTDELTA_CSRCS,
     ]
 
 CUTLASS_INCLUDE_DIR = Path(
@@ -535,7 +508,7 @@ def main():
     _require_supported_toolchain()
     setup(
         name="xattn",
-        version="1.1.1",
+        version="1.2.0",
         description="Efficient attention modules for xLLM.",
         long_description=(ROOT / "README.md").read_text(encoding="utf-8"),
         long_description_content_type="text/markdown",

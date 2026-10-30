@@ -20,7 +20,7 @@ std::tuple<torch::Tensor, torch::Tensor> CausalAttentionSM90Fwd(
     const c10::optional<torch::Tensor>& k_segment_idx,
     bool strict_past = false,
     const c10::optional<torch::Tensor>& output_state = c10::nullopt,
-    bool causal_flash_attn = false, bool use_fast_reciprocal = false, bool output_fp32 = false);
+    bool causal_flash_attn = false, bool use_fast_reciprocal = false, bool high_precision = false);
 
 std::tuple<
     torch::Tensor, torch::Tensor, torch::Tensor,
@@ -34,22 +34,8 @@ CausalAttentionSM90Bwd(
     const c10::optional<torch::Tensor>& prev_v,
     const c10::optional<torch::Tensor>& q_segment_idx,
     const c10::optional<torch::Tensor>& k_segment_idx,
-    bool deterministic, bool strict_past = false, bool causal_flash_attn = false);
-
-std::tuple<
-    torch::Tensor, torch::Tensor, torch::Tensor,
-    c10::optional<torch::Tensor>, c10::optional<torch::Tensor>>
-CausalAttentionSM90BwdWithHeadBoundary(
-    const torch::Tensor& y_grad, const torch::Tensor& q,
-    const torch::Tensor& k, const torch::Tensor& v,
-    const torch::Tensor& y, const torch::Tensor& lse,
-    int64_t window_size, double scale,
-    const c10::optional<torch::Tensor>& prev_k,
-    const c10::optional<torch::Tensor>& prev_v,
-    const c10::optional<torch::Tensor>& q_segment_idx,
-    const c10::optional<torch::Tensor>& k_segment_idx,
-    bool deterministic, bool strict_past,
-    int odd_head_window_right_delta, bool causal_flash_attn = false);
+    bool deterministic, bool strict_past = false, bool causal_flash_attn = false,
+    bool fp32_kv_grads = false);
 
 std::tuple<torch::Tensor, torch::Tensor> CausalAttentionSM90VarlenFwd(
     const torch::Tensor& q, const torch::Tensor& k,
@@ -59,7 +45,7 @@ std::tuple<torch::Tensor, torch::Tensor> CausalAttentionSM90VarlenFwd(
     int64_t max_seqlen_q, int64_t max_seqlen_k,
     int64_t window_size, double scale,
     bool strict_past = false,
-    const c10::optional<torch::Tensor>& output_state = c10::nullopt, bool output_fp32 = false);
+    const c10::optional<torch::Tensor>& output_state = c10::nullopt, bool high_precision = false);
 
 // Packed varlen forward into caller storage: y [total_q, Hq, V] with a
 // contiguous last dimension and 16-byte aligned rows / heads (any strides),

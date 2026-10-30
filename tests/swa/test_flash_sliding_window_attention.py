@@ -290,7 +290,7 @@ def test_flash_swa_extended_instances_match_fp64_oracle(
         )
 
 
-def test_flash_swa_high_precision_varlen_matches_fp64_oracle():
+def test_flash_swa_packed_varlen_gqa_matches_fp64_oracle():
     _requires_sm90_extension()
     torch.manual_seed(20260827)
     dtype = torch.bfloat16
@@ -336,7 +336,6 @@ def test_flash_swa_high_precision_varlen_matches_fp64_oracle():
         max_seqlen_k=max(k_lengths),
         backend="sm90",
         deterministic=True,
-        high_precision_level=int(True),
     )
     torch.testing.assert_close(
         actual,

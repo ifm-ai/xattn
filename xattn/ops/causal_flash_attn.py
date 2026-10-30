@@ -48,15 +48,15 @@ def causal_flash_attn(
 
     ``scale=None`` uses ``1/sqrt(D)``. Inputs must be CUDA fp16/bf16 on an
     SM90 GPU with ``backend='auto'`` or ``'sm90'``. Output is
-    ``[B, Lq, Hq, V]`` with the input dtype. ``high_precision_level=1``
-    retains FP32 output state for backward without changing the public dtype.
+    ``[B, Lq, Hq, V]`` with the input dtype. ``high_precision_level=1`` runs
+    the forward softmax in high precision and the precision-repair backward.
     """
     validate_high_precision_level(high_precision_level, api_name="causal_flash_attn")
     validate_attention_scale(scale)
     validate_sm90_dimensions(q, v, backend, api_name="causal_flash_attn")
     if scale is not None and float(scale) <= 0:
         return _dispatch_nonpositive_scale(causal_flash_attn, locals())
-    if high_precision_level >= 2:
+    if high_precision_level:
         from ._precision_backend import apply as precision_apply
         return precision_apply(q, k, v, visibility=0,
             scale=scale, q_segment_idx=q_segment_idx, k_segment_idx=k_segment_idx,
@@ -76,7 +76,6 @@ def causal_flash_attn(
         bos_mask=bos_mask,
         backend=backend,
         deterministic=deterministic,
-        high_precision_level=high_precision_level,
         api_name="causal_flash_attn",
     )
 
@@ -93,15 +92,12 @@ def causal_flash_attn_fwd(
     bos_mask: Optional[Tensor] = None,
     backend: str = "auto",
     high_precision_level: int = 0,
-) -> Tuple[Tensor, Optional[Tensor], Tensor]:
-    """Return ``(y, y_fp32, lse)``; ``y_fp32`` is None without high precision.
+) -> Tuple[Tensor, Tensor]:
+    """Return ``(y, lse)``.
 
-    ``y`` keeps the Q/K/V dtype. ``y_fp32`` is the same attention output
-    before casting, with the same shape and FP32 dtype. ``lse`` is FP32
-    with shape ``[B, Hq, Lq]``. Both outputs are written by one forward,
-    including in no_grad/inference mode; no autograd bridge is created.
-    Pass ``y_fp32`` as backward's ``y`` for high-precision state, while
-    keeping ``y_grad`` in the Q/K/V dtype.
+    ``y`` keeps the Q/K/V dtype; ``lse`` is FP32 with shape ``[B, Hq, Lq]``.
+    ``high_precision_level=1`` runs the softmax in high precision, also in
+    no_grad/inference mode; no autograd bridge is created.
     """
     validate_high_precision_level(high_precision_level, api_name="causal_flash_attn_fwd")
     validate_attention_scale(scale)
@@ -146,9 +142,9 @@ def causal_flash_attn_bwd(
     """Return flash-attention gradients ``(dq, dk, dv)``.
 
     Pass ``y`` and ``lse`` from :func:`causal_flash_attn_fwd` with the same
-    Q/K/V, scale, and segment metadata. ``y.dtype`` automatically
-    selects FP32 or input-precision state; no precision flag is needed.
-    ``y_grad`` must have the Q/K/V dtype in either case.
+    Q/K/V, scale, segment metadata and ``high_precision_level``. ``y`` and
+    ``y_grad`` have the Q/K/V dtype; level 1 recomputes the softmax
+    statistics and does not read ``y`` or ``lse``.
     """
     validate_high_precision_level(high_precision_level, api_name="causal_flash_attn_bwd")
     validate_attention_scale(scale)

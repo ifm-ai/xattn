@@ -643,7 +643,6 @@ void RunFlashSCABwdSm90(
   const bool dense =
       !varlen && params.q_segment_idx == nullptr &&
       params.seqlen_q == params.seqlen_k;
-  if (params.odd_head_window_right_delta == 0) {
   if (native_small_chunk_det && dense && deterministic &&
       UseNativeSmallChunkDetBwd(params.d, params.dv, params.attention_chunk)) {
     if (params.d == 160 && params.dv == 128) {
@@ -846,7 +845,6 @@ void RunFlashSCABwdSm90(
     DispatchFlashSCABwdSm90Variant<Element, 192, 256, 64>(
         params, deterministic, stream);
     return;
-  }
   }
   if (params.d <= 32) {
     if (params.dv <= 32) {
@@ -1383,10 +1381,8 @@ void FlashSCACheckBwdTensorsSM90(
   TORCH_CHECK(y_grad.dim() == 3 && y.dim() == 3,
               "FlashSCA SM90 varlen y_grad and y must be packed 3D tensors");
   TORCH_CHECK(y_grad.scalar_type() == q.scalar_type() &&
-                  (y.scalar_type() == q.scalar_type() ||
-                   y.scalar_type() == at::kFloat),
-              "FlashSCA SM90 y_grad dtype must match q and y must either "
-              "match q or be the float32 backward output state");
+                  y.scalar_type() == q.scalar_type(),
+              "FlashSCA SM90 y_grad and y dtypes must match q");
   TORCH_CHECK(y_grad.sizes() == y.sizes(),
               "FlashSCA SM90 y_grad and y shapes must match");
   TORCH_CHECK(y_grad.size(0) == q.size(0) && y_grad.size(1) == q.size(1) &&
@@ -1406,10 +1402,8 @@ void FlashSCACheckDenseBwdTensorsSM90(
   TORCH_CHECK(y_grad.dim() == 4 && y.dim() == 4,
               "FlashSCA SM90 y_grad and y must be 4D tensors");
   TORCH_CHECK(y_grad.scalar_type() == q.scalar_type() &&
-                  (y.scalar_type() == q.scalar_type() ||
-                   y.scalar_type() == at::kFloat),
-              "FlashSCA SM90 y_grad dtype must match q and y must either "
-              "match q or be the float32 backward output state");
+                  y.scalar_type() == q.scalar_type(),
+              "FlashSCA SM90 y_grad and y dtypes must match q");
   TORCH_CHECK(y_grad.size(0) == y.size(0) && y_grad.size(1) == y.size(1) &&
                   y_grad.size(2) == y.size(2) && y_grad.size(3) == y.size(3),
               "FlashSCA SM90 y_grad and y shapes must match");
@@ -1474,7 +1468,6 @@ void FlashSCAFillSM90DenseFwdParams(
   params.k_ptr = k.data_ptr();
   params.v_ptr = v.data_ptr();
   params.o_ptr = y.data_ptr();
-  params.output_fp32 = y.scalar_type() == at::kFloat;
   if (output_state.has_value()) {
     const torch::Tensor& state = output_state.value();
     params.o_state_ptr = state.data_ptr<float>();
@@ -1546,7 +1539,6 @@ void FlashSCAFillSM90VarlenFwdParams(
   params.k_ptr = k.data_ptr();
   params.v_ptr = v.data_ptr();
   params.o_ptr = y.data_ptr();
-  params.output_fp32 = y.scalar_type() == at::kFloat;
   if (output_state.has_value()) {
     const torch::Tensor& state = output_state.value();
     params.o_state_ptr = state.data_ptr<float>();
@@ -1607,7 +1599,7 @@ void FlashSCAFillSM90DenseBwdParams(
     torch::Tensor& dv, const int64_t* q_segment_idx,
     const int64_t* k_segment_idx, int64_t k_segment_len,
     const int* q_chunk_positions, bool reset_chunk_pos_per_seq,
-    bool strict_past, int odd_head_window_right_delta,
+    bool strict_past,
     AttentionBwdParams& params) {
   std::memset(&params, 0, sizeof(params));
 
@@ -1616,7 +1608,6 @@ void FlashSCAFillSM90DenseBwdParams(
   params.v_ptr = v.data_ptr();
   params.dy_ptr = dy.data_ptr();
   params.y_ptr = y.data_ptr();
-  params.y_is_fp32 = y.scalar_type() == at::kFloat;
   params.lse_ptr = lse.data_ptr<float>();
   params.dq_ptr = dq.data_ptr();
   params.dk_ptr = dk.data_ptr();
@@ -1663,7 +1654,6 @@ void FlashSCAFillSM90DenseBwdParams(
   params.scale_softmax = scale;
   params.window_size_left = static_cast<int>(2 * chunk_size - 1);
   params.window_size_right = strict_past ? -1 : 0;
-  params.odd_head_window_right_delta = odd_head_window_right_delta;
   params.attention_chunk = reset_chunk_pos_per_seq
       ? 0
       : static_cast<int>(chunk_size);
@@ -1699,7 +1689,6 @@ void FlashSCAFillSM90VarlenBwdParams(
   params.v_ptr = v.data_ptr();
   params.dy_ptr = dy.data_ptr();
   params.y_ptr = y.data_ptr();
-  params.y_is_fp32 = y.scalar_type() == at::kFloat;
   params.lse_ptr = lse.data_ptr<float>();
   params.dq_ptr = dq.data_ptr();
   params.dk_ptr = dk.data_ptr();
@@ -1767,7 +1756,7 @@ void FlashSCASM90DenseFwdImpl(
     const int64_t* k_segment_idx, int64_t k_segment_len,
     const int* q_chunk_positions, bool reset_chunk_pos_per_seq,
     bool strict_past, torch::Tensor& y, torch::Tensor& lse,
-    const c10::optional<torch::Tensor>& output_state) {
+    const c10::optional<torch::Tensor>& output_state, bool high_precision) {
   TORCH_CHECK(q.size(2) % k.size(2) == 0,
               "FlashSCA SM90 FWD requires Hq divisible by Hkv");
   TORCH_CHECK(q.size(3) <= 256 && v.size(3) <= 256,
@@ -1786,6 +1775,7 @@ void FlashSCASM90DenseFwdImpl(
       q_segment_idx, k_segment_idx,
       k_segment_len, q_chunk_positions, reset_chunk_pos_per_seq,
       strict_past, params);
+  params.high_precision = high_precision;
   cudaStream_t cuda_stream = at::cuda::getCurrentCUDAStream();
   using CompatEntry =
       flash_sca::plans::ScaDenseFwdCompatRegistryEntrySm90;
@@ -1805,7 +1795,7 @@ void FlashSCASM90FwdImpl(
     int64_t max_seqlen_q, int64_t max_seqlen_k,
     const int* q_position_offsets, bool strict_past, torch::Tensor& y,
     torch::Tensor& lse,
-    const c10::optional<torch::Tensor>& output_state) {
+    const c10::optional<torch::Tensor>& output_state, bool high_precision) {
   TORCH_CHECK(q.size(1) % k.size(1) == 0,
               "FlashSCA SM90 FWD requires Hq divisible by Hkv");
   TORCH_CHECK(q.size(2) <= 256 && v.size(2) <= 256,
@@ -1822,6 +1812,7 @@ void FlashSCASM90FwdImpl(
       seqused_k,
       num_sequences, max_seqlen_q, max_seqlen_k, q_position_offsets,
       strict_past, params);
+  params.high_precision = high_precision;
   cudaStream_t cuda_stream = at::cuda::getCurrentCUDAStream();
   using CompatEntry =
       flash_sca::plans::ScaVarlenFwdCompatRegistryEntrySm90;
@@ -1841,8 +1832,8 @@ void FlashSCASM90DenseBwdImpl(
     const int64_t* k_segment_idx, int64_t k_segment_len,
     const int* q_chunk_positions, bool reset_chunk_pos_per_seq,
     torch::Tensor& dq, torch::Tensor& dk, torch::Tensor& dv,
-    bool deterministic, bool strict_past,
-    int odd_head_window_right_delta, bool native_small_chunk_det) {
+    bool deterministic, bool strict_past, bool native_small_chunk_det,
+    torch::Tensor* dk_accum, torch::Tensor* dv_accum) {
   TORCH_CHECK(q.size(2) % k.size(2) == 0,
               "FlashSCA SM90 BWD requires Hq divisible by Hkv");
   TORCH_CHECK(q.size(3) == k.size(3),
@@ -1863,8 +1854,9 @@ void FlashSCASM90DenseBwdImpl(
   FlashSCAFillSM90DenseBwdParams(
       dy, q, k, v, y, lse, chunk_size, scale, dq, dk, dv,
       q_segment_idx, k_segment_idx, k_segment_len, q_chunk_positions,
-      reset_chunk_pos_per_seq, strict_past,
-      odd_head_window_right_delta, params);
+      reset_chunk_pos_per_seq, strict_past, params);
+  params.dk_accum_out = dk_accum;
+  params.dv_accum_out = dv_accum;
   cudaStream_t cuda_stream = at::cuda::getCurrentCUDAStream();
   using CompatEntry =
       flash_sca::plans::ScaDenseBwdCompatRegistryEntrySm90;
@@ -2660,7 +2652,7 @@ std::tuple<torch::Tensor, torch::Tensor> FlashSCASM90VarlenFwd(
     const c10::optional<torch::Tensor>& k_run_starts,
     const c10::optional<torch::Tensor>& k_run_lengths,
     bool strict_past,
-    const c10::optional<torch::Tensor>& output_state, bool output_fp32) {
+    const c10::optional<torch::Tensor>& output_state, bool high_precision) {
   const int arch = FlashSCACurrentDeviceArch(q);
   TORCH_CHECK(arch == 90,
               "FlashSCA SM90 FWD requires Hopper sm90, got sm", arch);
@@ -2732,8 +2724,6 @@ std::tuple<torch::Tensor, torch::Tensor> FlashSCASM90VarlenFwd(
   const int64_t total_q = q.size(0);
   const int64_t H = q.size(1);
   const int64_t V = v.size(2);
-  TORCH_CHECK(!output_fp32 || !output_state.has_value(),
-              "FP32-only output and output_state are mutually exclusive");
   if (output_state.has_value()) {
     const torch::Tensor& state = output_state.value();
     TORCH_CHECK(
@@ -2746,8 +2736,7 @@ std::tuple<torch::Tensor, torch::Tensor> FlashSCASM90VarlenFwd(
   }
   torch::Tensor y_compute = torch::empty(
       {total_q, H, V},
-      v_c.options().dtype(output_fp32 ? at::kFloat : v_c.scalar_type())
-          .memory_format(at::MemoryFormat::Contiguous));
+      v_c.options().memory_format(at::MemoryFormat::Contiguous));
   torch::Tensor lse = torch::empty(
       {H, total_q},
       q.options().dtype(at::kFloat).memory_format(
@@ -2758,18 +2747,18 @@ std::tuple<torch::Tensor, torch::Tensor> FlashSCASM90VarlenFwd(
         q_c, k_c, v_c, chunk_size, static_cast<float>(scale),
         cu_q_c.data_ptr<int>(), cu_k_aligned, seqused_k_data, num_sequences,
         max_seqlen_q, max_seqlen_k, position_offsets_data, strict_past,
-        y_compute, lse, output_state);
+        y_compute, lse, output_state, high_precision);
   } else {
     FlashSCASM90FwdImpl<
         cutlass::bfloat16_t, cutlass::bfloat16_t>(
         q_c, k_c, v_c, chunk_size, static_cast<float>(scale),
         cu_q_c.data_ptr<int>(), cu_k_aligned, seqused_k_data, num_sequences,
         max_seqlen_q, max_seqlen_k, position_offsets_data, strict_past,
-        y_compute, lse, output_state);
+        y_compute, lse, output_state, high_precision);
   }
 
   torch::Tensor y =
-      cast_compute && !output_fp32 ? y_compute.to(q.scalar_type()) : y_compute;
+      cast_compute ? y_compute.to(q.scalar_type()) : y_compute;
   return std::make_tuple<torch::Tensor, torch::Tensor>(std::move(y),
                                                        std::move(lse));
 }
@@ -2975,7 +2964,7 @@ std::tuple<torch::Tensor, torch::Tensor> FlashSCASM90Fwd(
     const c10::optional<torch::Tensor>& q_segment_idx,
     const c10::optional<torch::Tensor>& k_segment_idx,
     bool reset_chunk_pos_per_seq, bool strict_past,
-    const c10::optional<torch::Tensor>& output_state, bool output_fp32) {
+    const c10::optional<torch::Tensor>& output_state, bool high_precision) {
   const int arch = FlashSCACurrentDeviceArch(q);
   TORCH_CHECK(arch == 90,
               "FlashSCA SM90 FWD requires Hopper sm90, got sm", arch);
@@ -3032,8 +3021,6 @@ std::tuple<torch::Tensor, torch::Tensor> FlashSCASM90Fwd(
   const int64_t L = q.size(1);
   const int64_t H = q.size(2);
   const int64_t V = v.size(3);
-  TORCH_CHECK(!output_fp32 || !output_state.has_value(),
-              "FP32-only output and output_state are mutually exclusive");
   if (output_state.has_value()) {
     const torch::Tensor& state = output_state.value();
     TORCH_CHECK(
@@ -3047,8 +3034,7 @@ std::tuple<torch::Tensor, torch::Tensor> FlashSCASM90Fwd(
 
   torch::Tensor y_compute = torch::empty(
       {B, L, H, V},
-      v_c.options().dtype(output_fp32 ? at::kFloat : v_c.scalar_type())
-          .memory_format(at::MemoryFormat::Contiguous));
+      v_c.options().memory_format(at::MemoryFormat::Contiguous));
   torch::Tensor lse = torch::empty(
       {B, H, L},
       q.options().dtype(at::kFloat).memory_format(
@@ -3069,25 +3055,25 @@ std::tuple<torch::Tensor, torch::Tensor> FlashSCASM90Fwd(
         q_c, k_c, v_c, chunk_size, static_cast<float>(scale),
         q_segment_idx_data, k_segment_idx_data, k_segment_len,
         q_chunk_positions_data, dense_reset_with_segments, strict_past,
-        y_compute, lse, output_state);
+        y_compute, lse, output_state, high_precision);
   } else {
     FlashSCASM90DenseFwdImpl<
         cutlass::bfloat16_t, cutlass::bfloat16_t>(
         q_c, k_c, v_c, chunk_size, static_cast<float>(scale),
         q_segment_idx_data, k_segment_idx_data, k_segment_len,
         q_chunk_positions_data, dense_reset_with_segments, strict_past,
-        y_compute, lse, output_state);
+        y_compute, lse, output_state, high_precision);
   }
 
   torch::Tensor y =
-      cast_compute && !output_fp32 ? y_compute.to(q.scalar_type()) : y_compute;
+      cast_compute ? y_compute.to(q.scalar_type()) : y_compute;
   return std::make_tuple<torch::Tensor, torch::Tensor>(std::move(y),
                                                        std::move(lse));
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor,
            c10::optional<torch::Tensor>, c10::optional<torch::Tensor>>
-FlashSCASM90BwdWithHeadBoundary(
+FlashSCASM90Bwd(
     const torch::Tensor& y_grad, const torch::Tensor& q,
     const torch::Tensor& k, const torch::Tensor& v, const torch::Tensor& y,
     const torch::Tensor& lse, int64_t chunk_size, double scale,
@@ -3096,21 +3082,14 @@ FlashSCASM90BwdWithHeadBoundary(
     const c10::optional<torch::Tensor>& q_segment_idx,
     const c10::optional<torch::Tensor>& k_segment_idx,
     bool deterministic, bool reset_chunk_pos_per_seq,
-    bool strict_past, int odd_head_window_right_delta) {
+    bool strict_past, bool fp32_kv_grads) {
   const int arch = FlashSCACurrentDeviceArch(q);
   TORCH_CHECK(arch == 90,
               "FlashSCA SM90 BWD requires Hopper sm90, got sm", arch);
+  TORCH_CHECK(!fp32_kv_grads || q.size(2) != k.size(2),
+              "FlashSCA FP32 dK / dV gradients need grouped query heads");
   TORCH_CHECK(chunk_size > 0,
               "FlashSCA SM90 BWD expects positive chunk_size");
-  TORCH_CHECK(
-      odd_head_window_right_delta == 0 ||
-          odd_head_window_right_delta == -1,
-      "FlashSCA SM90 BWD odd-head boundary delta must be 0 or -1");
-  TORCH_CHECK(
-      odd_head_window_right_delta == 0 ||
-          (!strict_past && q.size(2) % 2 == 0),
-      "FlashSCA SM90 BWD odd-head boundary mode requires inclusive "
-      "base semantics and interleaved head pairs");
   TORCH_CHECK(prev_k.has_value() == prev_v.has_value(),
               "prev_k and prev_v must both be provided or both be None");
   FlashSCACheckDenseBwdTensorsSM90(y_grad, q, k, v, y, lse);
@@ -3170,7 +3149,6 @@ FlashSCASM90BwdWithHeadBoundary(
   const bool native_small_chunk_det =
       deterministic && !has_segment && !has_prev &&
       q.size(1) == k.size(1) &&
-      odd_head_window_right_delta == 0 &&
       UseNativeSmallChunkDetBwd(D, V, chunk_size);
   const int64_t bucket_dim_qk = FlashSCABwdHeadDimBucketSm90(
       static_cast<int>(D));
@@ -3233,24 +3211,30 @@ FlashSCASM90BwdWithHeadBoundary(
     q_chunk_positions_data = q_chunk_positions.data_ptr<int>();
   }
 
+  torch::Tensor dk_accum;
+  torch::Tensor dv_accum;
   if (q_c.scalar_type() == at::kHalf) {
     FlashSCASM90DenseBwdImpl<cutlass::half_t>(
         dy_c, q_c, k_c, v_c, y_c, lse, chunk_size,
         static_cast<float>(scale), q_segment_idx_data, k_segment_idx_data,
         k_segment_len, q_chunk_positions_data, dense_reset_with_segments,
         dq_pad, dk_total_pad, dv_total_pad,
-        deterministic, strict_past, odd_head_window_right_delta,
-        native_small_chunk_det);
+        deterministic, strict_past, native_small_chunk_det,
+        fp32_kv_grads ? &dk_accum : nullptr, fp32_kv_grads ? &dv_accum : nullptr);
   } else {
     FlashSCASM90DenseBwdImpl<cutlass::bfloat16_t>(
         dy_c, q_c, k_c, v_c, y_c, lse, chunk_size,
         static_cast<float>(scale), q_segment_idx_data, k_segment_idx_data,
         k_segment_len, q_chunk_positions_data, dense_reset_with_segments,
         dq_pad, dk_total_pad, dv_total_pad,
-        deterministic, strict_past, odd_head_window_right_delta,
-        native_small_chunk_det);
+        deterministic, strict_past, native_small_chunk_det,
+        fp32_kv_grads ? &dk_accum : nullptr, fp32_kv_grads ? &dv_accum : nullptr);
   }
 
+  if (fp32_kv_grads) {
+    dk_total_pad = dk_accum.narrow(3, 0, D);
+    dv_total_pad = dv_accum.narrow(3, 0, V);
+  }
   torch::Tensor dq_c =
       needs_qk_dim_pad ? dq_pad.narrow(3, 0, D).contiguous() : dq_pad;
   torch::Tensor dk_c;
@@ -3303,25 +3287,6 @@ FlashSCASM90BwdWithHeadBoundary(
                          c10::optional<torch::Tensor>>(
       std::move(dq), std::move(dk), std::move(dv), std::move(prev_dk_out),
       std::move(prev_dv_out));
-}
-
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor,
-           c10::optional<torch::Tensor>, c10::optional<torch::Tensor>>
-FlashSCASM90Bwd(
-    const torch::Tensor& y_grad, const torch::Tensor& q,
-    const torch::Tensor& k, const torch::Tensor& v, const torch::Tensor& y,
-    const torch::Tensor& lse, int64_t chunk_size, double scale,
-    const c10::optional<torch::Tensor>& prev_k,
-    const c10::optional<torch::Tensor>& prev_v,
-    const c10::optional<torch::Tensor>& q_segment_idx,
-    const c10::optional<torch::Tensor>& k_segment_idx,
-    bool deterministic, bool reset_chunk_pos_per_seq,
-    bool strict_past) {
-  return FlashSCASM90BwdWithHeadBoundary(
-      y_grad, q, k, v, y, lse, chunk_size, scale, prev_k, prev_v,
-      q_segment_idx, k_segment_idx, deterministic,
-      reset_chunk_pos_per_seq, strict_past,
-      0 /*odd_head_window_right_delta*/);
 }
 
 }  // namespace ops

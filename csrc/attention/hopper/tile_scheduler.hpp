@@ -613,13 +613,10 @@ public:
 // ResidualFirst schedules the partial L2 section (num_head * num_batch not a
 // multiple of the section size) before the full ones, so its longest blocks
 // do not form the tail.
-template <bool Varlen, int kBlock, bool SPT = false, int WorkGroupX = 1,
-          bool ContiguousWorkGroup = true, bool ResidualFirst = false>
+template <bool Varlen, int kBlock, bool SPT = false, bool ResidualFirst = false>
 class SingleTileBwdLPTScheduler {
 
 public:
-
-    static_assert(WorkGroupX >= 1, "BWD scheduler work-group width must be positive");
 
     using SharedStorage = int;
     static constexpr bool HasMBlockRange = false;
@@ -661,7 +658,7 @@ public:
 
     static dim3
     get_grid_shape(Params const& params, int num_sm) {
-        return {uint32_t(params.total_blocks * WorkGroupX)};
+        return {uint32_t(params.total_blocks)};
     }
 
     struct WorkTileInfo {
@@ -690,16 +687,7 @@ public:
     CUTLASS_DEVICE
     WorkTileInfo
     get_initial_work(Params const& params) const {
-        // CUDA clusters require contiguous reader groups. Independent readers
-        // use planes with the per-reader logical tile order.
-        int tile_idx;
-        if constexpr (ContiguousWorkGroup) {
-            tile_idx = blockIdx.x / WorkGroupX;
-        } else {
-            static_assert(WorkGroupX > 1,
-                          "planar work groups require multiple workers");
-            tile_idx = blockIdx.x % params.total_blocks;
-        }
+        int const tile_idx = blockIdx.x;
         int block, bidh, bidb;
         int l2_mod, bidhb, bidhb_residual;
         if constexpr (ResidualFirst) {

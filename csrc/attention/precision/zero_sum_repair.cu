@@ -56,7 +56,6 @@ __global__ void EncodeKernel(const float* first_plane, const float* last_plane, 
 __global__ void CoefficientKernel(const int* lo_in, const int* last_in, const int* changes,
                                   const int64_t* max_lo, const int64_t* max_last,
                                   const double* rho, const float* log_z,
-                                  const double* variance, const float* delta,
                                   int* mono_lo, int* mono_last, double* rho_anchor, float* coefficient,
                                   int nq, int nk, int hq, int64_t stride, int64_t total) {
   const int64_t x = int64_t(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -76,13 +75,8 @@ __global__ void CoefficientKernel(const int* lo_in, const int* last_in, const in
     double u = 0.0;
     float c = 0.f;
     if (elig && r != 0.0 && isfinite(r)) {
-      // Anchor share: dS_a^2 / sum dS^2 (rounding variance) when the operand
-      // statistics are available, else the anchor probability.
-      double share = fmin(fmax(exp(-double(log_z[row])), 0.0), 1.0);
-      if (variance != nullptr) {
-        const double v = variance[row], da = share * double(delta[row]);
-        if (v > 0.0 && isfinite(v) && isfinite(da)) share = fmin(da * da / v, 1.0);
-      }
+      // Anchor share: the anchor probability.
+      const double share = fmin(fmax(exp(-double(log_z[row])), 0.0), 1.0);
       const double n = double(l - lo + 1);
       c = float((r - r * share) / n);
       u = double(c) * n;  // the anchor share absorbs the FP32 rounding of c
@@ -331,8 +325,7 @@ __global__ void __launch_bounds__(kThreads) DkKernel(const E* q, const float* co
 void ZeroSumRepair(const torch::Tensor& q, const torch::Tensor& k, const torch::Tensor& rho,
                    const torch::Tensor& meta, const torch::Tensor& log_z,
                    const c10::optional<torch::Tensor>& k_segment, int64_t window, bool anchor_scatter,
-                   torch::Tensor rho_anchor, torch::Tensor dq, torch::Tensor dk, double scale,
-                   const c10::optional<torch::Tensor>& variance, const c10::optional<torch::Tensor>& delta) {
+                   torch::Tensor rho_anchor, torch::Tensor dq, torch::Tensor dk, double scale) {
   TORCH_CHECK(q.is_cuda() && q.dim() == 4 && k.dim() == 4, "zero-sum repair requires CUDA [B,N,H,D] Q/K");
   TORCH_CHECK(q.scalar_type() == at::kHalf || q.scalar_type() == at::kBFloat16, "zero-sum repair requires FP16/BF16 Q/K");
   TORCH_CHECK(k.scalar_type() == q.scalar_type() && q.is_contiguous() && k.is_contiguous(), "Q/K must be contiguous with one dtype");
@@ -343,11 +336,6 @@ void ZeroSumRepair(const torch::Tensor& q, const torch::Tensor& k, const torch::
   TORCH_CHECK(rho.scalar_type() == at::kDouble && rho.is_contiguous() && rho.numel() == rows, "rho must be contiguous FP64 [B,Hq,Nq]");
   TORCH_CHECK(rho_anchor.scalar_type() == at::kDouble && rho_anchor.is_contiguous() && rho_anchor.numel() == rows, "rho_anchor must be contiguous FP64 [B,Hq,Nq]");
   TORCH_CHECK(log_z.scalar_type() == at::kFloat && log_z.is_contiguous() && log_z.numel() == rows, "log_z must be contiguous FP32 [B,Hq,Nq]");
-  TORCH_CHECK(variance.has_value() == delta.has_value(), "variance and delta are required together");
-  if (variance) {
-    TORCH_CHECK(variance->scalar_type() == at::kDouble && variance->is_contiguous() && variance->numel() == rows && variance->is_cuda() && variance->device() == q.device(), "variance must be contiguous FP64 [B,Hq,Nq]");
-    TORCH_CHECK(delta->scalar_type() == at::kFloat && delta->is_contiguous() && delta->numel() == rows && delta->is_cuda() && delta->device() == q.device(), "delta must be contiguous FP32 [B,Hq,Nq]");
-  }
   TORCH_CHECK(meta.scalar_type() == at::kFloat && meta.is_contiguous() && meta.numel() == 6 * rows, "invalid precision metadata");
   TORCH_CHECK(dq.scalar_type() == at::kFloat && dk.scalar_type() == at::kFloat && dq.is_contiguous() && dk.is_contiguous(), "dQ/dK must be contiguous FP32");
   TORCH_CHECK(dq.sizes() == q.sizes() && dk.sizes() == k.sizes(), "accumulator shapes must match Q/K");
@@ -390,7 +378,6 @@ void ZeroSumRepair(const torch::Tensor& q, const torch::Tensor& k, const torch::
   auto coefficient = torch::empty({b, hq, nq}, q.options().dtype(at::kFloat));
   CoefficientKernel<<<(total + 255) / 256, 256, 0, stream>>>(lo.data_ptr<int>(), last.data_ptr<int>(), change_ptr,
       max_lo, max_last, rho.data_ptr<double>(), log_z.data_ptr<float>(),
-      variance ? variance->data_ptr<double>() : nullptr, delta ? delta->data_ptr<float>() : nullptr,
       mono_lo.data_ptr<int>(), mono_last.data_ptr<int>(),
       rho_anchor.data_ptr<double>(), coefficient.data_ptr<float>(), nq, nk, hq, stride, total);
   const int smem = (kChunk + 1) * d * int(sizeof(float));

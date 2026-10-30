@@ -15,7 +15,7 @@ std::tuple<torch::Tensor, torch::Tensor> CausalAttentionFwd(
     const c10::optional<torch::Tensor>& k_segment_idx,
     const std::string& backend, bool strict_past,
     const c10::optional<torch::Tensor>& output_state,
-    bool causal_flash_attn = false, bool use_fast_reciprocal = false, bool output_fp32 = false);
+    bool causal_flash_attn = false, bool use_fast_reciprocal = false, bool high_precision = false);
 
 std::tuple<
     torch::Tensor, torch::Tensor, torch::Tensor,
@@ -30,7 +30,7 @@ CausalAttentionBwd(
     const c10::optional<torch::Tensor>& q_segment_idx,
     const c10::optional<torch::Tensor>& k_segment_idx,
     bool deterministic, const std::string& backend, bool strict_past,
-    bool causal_flash_attn = false);
+    bool causal_flash_attn = false, bool fp32_kv_grads = false);
 
 std::tuple<torch::Tensor, torch::Tensor> CausalAttentionVarlenFwd(
     const torch::Tensor& q, const torch::Tensor& k,
@@ -40,7 +40,7 @@ std::tuple<torch::Tensor, torch::Tensor> CausalAttentionVarlenFwd(
     int64_t max_seqlen_q, int64_t max_seqlen_k,
     int64_t window_size, double scale,
     const std::string& backend, bool strict_past,
-    const c10::optional<torch::Tensor>& output_state, bool output_fp32 = false);
+    const c10::optional<torch::Tensor>& output_state, bool high_precision = false);
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
 CausalAttentionVarlenBwd(

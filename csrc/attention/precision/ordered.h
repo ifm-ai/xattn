@@ -8,6 +8,6 @@ std::tuple<torch::Tensor,torch::Tensor,torch::Tensor> MainBackward(
     const c10::optional<torch::Tensor>& q_segment,
     const c10::optional<torch::Tensor>& k_segment,
     const c10::optional<torch::Tensor>& q_positions,
-    double scale,int level,int visibility,int span,bool strict_past,bool reset,
-    const c10::optional<torch::Tensor>& rho_exponent);
+    double scale,int visibility,int span,bool strict_past,bool reset,
+    const torch::Tensor& rho_exponent);
 }
