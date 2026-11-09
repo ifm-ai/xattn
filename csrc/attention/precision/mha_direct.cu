@@ -10,36 +10,12 @@ void Main_64_64_bf16_2(AttentionBwdParams,cudaStream_t);
 void Main_64_64_fp16_0(AttentionBwdParams,cudaStream_t);
 void Main_64_64_fp16_1(AttentionBwdParams,cudaStream_t);
 void Main_64_64_fp16_2(AttentionBwdParams,cudaStream_t);
-void Main_64_128_bf16_0(AttentionBwdParams,cudaStream_t);
-void Main_64_128_bf16_1(AttentionBwdParams,cudaStream_t);
-void Main_64_128_bf16_2(AttentionBwdParams,cudaStream_t);
-void Main_64_128_fp16_0(AttentionBwdParams,cudaStream_t);
-void Main_64_128_fp16_1(AttentionBwdParams,cudaStream_t);
-void Main_64_128_fp16_2(AttentionBwdParams,cudaStream_t);
-void Main_64_256_bf16_0(AttentionBwdParams,cudaStream_t);
-void Main_64_256_bf16_1(AttentionBwdParams,cudaStream_t);
-void Main_64_256_bf16_2(AttentionBwdParams,cudaStream_t);
-void Main_64_256_fp16_0(AttentionBwdParams,cudaStream_t);
-void Main_64_256_fp16_1(AttentionBwdParams,cudaStream_t);
-void Main_64_256_fp16_2(AttentionBwdParams,cudaStream_t);
-void Main_128_64_bf16_0(AttentionBwdParams,cudaStream_t);
-void Main_128_64_bf16_1(AttentionBwdParams,cudaStream_t);
-void Main_128_64_bf16_2(AttentionBwdParams,cudaStream_t);
-void Main_128_64_fp16_0(AttentionBwdParams,cudaStream_t);
-void Main_128_64_fp16_1(AttentionBwdParams,cudaStream_t);
-void Main_128_64_fp16_2(AttentionBwdParams,cudaStream_t);
 void Main_128_128_bf16_0(AttentionBwdParams,cudaStream_t);
 void Main_128_128_bf16_1(AttentionBwdParams,cudaStream_t);
 void Main_128_128_bf16_2(AttentionBwdParams,cudaStream_t);
 void Main_128_128_fp16_0(AttentionBwdParams,cudaStream_t);
 void Main_128_128_fp16_1(AttentionBwdParams,cudaStream_t);
 void Main_128_128_fp16_2(AttentionBwdParams,cudaStream_t);
-void Main_128_256_bf16_0(AttentionBwdParams,cudaStream_t);
-void Main_128_256_bf16_1(AttentionBwdParams,cudaStream_t);
-void Main_128_256_bf16_2(AttentionBwdParams,cudaStream_t);
-void Main_128_256_fp16_0(AttentionBwdParams,cudaStream_t);
-void Main_128_256_fp16_1(AttentionBwdParams,cudaStream_t);
-void Main_128_256_fp16_2(AttentionBwdParams,cudaStream_t);
 void Main_256_64_bf16_0(AttentionBwdParams,cudaStream_t);
 void Main_256_64_bf16_1(AttentionBwdParams,cudaStream_t);
 void Main_256_64_bf16_2(AttentionBwdParams,cudaStream_t);
@@ -63,8 +39,7 @@ std::tuple<torch::Tensor,torch::Tensor,torch::Tensor> MainBackward(
  const torch::Tensor& g,const torch::Tensor& delta,const torch::Tensor& logz,
  const torch::Tensor& stats,const torch::Tensor& meta,
  const c10::optional<torch::Tensor>& qs,const c10::optional<torch::Tensor>& ks,
- const c10::optional<torch::Tensor>& qp,double scale,int level,int visibility,int span,bool strict,bool reset) {
- TORCH_CHECK(level>=2 && level<=4,"precision mainloop needs level 2, 3, or 4");
+ const c10::optional<torch::Tensor>& qp,double scale,int visibility,int span,bool strict,bool reset) {
  TORCH_CHECK(visibility>=0 && visibility<=2,"invalid attention visibility");
  TORCH_CHECK(q.is_cuda() && q.dim()==4,"Q must be CUDA [B,N,H,D]");
  TORCH_CHECK(q.scalar_type()==at::kHalf || q.scalar_type()==at::kBFloat16,"precision mainloop requires FP16/BF16");
@@ -96,12 +71,12 @@ std::tuple<torch::Tensor,torch::Tensor,torch::Tensor> MainBackward(
  if(!q.numel()){return {torch::zeros(q.sizes(),q.options().dtype(at::kFloat)),torch::zeros(k.sizes(),q.options().dtype(at::kFloat)),torch::zeros(v.sizes(),q.options().dtype(at::kFloat))};}
  AttentionBwdParams p{};p.q_ptr=q.data_ptr();p.k_ptr=k.data_ptr();p.v_ptr=v.data_ptr();p.dy_ptr=g.data_ptr();
  p.lse_ptr=logz.data_ptr();p.dq_ptr=dq.data_ptr();p.dk_ptr=dk.data_ptr();p.dv_ptr=dv.data_ptr();
- p.hp_delta=delta.data_ptr<float>();p.hp_rho=reinterpret_cast<float*>(stats.data_ptr());p.hp_mass=meta.data_ptr<float>();p.high_precision_level=level;
+ p.hp_delta=delta.data_ptr<float>();p.hp_rho=reinterpret_cast<float*>(stats.data_ptr());p.hp_mass=meta.data_ptr<float>();
  p.b=q.size(0);p.num_sequences=p.b;p.seqlen_q=q.size(1);p.seqlen_k=k.size(1);p.max_seqlen_q=p.seqlen_q;p.max_seqlen_k=p.seqlen_k;
  p.d=q.size(3);p.dv=v.size(3);p.h=q.size(2);p.h_k=k.size(2);p.scale_softmax=float(scale);
  p.window_size_left=visibility==0 ? p.seqlen_k : visibility==1 ? span : 2*span-1;
  p.window_size_right=strict ? -1 : 0;p.attention_chunk=visibility==2 && !(reset && qs.has_value()) ? span : 0;
- p.y_is_fp32=true;p.num_sm=at::cuda::getDeviceProperties(q.get_device())->multiProcessorCount;
+ p.num_sm=at::cuda::getDeviceProperties(q.get_device())->multiProcessorCount;
  if(qs){p.q_segment_idx=qs->data_ptr<int64_t>();p.k_segment_idx=ks->data_ptr<int64_t>();p.k_segment_len=p.seqlen_k;}
  p.q_chunk_positions=qp ? qp->data_ptr<int>() : nullptr;p.reset_attention_chunk=reset && qs.has_value() ? span : 0;
 #define STRIDE(NAME,TENSOR) p.NAME##_batch_stride=TENSOR.stride(0);p.NAME##_row_stride=TENSOR.stride(1);p.NAME##_head_stride=TENSOR.stride(2);
@@ -109,10 +84,11 @@ std::tuple<torch::Tensor,torch::Tensor,torch::Tensor> MainBackward(
 #undef STRIDE
  auto stream=at::cuda::getCurrentCUDAStream(q.get_device());
  using Fn=void(*)(AttentionBwdParams,cudaStream_t);
- static const Fn bf16[3][3][3]={{{Main_64_64_bf16_0,Main_64_64_bf16_1,Main_64_64_bf16_2},{Main_64_128_bf16_0,Main_64_128_bf16_1,Main_64_128_bf16_2},{Main_64_256_bf16_0,Main_64_256_bf16_1,Main_64_256_bf16_2}},{{Main_128_64_bf16_0,Main_128_64_bf16_1,Main_128_64_bf16_2},{Main_128_128_bf16_0,Main_128_128_bf16_1,Main_128_128_bf16_2},{Main_128_256_bf16_0,Main_128_256_bf16_1,Main_128_256_bf16_2}},{{Main_256_64_bf16_0,Main_256_64_bf16_1,Main_256_64_bf16_2},{Main_256_128_bf16_0,Main_256_128_bf16_1,Main_256_128_bf16_2},{Main_256_256_bf16_0,Main_256_256_bf16_1,Main_256_256_bf16_2}}};
- static const Fn fp16[3][3][3]={{{Main_64_64_fp16_0,Main_64_64_fp16_1,Main_64_64_fp16_2},{Main_64_128_fp16_0,Main_64_128_fp16_1,Main_64_128_fp16_2},{Main_64_256_fp16_0,Main_64_256_fp16_1,Main_64_256_fp16_2}},{{Main_128_64_fp16_0,Main_128_64_fp16_1,Main_128_64_fp16_2},{Main_128_128_fp16_0,Main_128_128_fp16_1,Main_128_128_fp16_2},{Main_128_256_fp16_0,Main_128_256_fp16_1,Main_128_256_fp16_2}},{{Main_256_64_fp16_0,Main_256_64_fp16_1,Main_256_64_fp16_2},{Main_256_128_fp16_0,Main_256_128_fp16_1,Main_256_128_fp16_2},{Main_256_256_fp16_0,Main_256_256_fp16_1,Main_256_256_fp16_2}}};
+ static const Fn bf16[3][3][3]={{{Main_64_64_bf16_0,Main_64_64_bf16_1,Main_64_64_bf16_2},{nullptr,nullptr,nullptr},{nullptr,nullptr,nullptr}},{{nullptr,nullptr,nullptr},{Main_128_128_bf16_0,Main_128_128_bf16_1,Main_128_128_bf16_2},{nullptr,nullptr,nullptr}},{{Main_256_64_bf16_0,Main_256_64_bf16_1,Main_256_64_bf16_2},{Main_256_128_bf16_0,Main_256_128_bf16_1,Main_256_128_bf16_2},{Main_256_256_bf16_0,Main_256_256_bf16_1,Main_256_256_bf16_2}}};
+ static const Fn fp16[3][3][3]={{{Main_64_64_fp16_0,Main_64_64_fp16_1,Main_64_64_fp16_2},{nullptr,nullptr,nullptr},{nullptr,nullptr,nullptr}},{{nullptr,nullptr,nullptr},{Main_128_128_fp16_0,Main_128_128_fp16_1,Main_128_128_fp16_2},{nullptr,nullptr,nullptr}},{{Main_256_64_fp16_0,Main_256_64_fp16_1,Main_256_64_fp16_2},{Main_256_128_fp16_0,Main_256_128_fp16_1,Main_256_128_fp16_2},{Main_256_256_fp16_0,Main_256_256_fp16_1,Main_256_256_fp16_2}}};
  int db=p.d<=64?0:p.d<=128?1:2,vb=p.dv<=64?0:p.dv<=128?1:2;
  TORCH_CHECK(q.size(2)==k.size(2),"direct KV epilogue requires MHA");
+ TORCH_CHECK((db==vb || db==2) && db>=vb,"direct KV units cover square buckets and D 256");
  (q.scalar_type()==at::kBFloat16?bf16:fp16)[db][vb][visibility](p,stream);
  return {dq.narrow(3,0,p.d).contiguous(),dk.narrow(3,0,p.d).contiguous(),dv.narrow(3,0,p.dv).contiguous()};
 }

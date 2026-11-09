@@ -53,7 +53,7 @@ FlashSCASM90VarlenFwd(
     const c10::optional<torch::Tensor>& k_run_lengths,
     bool strict_past,
     const c10::optional<torch::Tensor>& output_state = c10::nullopt,
-    bool output_fp32 = false);
+    bool high_precision = false);
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
 FlashSCASM90VarlenBwd(
@@ -537,7 +537,7 @@ std::tuple<torch::Tensor, torch::Tensor> FlashSCAFwd(
     const c10::optional<torch::Tensor>& k_segment_idx,
     const std::string& backend,
     bool reset_chunk_pos_per_seq,
-    const c10::optional<torch::Tensor>& output_state, bool output_fp32) {
+    const c10::optional<torch::Tensor>& output_state, bool high_precision) {
   TORCH_CHECK(q.device().type() == torch::kCUDA);
   TORCH_CHECK(k.device().type() == torch::kCUDA);
   TORCH_CHECK(v.device().type() == torch::kCUDA);
@@ -551,11 +551,11 @@ std::tuple<torch::Tensor, torch::Tensor> FlashSCAFwd(
   CheckFlashSCASM90OnlyAvailable(q);
   return FlashSCASM90Fwd(
       q, k, v, chunk_size, scale, prev_k, prev_v, q_segment_idx,
-      k_segment_idx, reset_chunk_pos_per_seq, false, output_state, output_fp32);
+      k_segment_idx, reset_chunk_pos_per_seq, false, output_state, high_precision);
 #else
   return FlashSCACUDAFwd(
       q, k, v, chunk_size, scale, prev_k, prev_v, q_segment_idx,
-      k_segment_idx, backend, reset_chunk_pos_per_seq, output_state, output_fp32);
+      k_segment_idx, backend, reset_chunk_pos_per_seq, output_state, high_precision);
 #endif
 }
 
@@ -570,7 +570,7 @@ FlashSCABwd(
     const c10::optional<torch::Tensor>& q_segment_idx,
     const c10::optional<torch::Tensor>& k_segment_idx,
     bool deterministic, const std::string& backend,
-    bool reset_chunk_pos_per_seq) {
+    bool reset_chunk_pos_per_seq, bool fp32_kv_grads) {
   TORCH_CHECK(y_grad.device().type() == torch::kCUDA);
   TORCH_CHECK(q.device().type() == torch::kCUDA);
   TORCH_CHECK(k.device().type() == torch::kCUDA);
@@ -581,6 +581,18 @@ FlashSCABwd(
   CheckOptionalCUDA(prev_v, "prev_v");
   CheckOptionalCUDA(q_segment_idx, "q_segment_idx");
   CheckOptionalCUDA(k_segment_idx, "k_segment_idx");
+  if (fp32_kv_grads) {
+#ifdef XATTN_HAS_SM90
+    CheckFlashSCASM90OnlyBackend(backend);
+    CheckFlashSCASM90OnlyAvailable(q);
+    return FlashSCASM90Bwd(
+        y_grad, q, k, v, y, lse, chunk_size, scale, prev_k, prev_v,
+        q_segment_idx, k_segment_idx, deterministic,
+        reset_chunk_pos_per_seq, false, true);
+#else
+    TORCH_CHECK(false, "FlashSCA FP32 dK / dV gradients need the SM90 backend");
+#endif
+  }
 #ifdef XATTN_SM90_ONLY
   CheckFlashSCASM90OnlyBackend(backend);
   CheckFlashSCASM90OnlyAvailable(q);
@@ -605,7 +617,7 @@ std::tuple<torch::Tensor, torch::Tensor> FlashSCAStrictPastFwd(
     const c10::optional<torch::Tensor>& k_segment_idx,
     const std::string& backend,
     bool reset_chunk_pos_per_seq,
-    const c10::optional<torch::Tensor>& output_state, bool output_fp32) {
+    const c10::optional<torch::Tensor>& output_state, bool high_precision) {
   TORCH_CHECK(q.device().type() == torch::kCUDA);
   TORCH_CHECK(k.device().type() == torch::kCUDA);
   TORCH_CHECK(v.device().type() == torch::kCUDA);
@@ -619,7 +631,7 @@ std::tuple<torch::Tensor, torch::Tensor> FlashSCAStrictPastFwd(
 #ifdef XATTN_HAS_SM90
   return FlashSCASM90Fwd(
       q, k, v, chunk_size, scale, prev_k, prev_v, q_segment_idx,
-      k_segment_idx, reset_chunk_pos_per_seq, true, output_state, output_fp32);
+      k_segment_idx, reset_chunk_pos_per_seq, true, output_state, high_precision);
 #else
   TORCH_CHECK(false, "FlashSCA SM90 support is not built");
 #endif
@@ -796,7 +808,7 @@ void DefineFlashSCAOps(py::module& m) {
            py::arg("k_run_lengths") = py::none(),
            py::arg("strict_past") = false,
            py::arg("output_state") = py::none(),
-           py::arg("output_fp32") = false)
+           py::arg("high_precision") = false)
       .def("_flash_sca_sm90_varlen_bwd",
            &FlashSCASM90VarlenBwd,
            "Run prepared-varlen FlashSCA SM90 backward",
@@ -836,7 +848,7 @@ void DefineFlashSCAOps(py::module& m) {
            py::arg("backend") = "auto",
            py::arg("reset_chunk_pos_per_seq") = false,
            py::arg("output_state") = py::none(),
-           py::arg("output_fp32") = false)
+           py::arg("high_precision") = false)
       .def("_flash_sca_sm90_strict_past_bwd",
            &FlashSCAStrictPastBwd,
            "Strict-past FlashSCA SM90 BWD",
@@ -869,7 +881,7 @@ void DefineFlashSCAOps(py::module& m) {
            py::arg("backend") = "auto",
            py::arg("reset_chunk_pos_per_seq") = false,
            py::arg("output_state") = py::none(),
-           py::arg("output_fp32") = false)
+           py::arg("high_precision") = false)
       .def("flash_sca_bwd",
            &FlashSCABwd, "FlashSCABwd",
            py::arg("y_grad"),
@@ -886,7 +898,8 @@ void DefineFlashSCAOps(py::module& m) {
            py::arg("k_segment_idx"),
            py::arg("deterministic") = false,
            py::arg("backend") = "auto",
-           py::arg("reset_chunk_pos_per_seq") = false);
+           py::arg("reset_chunk_pos_per_seq") = false,
+           py::arg("fp32_kv_grads") = false);
 }
 
 }  // namespace ops

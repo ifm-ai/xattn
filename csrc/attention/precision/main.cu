@@ -17,8 +17,7 @@ std::tuple<torch::Tensor,torch::Tensor,torch::Tensor> MainBackward(
  const torch::Tensor& g,const torch::Tensor& delta,const torch::Tensor& logz,
  const torch::Tensor& stats,const torch::Tensor& meta,
  const c10::optional<torch::Tensor>& qs,const c10::optional<torch::Tensor>& ks,
- const c10::optional<torch::Tensor>& qp,double scale,int level,int visibility,int span,bool strict,bool reset) {
- TORCH_CHECK(level>=2 && level<=4,"precision mainloop needs level 2, 3, or 4");
+ const c10::optional<torch::Tensor>& qp,double scale,int visibility,int span,bool strict,bool reset) {
  TORCH_CHECK(visibility>=0 && visibility<=2,"invalid attention visibility");
  TORCH_CHECK(q.is_cuda() && q.dim()==4,"Q must be CUDA [B,N,H,D]");
  TORCH_CHECK(q.scalar_type()==at::kHalf || q.scalar_type()==at::kBFloat16,"precision mainloop requires FP16/BF16");
@@ -40,17 +39,17 @@ std::tuple<torch::Tensor,torch::Tensor,torch::Tensor> MainBackward(
  if(qp)TORCH_CHECK(qp->is_cuda() && qp->device()==q.device() && qp->is_contiguous() && qp->scalar_type()==at::kInt && qp->numel()==q.size(0)*q.size(1),"invalid reset query positions");
  TORCH_CHECK(!reset || visibility==2,"reset positions only apply to sliding chunks");
  c10::cuda::CUDAGuard guard(q.device());
- // HP4 rectangular kernels are retained only in the measured favorable region.
+ // Rectangular kernels are retained only in the measured favorable region.
  auto dimension_bucket=[](int64_t d){return d<=64?64:d<=128?128:256;};
  const int db=dimension_bucket(q.size(3)),vb=dimension_bucket(v.size(3));
- const bool use_rectangular=level<=3 || db==256;
+ const bool use_rectangular=db==256;
  if(q.size(2)==k.size(2) && (db==vb || use_rectangular)) {
    return mha_direct::MainBackward(q,k,v,g,delta,logz,stats,meta,qs,ks,qp,
-                                  scale,level,visibility,span,strict,reset);
+                                  scale,visibility,span,strict,reset);
  }
  if(db!=vb && use_rectangular) {
    return rectangular::MainBackward(q,k,v,g,delta,logz,stats,meta,qs,ks,qp,
-                                   scale,level,visibility,span,strict,reset);
+                                   scale,visibility,span,strict,reset);
  }
  int max_dimension=std::max(q.size(3),v.size(3));
  int storage_dimension=max_dimension<=64 ? 64 : max_dimension<=128 ? 128 : 256;
@@ -62,12 +61,12 @@ std::tuple<torch::Tensor,torch::Tensor,torch::Tensor> MainBackward(
  if(!q.numel()){return {torch::zeros(q.sizes(),q.options().dtype(at::kFloat)),torch::zeros(k.sizes(),q.options().dtype(at::kFloat)),torch::zeros(v.sizes(),q.options().dtype(at::kFloat))};}
  AttentionBwdParams p{};p.q_ptr=q.data_ptr();p.k_ptr=k.data_ptr();p.v_ptr=v.data_ptr();p.dy_ptr=g.data_ptr();
  p.lse_ptr=logz.data_ptr();p.dq_ptr=dq.data_ptr();p.dk_ptr=dk.data_ptr();p.dv_ptr=dv.data_ptr();
- p.hp_delta=delta.data_ptr<float>();p.hp_rho=reinterpret_cast<float*>(stats.data_ptr());p.hp_mass=meta.data_ptr<float>();p.high_precision_level=level;
+ p.hp_delta=delta.data_ptr<float>();p.hp_rho=reinterpret_cast<float*>(stats.data_ptr());p.hp_mass=meta.data_ptr<float>();
  p.b=q.size(0);p.num_sequences=p.b;p.seqlen_q=q.size(1);p.seqlen_k=k.size(1);p.max_seqlen_q=p.seqlen_q;p.max_seqlen_k=p.seqlen_k;
  p.d=q.size(3);p.dv=v.size(3);p.h=q.size(2);p.h_k=k.size(2);p.scale_softmax=float(scale);
  p.window_size_left=visibility==0 ? p.seqlen_k : visibility==1 ? span : 2*span-1;
  p.window_size_right=strict ? -1 : 0;p.attention_chunk=visibility==2 && !(reset && qs.has_value()) ? span : 0;
- p.y_is_fp32=true;p.num_sm=at::cuda::getDeviceProperties(q.get_device())->multiProcessorCount;
+ p.num_sm=at::cuda::getDeviceProperties(q.get_device())->multiProcessorCount;
  if(qs){p.q_segment_idx=qs->data_ptr<int64_t>();p.k_segment_idx=ks->data_ptr<int64_t>();p.k_segment_len=p.seqlen_k;}
  p.q_chunk_positions=qp ? qp->data_ptr<int>() : nullptr;p.reset_attention_chunk=reset && qs.has_value() ? span : 0;
 #define STRIDE(NAME,TENSOR) p.NAME##_batch_stride=TENSOR.stride(0);p.NAME##_row_stride=TENSOR.stride(1);p.NAME##_head_stride=TENSOR.stride(2);

@@ -1,5 +1,3 @@
-#include "softdelta/fwd_dynamic_full_tile_instantiation.cuh"
+#include "softdelta/fwd_template.cuh"
 
-XATTN_FLASH_SOFTDELTA_FWD_SM90_INSTANTIATE_DYNAMIC_FULL_TILE(
-    cutlass::half_t, 192, 128, 128, 128, 2,
-    xattn::ops::FlashSoftDeltaKVHeadTileGrouping<2>)
+XATTN_SOFTDELTA_FWD_SM90_INSTANTIATE(cutlass::half_t, 192, 128)

@@ -1,4 +1,3 @@
-#include "softdelta/fwd_dynamic_chunk_instantiation.cuh"
+#include "softdelta/fwd_template.cuh"
 
-XATTN_FLASH_SOFTDELTA_FWD_SM90_INSTANTIATE_DYNAMIC_CHUNK(
-    cutlass::half_t, 96, 192)
+XATTN_SOFTDELTA_FWD_SM90_INSTANTIATE(cutlass::half_t, 96, 192)

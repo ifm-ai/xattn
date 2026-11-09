@@ -161,9 +161,6 @@ public:
         using MainloopPipeline_dO = typename CollectiveMainloop::MainloopPipeline_dO;
         using PipelineParams_dO = typename MainloopPipeline_dO::Params;
         using PipelineState_dO = typename MainloopPipeline_dO::PipelineState;
-        using MainloopPipelineK = typename CollectiveMainloop::MainloopPipelineK;
-        using MainloopPipelineV = typename CollectiveMainloop::MainloopPipelineV;
-        using PipelineStateKV = typename CollectiveMainloop::PipelineStateKV;
         SharedStorage& shared_storage = *reinterpret_cast<SharedStorage*>(smem_buf);
 
         int const lane_predicate = cute::elect_one_sync();
@@ -187,10 +184,8 @@ public:
         pipeline_params.is_leader = warp_group_thread_idx == 0;
         pipeline_params.num_consumers = NumMmaThreads;
 
-        if constexpr (!CollectiveMainloop::HeadPairClusterKVReuse) {
-            if (warp_idx == 0 && lane_predicate) {
-                shared_storage.pipelines.kv.barrier_KV.init(1 /*numThreads*/);
-            }
+        if (warp_idx == 0 && lane_predicate) {
+            shared_storage.pipelines.kv.barrier_KV.init(1 /*numThreads*/);
         }
         // pipeline_q initializes barrier fences.
         MainloopPipeline pipeline_q(shared_storage.pipelines.pipeline_q, pipeline_params, ClusterShape{});
@@ -201,38 +196,6 @@ public:
             CollectiveMainloop::TmaTransactionBytesdO + CollectiveMainloop::TmaTransactionBytesLSE + CollectiveMainloop::TmaTransactionBytesHPdO,
             role_dO, pipeline_params.is_leader, pipeline_params.num_consumers};
         MainloopPipeline_dO pipeline_do(shared_storage.pipelines.pipeline_do, pipeline_params_dO, ClusterShape{});
-        MainloopPipelineK pipeline_k = [&] {
-            if constexpr (CollectiveMainloop::HeadPairClusterKVReuse) {
-                typename MainloopPipelineK::Params params_k;
-                params_k.transaction_bytes = CollectiveMainloop::TmaTransactionBytesK;
-                params_k.role = warp_group_idx == 0
-                    ? MainloopPipelineK::ThreadCategory::Producer
-                    : MainloopPipelineK::ThreadCategory::Consumer;
-                params_k.is_leader = pipeline_params.is_leader;
-                params_k.num_consumers = NumMmaThreads;
-                return MainloopPipelineK(
-                    shared_storage.pipelines.kv.pipeline_k,
-                    params_k, ClusterShape{});
-            } else {
-                return nullptr;
-            }
-        }();
-        MainloopPipelineV pipeline_v = [&] {
-            if constexpr (CollectiveMainloop::HeadPairClusterKVReuse) {
-                typename MainloopPipelineV::Params params_v;
-                params_v.transaction_bytes = CollectiveMainloop::TmaTransactionBytesV;
-                params_v.role = warp_group_idx == 0
-                    ? MainloopPipelineV::ThreadCategory::Producer
-                    : MainloopPipelineV::ThreadCategory::Consumer;
-                params_v.is_leader = pipeline_params.is_leader;
-                params_v.num_consumers = NumMmaThreads;
-                return MainloopPipelineV(
-                    shared_storage.pipelines.kv.pipeline_v,
-                    params_v, ClusterShape{});
-            } else {
-                return nullptr;
-            }
-        }();
 
         CollectiveMainloop mainloop;
         CollectiveEpilogue epilogue;
@@ -262,9 +225,6 @@ public:
             if (warp_idx_in_warpgroup == 0) {  // Load K, V, and do TMA on Q and dO
                 PipelineState smem_pipe_write = cutlass::make_producer_start_state<MainloopPipeline>();
                 PipelineState_dO smem_pipe_write_do = cutlass::make_producer_start_state<MainloopPipeline_dO>();
-                PipelineStateKV smem_pipe_write_kv =
-                    cutlass::make_producer_start_state<
-                        typename CollectiveMainloop::MainloopPipelineKCluster>();
                 for (auto work_tile_info = scheduler.template get_initial_work</*IsProducerWarp=*/true>(params.scheduler);
                      work_tile_info.is_valid(params.scheduler);
                      work_tile_info = scheduler.template get_next_work</*IsProducerWarp=*/true>(params.scheduler, work_tile_info)) {
@@ -276,14 +236,12 @@ public:
                         scheduler.prefetch_next_work(params.scheduler, work_tile_info);
                     };
                     mainloop.load(params.mainloop, pipeline_q, pipeline_do,
-                                  pipeline_k, pipeline_v, smem_pipe_write,
-                                  smem_pipe_write_do, smem_pipe_write_kv,
+                                  smem_pipe_write, smem_pipe_write_do,
                                   shared_storage, scheduler_prefetch,
                                   block_coord, m_block_range);
                 }
-                mainloop.load_tail(pipeline_q, pipeline_do, pipeline_k, pipeline_v,
-                                   smem_pipe_write, smem_pipe_write_do,
-                                   smem_pipe_write_kv);
+                mainloop.load_tail(pipeline_q, pipeline_do,
+                                   smem_pipe_write, smem_pipe_write_do);
             } else if (warp_idx_in_warpgroup == 1) {
                 if constexpr (CollectiveMainloop::dQacc_use_TMA ||
                               TileScheduler::RequiresProducerWarp1) {
@@ -308,7 +266,6 @@ public:
 
             PipelineState smem_pipe_read;
             PipelineState_dO smem_pipe_read_do;
-            PipelineStateKV smem_pipe_read_kv;
 
             mainloop.mma_init();
             scheduler.init_consumer();
@@ -321,17 +278,6 @@ public:
                 auto block_coord_ = work_tile_info.get_block_coord(params.scheduler);
                 auto [n_block, bidh, bidb, _ /*split_idx*/] = block_coord_;
                 cute::tuple<int32_t, int32_t, int32_t> block_coord = {n_block, bidh, bidb};
-                int epilogue_batch = bidb;
-                if constexpr (CollectiveMainloop::HeadPairPrivateKVGrad) {
-                    int const reader =
-                        CollectiveMainloop::head_pair_reader_index();
-                    int const logical_batches =
-                        CollectiveEpilogue::destination_batch_count(
-                            params.epilogue);
-                    epilogue_batch = bidb + reader * logical_batches;
-                }
-                cute::tuple<int32_t, int32_t, int32_t> epilogue_block_coord =
-                    {n_block, bidh, epilogue_batch};
 
                 // dK and dV output accumulator.
                 Tensor tdKrdK = partition_fragment_C(tiled_mma_dK, select<!dKV_swapAB ? 1 : 2, !dKV_swapAB? 2 : 1>(TileShape_MNK{}));
@@ -339,8 +285,7 @@ public:
                 auto m_block_range = get_m_block_range(work_tile_info, block_coord);
                 bool tile_valid = mainloop.mma(
                     params.mainloop, pipeline_q, pipeline_do,
-                    pipeline_k, pipeline_v, smem_pipe_read,
-                    smem_pipe_read_do, smem_pipe_read_kv,
+                    smem_pipe_read, smem_pipe_read_do,
                     tdKrdK, tdVrdV, threadIdx.x - NumCopyThreads, work_idx,
                     block_coord, m_block_range, shared_storage);
                 SmemHandoff::sync();
@@ -348,11 +293,11 @@ public:
                     epilogue.store(params.epilogue, tdKrdK, tdVrdV, shared_storage,
                                    tiled_mma_dK, tiled_mma_dV,
                                    threadIdx.x - NumCopyThreads,
-                                   epilogue_block_coord);
+                                   block_coord);
                 } else {
                     epilogue.store_zero(params.epilogue,
                                         threadIdx.x - NumCopyThreads,
-                                        epilogue_block_coord);
+                                        block_coord);
                 }
 
             }

@@ -218,7 +218,7 @@ def test_causal_flash_attn_matches_fp64_oracle(
     for index, (actual, ref) in enumerate(zip(tensors, reference)):
         check_grad(index, actual.grad, ref)
 
-    actual_y, _, lse = causal_flash_attn_fwd(q, k, v, **kwargs)
+    actual_y, lse = causal_flash_attn_fwd(q, k, v, **kwargs)
     assert lse.shape == (1, heads, length)
     assert lse.dtype == torch.float32
     torch.testing.assert_close(actual_y, expected.to(dtype), atol=atol, rtol=rtol)
@@ -269,9 +269,8 @@ def test_causal_flash_attn_long_padding_preserves_saved_state_backward(
     q, k, v = make(heads, head_dim, True), make(kv_heads, head_dim, True), make(kv_heads, value_dim)
     dy = make(heads, value_dim)
     scale = head_dim ** -0.5
-    state = torch.empty(batch, length, heads, value_dim, device="cuda", dtype=torch.float32) if high_precision_level else None
-    y, lse = extension.ops.causal_flash_attn_fwd(q, k, v, scale, output_state=state)
-    saved = state if high_precision_level else y
+    saved, lse = extension.ops.causal_flash_attn_fwd(
+        q, k, v, scale, high_precision=bool(high_precision_level))
     if shifted_storage:
         def shift(tensor):
             storage = torch.empty(

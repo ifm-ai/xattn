@@ -19,8 +19,7 @@ namespace flash {
 using namespace cute;
 
 template <class TileShape_MK_, int kHeadDimQ_, class Element, class ElementAccum,
-          class ArchTag_, bool Clear_dQaccum, bool Varlen,
-          bool OutputStateFp32 = false>
+          class ArchTag_, bool Clear_dQaccum, bool Varlen>
 class AttentionBwdPreprocess {
 
 public:
@@ -65,7 +64,8 @@ public:
     using StrideO = cute::Stride<int64_t, _1, int64_t, int64_t>;
     using ShapedPsum = cute::Shape<int32_t, int32_t, int32_t>;  // (seqlen_q, head, batch)
     using StridedPsum = cute::Stride<_1, int64_t, int64_t>;
-    using ShapedQaccum = cute::Shape<int32_t, int32_t, int32_t>;  // (seqlen_q * d, head, batch)
+    // int64 extent: varlen workspaces can exceed 2^31 / d padded rows times d.
+    using ShapedQaccum = cute::Shape<int64_t, int32_t, int32_t>;  // (seqlen_q * d, head, batch)
     using StridedQaccum = cute::Stride<_1, int64_t, int64_t>;
 
     // Device side arguments
@@ -90,8 +90,6 @@ public:
         int* dq_semaphore;
         int const* cu_seqlens = nullptr;
         int const* seqused = nullptr;
-        // Optional FP32 backward state follows the fixed argument prefix.
-        float const* ptr_O_state = nullptr;
         // Fixed-point deterministic dQ: max_j |V_j|, max |K| in, row exponents out.
         float const* ptr_fixed_bounds = nullptr;
         int* ptr_dq_exponent = nullptr;
@@ -119,7 +117,6 @@ public:
         int* dq_semaphore;
         int const* cu_seqlens = nullptr;
         int const* seqused = nullptr;
-        float const* ptr_O_state = nullptr;
         float const* ptr_fixed_bounds = nullptr;
         int* ptr_dq_exponent = nullptr;
     };
@@ -149,40 +146,27 @@ public:
             args.dq_semaphore,
             args.cu_seqlens,
             args.seqused,
-            args.ptr_O_state,
             args.ptr_fixed_bounds,
             args.ptr_dq_exponent
         };
     }
 
+    // Batches past the grid z limit are strided: blockIdx.z, + gridDim.z, ...
     CUTLASS_DEVICE
     void
     operator()(Params const& params, [[maybe_unused]] char* smem_buf) {
+        for (int bidb = int(blockIdx.z); bidb < params.num_batch; bidb += int(gridDim.z)) {
+            run_tile(params, int(blockIdx.x), int(blockIdx.y), bidb);
+        }
+    }
+
+    CUTLASS_DEVICE
+    void
+    run_tile(Params const& params, int const m_block, int const bidh, int const bidb) {
 
         static constexpr int kBlockM = get<0>(TileShape_MK{});
 
         int const thread_idx = threadIdx.x;
-        int m_block;
-        int bidh;
-        int bidb;
-        if constexpr (Varlen) {
-            if (params.num_batch > 65535) {
-                int tile_idx = int(blockIdx.x);
-                m_block = tile_idx % params.num_m_blocks;
-                tile_idx /= params.num_m_blocks;
-                int const num_head = get<2>(params.shape_O);
-                bidh = tile_idx % num_head;
-                bidb = tile_idx / num_head;
-            } else {
-                m_block = int(blockIdx.x);
-                bidh = int(blockIdx.y);
-                bidb = int(blockIdx.z);
-            }
-        } else {
-            m_block = int(blockIdx.x);
-            bidh = int(blockIdx.y);
-            bidb = int(blockIdx.z);
-        }
 
         flash::SeqlenInfo<Varlen, kBlockM> seqlen_info(bidb, size<0>(params.shape_O), params.cu_seqlens, params.seqused);
         bool const is_varlen = Varlen && params.cu_seqlens;
@@ -220,42 +204,20 @@ public:
         // Reshape from e.g. (8, kBlockM / 32, kHeadDim / 64) to (kBlockM / 32, (8, kHeadDim / 64))
         Layout l = make_layout(get<1>(tOrO.layout()), make_layout(get<0>(tOrO.layout()), get<2>(tOrO.layout())));
         Tensor tOrO_l = make_tensor(tOrO.data(), l);
+        Tensor mO = make_tensor(
+            make_gmem_ptr(params.ptr_O), params.shape_O,
+            params.stride_O)(_, _, bidh, !is_varlen ? bidb : 0);
+        Tensor gO = local_tile(
+            cute::domain_offset(
+                make_coord(seqlen_info.offset, _0{}), mO),
+            TileShape_MK{}, make_coord(m_block, _0{}));
+        Tensor tOgO = gmem_thr_copy_O.partition_S(gO);
+        flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false,
+                    /*Clear_OOB_MN=*/true, /*Clearn_OOB_K=*/true>(
+            gmem_tiled_copy_O, tOgO, tOrO, tOcO, tOpO,
+            seqlen_o - m_block * kBlockM);
         Tensor o_fp32 = make_tensor_like<float>(tOrO_l);
-        if constexpr (OutputStateFp32) {
-            Tensor mO_state = make_tensor(
-                make_gmem_ptr(params.ptr_O_state), params.shape_O,
-                params.stride_O)(_, _, bidh, !is_varlen ? bidb : 0);
-            Tensor gO_state = local_tile(
-                cute::domain_offset(
-                    make_coord(seqlen_info.offset, _0{}), mO_state),
-                TileShape_MK{}, make_coord(m_block, _0{}));
-            Tensor tOrO_state = make_tensor(o_fp32.data(), tOrO.layout());
-            #pragma unroll
-            for (int i = 0; i < size(tOrO_state); ++i) {
-                auto const coord = tOcO(i);
-                int const row = get<0>(coord);
-                int const col = get<1>(coord);
-                tOrO_state(i) =
-                    row < seqlen_o - m_block * kBlockM &&
-                            col < get<1>(params.shape_O)
-                        ? gO_state(row, col)
-                        : 0.0f;
-            }
-        } else {
-            Tensor mO = make_tensor(
-                make_gmem_ptr(params.ptr_O), params.shape_O,
-                params.stride_O)(_, _, bidh, !is_varlen ? bidb : 0);
-            Tensor gO = local_tile(
-                cute::domain_offset(
-                    make_coord(seqlen_info.offset, _0{}), mO),
-                TileShape_MK{}, make_coord(m_block, _0{}));
-            Tensor tOgO = gmem_thr_copy_O.partition_S(gO);
-            flash::copy</*Is_even_MN=*/false, /*Is_even_K=*/false,
-                        /*Clear_OOB_MN=*/true, /*Clearn_OOB_K=*/true>(
-                gmem_tiled_copy_O, tOgO, tOrO, tOcO, tOpO,
-                seqlen_o - m_block * kBlockM);
-            flash::convert_type_out(tOrO_l, o_fp32);
-        }
+        flash::convert_type_out(tOrO_l, o_fp32);
         Tensor tOrdO_l = make_tensor(tOrdO.data(), l);
         Tensor do_fp32 = make_tensor_like<float>(tOrdO_l);
         flash::convert_type_out(tOrdO_l, do_fp32);
@@ -317,7 +279,7 @@ public:
 
         if constexpr (Clear_dQaccum) {
             Tensor mdQaccum = make_tensor(make_gmem_ptr(params.ptr_dQaccum), params.shape_dQaccum, params.stride_dQaccum)(_, bidh, !is_varlen ? bidb : 0);
-            Tensor gdQaccum = local_tile(cute::domain_offset(make_coord(seqlen_info.offset_padded * kHeadDimQ), mdQaccum), Shape<Int<kBlockM * kHeadDimQ>>{}, make_coord(m_block));
+            Tensor gdQaccum = local_tile(cute::domain_offset(make_coord(int64_t(seqlen_info.offset_padded) * kHeadDimQ), mdQaccum), Shape<Int<kBlockM * kHeadDimQ>>{}, make_coord(m_block));
             GmemTiledCopyAccum gmem_tiled_copy_dQaccum;
             auto gmem_thr_copy_dQaccum = gmem_tiled_copy_dQaccum.get_thread_slice(thread_idx);
             Tensor tdQgdQaccum = gmem_thr_copy_dQaccum.partition_D(gdQaccum);

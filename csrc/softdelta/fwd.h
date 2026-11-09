@@ -1,56 +1,34 @@
 #pragma once
 
-#include <cuda_runtime_api.h>
 #include <torch/types.h>
 
-#include "attention/hopper/fwd_params.h"
-#include "attention/semantics/visibility.h"
+#include <tuple>
 
 namespace xattn {
 namespace ops {
 
-enum class FlashSoftDeltaVisibility : int64_t {
-  kFull = 0,
-  kSlidingWindow = 1,
-  kSlidingChunk = 2,
-};
+// Both SoftDelta reads in one launch. Returns the class-major readers
+// [B, Lq, Hkv + H, V] and their log-sum-exp [B, Hkv + H, Lq] (FP32): head g is the
+// negative read (strict past) of neg_q head g, head Hkv + h the query read
+// (inclusive) of query head h. output_state optionally receives the FP32 readers.
+// visibility / span (softdelta/visibility.h) limit both reads to a sliding
+// window or sliding chunks; reset restarts chunk positions in each segment.
+std::tuple<torch::Tensor, torch::Tensor> SoftDeltaFwd(
+    const torch::Tensor& q, const torch::Tensor& k, const torch::Tensor& v,
+    const torch::Tensor& neg_q, double scale,
+    const c10::optional<torch::Tensor>& q_segment_idx,
+    const c10::optional<torch::Tensor>& k_segment_idx,
+    const c10::optional<torch::Tensor>& output_state, int64_t visibility = 0, int64_t span = 0,
+    bool reset = false);
 
-struct FlashSoftDeltaFwdParams : AttentionFwdParams {
-  const void* __restrict__ gate_ptr;
-  index_t gate_batch_stride;
-  index_t gate_row_stride;
-  index_t gate_head_stride;
-  index_t gate_group_stride;
-  int gate_group_dim;
-  bool emit_ungated_pair;
-};
-
-template <
-    typename Element, typename ElementOut, int kHeadDim,
-    int kHeadDimV, typename Visibility>
-void RunFlashSoftDeltaFwdSm90VD(
-    AttentionFwdParams& params, cudaStream_t stream);
-
-torch::Tensor FlashSoftDeltaFwd(
-    const torch::Tensor& q,
-    const torch::Tensor& k,
-    const torch::Tensor& v,
-    const torch::Tensor& gate,
-    int64_t span,
-    double scale,
-    int64_t visibility);
-
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
-FlashSoftDeltaTrainingFwd(
-    const torch::Tensor& q,
-    const torch::Tensor& k,
-    const torch::Tensor& v,
-    const torch::Tensor& gate,
-    int64_t span,
-    double scale,
-    int64_t visibility,
-    const c10::optional<torch::Tensor>& output_state = c10::nullopt);
-
+// The same readers and log-sum-exp for packed sequences (equal Q / K lengths,
+// sequences given by cu_seqlens over the B * L rows): the inclusive read runs
+// as varlen causal attention (PackGQA) and the strict read as varlen strict
+// attention with Hkv heads, each written into its readers heads.
+std::tuple<torch::Tensor, torch::Tensor> SoftDeltaFwdVarlen(
+    const torch::Tensor& q, const torch::Tensor& k, const torch::Tensor& v,
+    const torch::Tensor& neg_q, const torch::Tensor& cu_seqlens,
+    int64_t max_seqlen, double scale);
 
 }  // namespace ops
 }  // namespace xattn

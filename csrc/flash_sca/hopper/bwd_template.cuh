@@ -39,26 +39,6 @@ void RunFlashSCABwdSm90HeadDispatch(
     AttentionBwdParams& params, cudaStream_t stream) {
   TORCH_CHECK(params.h % params.h_k == 0,
               "FlashSCA SM90 BWD requires Hq divisible by Hkv");
-  if constexpr (!kVarlen && !kHasSegment) {
-    if (params.odd_head_window_right_delta != 0) {
-      if (params.h / 2 == params.h_k) {
-        RunAttentionBwdSm90Kernel<
-            kHeadDim, kHeadDimV, kBlockN, Element, kDeterministic,
-            false, false, kBlockMOverride, false /*kGQA*/, false,
-            attention::semantics::SlidingChunkVisibility,
-            flash::AttentionBwdSm90, 0, 0, 0, false, true, true,
-            true /*kReaderPairKVReuse*/>(params, stream);
-      } else {
-        RunAttentionBwdSm90Kernel<
-            kHeadDim, kHeadDimV, kBlockN, Element, kDeterministic,
-            false, false, kBlockMOverride, true /*kGQA*/, false,
-            attention::semantics::SlidingChunkVisibility,
-            flash::AttentionBwdSm90, 0, 0, 0, false, true, true,
-            true /*kReaderPairKVReuse*/>(params, stream);
-      }
-      return;
-    }
-  }
   if (params.h == params.h_k) {
     RunAttentionBwdSm90Kernel<
         kHeadDim, kHeadDimV, kBlockN, Element, kDeterministic, kVarlen,

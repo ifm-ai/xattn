@@ -10,6 +10,7 @@
 #include <cutlass/device_kernel.h>
 #include <cutlass/kernel_hardware_info.h>
 #include <cutlass/kernel_launch.h>
+#include <cutlass/numeric_conversion.h>
 #include <cutlass/numeric_types.h>
 #include <limits>
 #include <torch/types.h>
@@ -252,6 +253,39 @@ __global__ void AttentionCastGroupedKVGradsKernel(
   }
 }
 
+// Grouped dK / dV cast, 8 values per thread: output rows of d / 8 vectors
+// (contiguous) from accumulator rows of accum_row_vectors (the instance's head
+// dimension, d rounded up). Thread (row, column): row = idx >> row_shift,
+// column = idx & (2^row_shift - 1), past a row's vectors idle (no division).
+template <typename Element>
+__global__ void AttentionCastGroupedKVGradsVectorKernel(
+    int64_t rows, int row_shift, const float* __restrict__ dk_input,
+    Element* __restrict__ dk_output, int dk_row_vectors, int dk_accum_row_vectors,
+    const float* __restrict__ dv_input, Element* __restrict__ dv_output,
+    int dv_row_vectors, int dv_accum_row_vectors) {
+  using Input = cutlass::AlignedArray<float, 8>;
+  using Output = cutlass::AlignedArray<Element, 8>;
+  cutlass::NumericArrayConverter<Element, float, 8> convert;
+  int64_t const idx =
+      int64_t(blockIdx.x) * int64_t(blockDim.x) + int64_t(threadIdx.x);
+  int64_t const row = idx >> row_shift;
+  int const column = int(idx & ((int64_t(1) << row_shift) - 1));
+  if (row >= rows) {
+    return;
+  }
+  Output out;
+  if (column < dk_row_vectors) {
+    static_cast<cutlass::Array<Element, 8>&>(out) = convert(
+        reinterpret_cast<Input const*>(dk_input)[row * dk_accum_row_vectors + column]);
+    reinterpret_cast<Output*>(dk_output)[row * dk_row_vectors + column] = out;
+  }
+  if (column < dv_row_vectors) {
+    static_cast<cutlass::Array<Element, 8>&>(out) = convert(
+        reinterpret_cast<Input const*>(dv_input)[row * dv_accum_row_vectors + column]);
+    reinterpret_cast<Output*>(dv_output)[row * dv_row_vectors + column] = out;
+  }
+}
+
 // Cast directly into the unpadded gradient tensor.
 template <typename Element, int kHeadDim, int kHeadDimV>
 __global__ void AttentionCastTrimGroupedKVGradsKernel(
@@ -273,72 +307,9 @@ __global__ void AttentionCastTrimGroupedKVGradsKernel(
   }
 }
 
-template <typename Element>
-__global__ void AttentionAccumulateSecondaryKVGradsKernel(
-    int64_t dk_vectors, int64_t dv_vectors,
-    int seqlen_k, int kv_heads,
-    int dk_vectors_per_head, const Element* __restrict__ dk_secondary,
-    Element* __restrict__ dk_output,
-    int64_t dk_row_stride, int64_t dk_head_stride,
-    int64_t dk_batch_stride,
-    int dv_vectors_per_head, const Element* __restrict__ dv_secondary,
-    Element* __restrict__ dv_output,
-    int64_t dv_row_stride, int64_t dv_head_stride,
-    int64_t dv_batch_stride) {
-  constexpr int kElementsPerVector = 8;
-  using Access = cutlass::AlignedArray<
-      Element, kElementsPerVector, 16>;
-  int64_t const idx =
-      int64_t(blockIdx.x) * int64_t(blockDim.x) + int64_t(threadIdx.x);
-  if (idx < dk_vectors) {
-    int const column_vector = int(idx % dk_vectors_per_head);
-    int64_t const output_row = idx / dk_vectors_per_head;
-    int const head = int(output_row % kv_heads);
-    int64_t const batch_row = output_row / kv_heads;
-    int const row = int(batch_row % seqlen_k);
-    int const batch = int(batch_row / seqlen_k);
-    int64_t const destination =
-        int64_t(batch) * dk_batch_stride + int64_t(row) * dk_row_stride +
-        int64_t(head) * dk_head_stride +
-        int64_t(column_vector) * kElementsPerVector;
-    Access const primary =
-        *reinterpret_cast<Access const*>(dk_output + destination);
-    Access const second =
-        reinterpret_cast<Access const*>(dk_secondary)[idx];
-    Access merged;
-    #pragma unroll
-    for (int lane = 0; lane < kElementsPerVector; ++lane) {
-      merged[lane] = static_cast<Element>(
-          static_cast<float>(primary[lane]) +
-          static_cast<float>(second[lane]));
-    }
-    *reinterpret_cast<Access*>(dk_output + destination) = merged;
-  }
-  if (idx < dv_vectors) {
-    int const column_vector = int(idx % dv_vectors_per_head);
-    int64_t const output_row = idx / dv_vectors_per_head;
-    int const head = int(output_row % kv_heads);
-    int64_t const batch_row = output_row / kv_heads;
-    int const row = int(batch_row % seqlen_k);
-    int const batch = int(batch_row / seqlen_k);
-    int64_t const destination =
-        int64_t(batch) * dv_batch_stride + int64_t(row) * dv_row_stride +
-        int64_t(head) * dv_head_stride +
-        int64_t(column_vector) * kElementsPerVector;
-    Access const primary =
-        *reinterpret_cast<Access const*>(dv_output + destination);
-    Access const second =
-        reinterpret_cast<Access const*>(dv_secondary)[idx];
-    Access merged;
-    #pragma unroll
-    for (int lane = 0; lane < kElementsPerVector; ++lane) {
-      merged[lane] = static_cast<Element>(
-          static_cast<float>(primary[lane]) +
-          static_cast<float>(second[lane]));
-    }
-    *reinterpret_cast<Access*>(dv_output + destination) = merged;
-  }
-}
+// Backward kernels that read negative-query heads (softdelta) specialize this.
+template <template <class, class, class> class BwdKernel>
+struct AttentionBwdKernelUsesNegQReaders : std::false_type {};
 
 template <int kHeadDim, int kHeadDimV, int kRequestedBlockN, typename Element,
           bool kDeterministic, bool kVarlen, bool kHasSegment,
@@ -353,10 +324,7 @@ template <int kHeadDim, int kHeadDimV, int kRequestedBlockN, typename Element,
           bool kPersistentScheduler = false,
           bool kDirectChunkRange = Visibility::kIsSlidingChunk,
           bool kDirectChunkTile = kDirectChunkRange,
-          bool kReaderPairKVReuse = false,
-          bool kHeadPairParallel = false,
-          bool kHeadPairClusterKVReuse = false,
-          bool kHeadPairPrivateKVGrad = false, int kPrecisionLevel = 0>
+          bool kReaderPairKVReuse = false, bool kPrecisionRepair = false>
 void RunAttentionBwdSm90Kernel(
     AttentionBwdParams params, cudaStream_t stream) {
   static constexpr bool kWindowN64 =
@@ -368,22 +336,17 @@ void RunAttentionBwdSm90Kernel(
       kDeterministic && kStagesOverride == 0 && kHeadDim == 192 &&
       (kHeadDimV == 32 || kHeadDimV == 64) &&
       Visibility::kKind == attention::semantics::VisibilityKind::kCausalFull;
-  if constexpr (!kVarlen && !kHasSegment &&
-                (!kReaderPairKVReuse || kWindowN64) &&
-                !kHeadPairParallel && (kWindowN64 || kFullStage2)) {
+  if constexpr (!kVarlen && !kHasSegment && !kReaderPairKVReuse &&
+                (kWindowN64 || kFullStage2)) {
     if (params.d == kHeadDim && params.dv == kHeadDimV &&
-        params.seqlen_q == params.seqlen_k &&
-        (!kReaderPairKVReuse ||
-         (params.b == 1 && params.h == 16 && params.h_k == 1 &&
-          params.seqlen_q == 8192 && params.window_size_left == 255))) {
+        params.seqlen_q == params.seqlen_k) {
       RunAttentionBwdSm90Kernel<
           kHeadDim, kHeadDimV, kWindowN64 ? 64 : kRequestedBlockN, Element,
           kDeterministic, kVarlen, kHasSegment, kBlockMOverride, kGQA,
           kTwoComponentDV, Visibility, BwdKernel,
           kFullStage2 ? 2 : kStagesOverride, kStagesDOOverride,
           kStagesDSOverride, kPersistentScheduler, kDirectChunkRange,
-          kDirectChunkTile, kReaderPairKVReuse, kHeadPairParallel,
-          kHeadPairClusterKVReuse, kHeadPairPrivateKVGrad, kPrecisionLevel>(params, stream);
+          kDirectChunkTile, kReaderPairKVReuse, kPrecisionRepair>(params, stream);
       return;
     }
   }
@@ -395,52 +358,39 @@ void RunAttentionBwdSm90Kernel(
           ? 64 : kRequestedBlockN;
   static_assert(!(kVarlen && kHasSegment),
                 "attention SM90 BWD cannot enable varlen and segment mask together");
-  static_assert(!kReaderPairKVReuse || (!kVarlen && !kHasSegment),
-                "reader-pair K/V reuse requires dense attention BWD");
-  static_assert(!kHeadPairParallel ||
-                    (!kVarlen && !kHasSegment && !kDeterministic && kGQA),
-                "parallel head-pair execution requires dense, grouped-output, non-deterministic BWD");
-  static_assert(!kHeadPairClusterKVReuse || kHeadPairParallel,
-                "cluster K/V reuse requires parallel head-pair execution");
-  static_assert(!kHeadPairPrivateKVGrad || kHeadPairParallel,
-                "private K/V gradients require parallel head-pair execution");
-  static_assert(!(kReaderPairKVReuse && kHeadPairParallel),
-                "same-CTA and parallel head-pair execution are exclusive");
-  if constexpr (kReaderPairKVReuse || kHeadPairParallel) {
-    TORCH_CHECK(
-        params.h % 2 == 0 && (params.h / 2) % params.h_k == 0,
-        "paired-reader execution requires an even Q-head count and logical "
-        "Q heads divisible by KV heads");
-    TORCH_CHECK(
-        params.odd_head_window_right_delta == -1 &&
-            params.window_size_right == 0,
-        "paired-reader execution requires inclusive/strict-past paired "
-        "boundaries");
-  }
-  if constexpr (kHeadPairParallel) {
-    TORCH_CHECK(
-        params.h == 2 * params.h_k,
-        "parallel head-pair execution requires two physical Q "
-        "heads per KV head");
-  }
-  int const scheduled_q_heads =
-      (kReaderPairKVReuse || kHeadPairParallel)
-          ? params.h_k
-          : params.h;
-  static_assert(kPrecisionLevel >= 0 && kPrecisionLevel <= 4);
-  static_assert(kPrecisionLevel < 2 || (!kVarlen && !kReaderPairKVReuse && !kHeadPairParallel),
-                "advanced precision needs its dedicated dense reader dispatch");
-  static_assert(kPrecisionLevel != 4 || kTwoComponentDV,
-                "protected precision requires dual P operands");
-  using HPOut = std::conditional_t<(kPrecisionLevel >= 2), float, Element>;
+  static constexpr bool kNegQReaders =
+      AttentionBwdKernelUsesNegQReaders<BwdKernel>::value;
+  static_assert(!kReaderPairKVReuse || (kNegQReaders && !kVarlen),
+                "reader groups run the negative-query readers on dense inputs");
+  // Negative-query readers run per logical head (kGQA, FP32 dK / dV accumulators)
+  // or as reader groups (kReaderPairKVReuse without kGQA: one work tile per
+  // key tile and KV head over its readers, dK / dV written once).
+  static_assert(!kNegQReaders ||
+                    (!kDeterministic && !kVarlen && !kPrecisionRepair &&
+                     kGQA != kReaderPairKVReuse),
+                "negative-query reader BWD: non-deterministic dense/segment GQA only");
+  static constexpr bool kNegQGroups = kNegQReaders && kReaderPairKVReuse;
+  int const scheduled_q_heads = kReaderPairKVReuse ? params.h_k : params.h;
+  static_assert(!kPrecisionRepair || (!kVarlen && !kReaderPairKVReuse),
+                "precision repair needs its dedicated dense reader dispatch");
+  static_assert(!kPrecisionRepair || kTwoComponentDV,
+                "precision repair requires dual P operands");
+  using HPOut = std::conditional_t<kPrecisionRepair, float, Element>;
+  static constexpr bool kGroupedAccum = kGQA && !kReaderPairKVReuse && !kNegQReaders;
+  TORCH_CHECK((params.dk_accum_out == nullptr) == (params.dv_accum_out == nullptr) &&
+                  (params.dk_accum_out == nullptr ||
+                   (kGroupedAccum && !kPrecisionRepair && !kVarlen && params.dkv_accum_ptr == nullptr)),
+              "attention SM90 BWD FP32 dK / dV output needs a dense grouped-head backward");
   static constexpr bool IsCausal = Visibility::kUseCausalMask;
   static constexpr bool IsLocal = Visibility::kUseLocalMask;
   static constexpr bool HasSoftcap = false;
   static constexpr bool Varlen = kVarlen;
   static constexpr int kMaxHeadDim = kHeadDim > kHeadDimV ? kHeadDim : kHeadDimV;
+  // 128-row tiles for narrow Q/K; with V > 64 only dense rows keep them:
+  // segment and varlen rows spill registers there.
   static constexpr bool UseLargeBlockM =
       kHeadDim <= 64 && kHeadDimV <= 128 &&
-      (!kVarlen || kDeterministic || kHeadDimV <= 64);
+      (kHeadDimV <= 64 || (!kHasSegment && !kVarlen));
   static constexpr int kDefaultBlockM = UseLargeBlockM ? 128 : 64;
   static constexpr int kBlockM =
       kBlockMOverride > 0 ? kBlockMOverride : kDefaultBlockM;
@@ -464,9 +414,9 @@ void RunAttentionBwdSm90Kernel(
       kHeadDim == 192 && kHeadDimV == 192 ? 3 : 2;
   // Non-transposed scores with BM=64 cannot place two 64-row MMA atoms
   // along M: that produces a 128-row copy tile over a 64-row allocation.
-  // Preserve legacy layouts; advanced BN64 instances split the N dimension.
+  // Preserve legacy layouts; precision-repair BN64 instances split the N dimension.
   static constexpr int AtomLayoutMSdP =
-      kPrecisionLevel >= 2 && kBlockN == 64 && SdPSwapAB ? 2 : 1;
+      kPrecisionRepair && kBlockN == 64 && SdPSwapAB ? 2 : 1;
   // Varlen mixed-D/V layouts use unsplit K/V slices when either dimension is
   // not warp-group aligned.
   static constexpr bool DKvCanSplitHeadDim =
@@ -474,7 +424,7 @@ void RunAttentionBwdSm90Kernel(
       kHeadDim % (NumMmaWarpGroups * 64) == 0 &&
       kHeadDimV % (NumMmaWarpGroups * 64) == 0;
   static constexpr int AtomLayoutNdKV =
-      kPrecisionLevel >= 2 && kBlockN == 64 ? 1 : kMaxHeadDim <= 128
+      kPrecisionRepair && kBlockN == 64 ? 1 : kMaxHeadDim <= 128
           ? 2
           : (kVarlen && !DKvCanSplitHeadDim ? NumMmaWarpGroups : 1);
   static constexpr int AtomLayoutMdQ =
@@ -590,8 +540,17 @@ void RunAttentionBwdSm90Kernel(
   using ArchTag = cutlass::arch::Sm90;
   using TileShapeMK = cute::Shape<Int<kBlockM>, Int<kHeadDim>>;
   using TileShapeMV = cute::Shape<Int<kBlockM>, Int<kHeadDimV>>;
-  const int seqlen_q_rounded =
-      kVarlen ? params.seqlen_q_padded : cute::round_up(params.seqlen_q, kBlockM);
+  // Negative-query readers: the caller prepares dPsum / LSE_log2 / the zeroed dQaccum
+  // over logical heads with rows padded to params.seqlen_q_padded.
+  const int seqlen_q_rounded = kVarlen || kNegQReaders
+      ? params.seqlen_q_padded
+      : cute::round_up(params.seqlen_q, kBlockM);
+  if constexpr (kNegQReaders) {
+    TORCH_CHECK(seqlen_q_rounded % kBlockM == 0 && seqlen_q_rounded >= params.seqlen_q &&
+                    params.dpsum_ptr != nullptr && params.lse_log2_ptr != nullptr &&
+                    params.dq_accum_ptr != nullptr,
+                "negative-query reader BWD needs caller-prepared dPsum, LSE_log2 and dQaccum");
+  }
   const int logical_batch = kVarlen ? params.num_sequences : params.b;
   // Varlen workspace batch: 1; launch and scheduling batch: num_sequences.
   const int workspace_batch = kVarlen ? 1 : logical_batch;
@@ -599,7 +558,7 @@ void RunAttentionBwdSm90Kernel(
   // D <= 128 and D = V = 192; other dimensions keep ordered or slot-split
   // FP32 accumulation.
   static constexpr bool kFixedDQ =
-      kDeterministic && kPrecisionLevel < 2 &&
+      kDeterministic && !kPrecisionRepair &&
       (kHeadDim <= 128 || (kHeadDim == 192 && kHeadDimV == 192));
   static constexpr bool SplitDQ =
       kDeterministic && !kFixedDQ && Visibility::kIsSlidingChunk &&
@@ -627,7 +586,7 @@ void RunAttentionBwdSm90Kernel(
     }
   }
   torch::Tensor dpsum = torch::empty(
-      {workspace_batch, params.h, seqlen_q_rounded},
+      {kNegQReaders ? 0 : workspace_batch, params.h, seqlen_q_rounded},
       torch::TensorOptions()
           .device(torch::kCUDA)
           .dtype(at::kFloat)
@@ -638,20 +597,14 @@ void RunAttentionBwdSm90Kernel(
       .memory_format(at::MemoryFormat::Contiguous);
   torch::Tensor dq_accum = dq_slots > 1
       ? torch::zeros({dq_slots, dq_slot_stride}, dq_options)
-      : torch::empty({dq_slot_stride}, dq_options);
+      : torch::empty({kNegQReaders ? 0 : dq_slot_stride}, dq_options);
   const int num_m_block = cute::ceil_div(
       kVarlen ? params.max_seqlen_q : params.seqlen_q, kBlockM);
-  dim3 auxiliary_grid(num_m_block, params.h, logical_batch);
-  if constexpr (kVarlen) {
-    if (logical_batch > 65535) {
-      int64_t const auxiliary_grid_blocks =
-          int64_t(num_m_block) * params.h * logical_batch;
-      TORCH_CHECK(
-          auxiliary_grid_blocks <= std::numeric_limits<int>::max(),
-          "attention SM90 BWD auxiliary grid exceeds the CUDA x-dimension limit");
-      auxiliary_grid = dim3(uint32_t(auxiliary_grid_blocks));
-    }
-  }
+  // Any batch: the preprocess and postprocess kernels stride over batches
+  // past the grid z limit.
+  TORCH_CHECK(params.h <= 65535, "attention SM90 BWD supports at most 65535 query heads");
+  dim3 const auxiliary_grid(num_m_block, params.h,
+                            logical_batch < 65535 ? logical_batch : 65535);
   torch::Tensor dq_semaphore;
   torch::Tensor hp_rows;
   torch::Tensor fixed_bounds, dq_exponent;
@@ -675,9 +628,11 @@ void RunAttentionBwdSm90Kernel(
       C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
   }
-  params.dpsum_ptr = dpsum.data_ptr<float>();
-  params.lse_log2_ptr = lse_log2.data_ptr<float>();
-  params.dq_accum_ptr = dq_accum.data_ptr<float>();
+  if constexpr (!kNegQReaders) {
+    params.dpsum_ptr = dpsum.data_ptr<float>();
+    params.lse_log2_ptr = lse_log2.data_ptr<float>();
+    params.dq_accum_ptr = dq_accum.data_ptr<float>();
+  }
   if constexpr (kDeterministic) {
     dq_semaphore = torch::empty(
         {num_m_block, logical_batch, params.h},
@@ -693,7 +648,7 @@ void RunAttentionBwdSm90Kernel(
   }
   params.tile_count_semaphore = nullptr;
 
-  if constexpr (kPrecisionLevel >= 2) {
+  if constexpr (kPrecisionRepair) {
   // Advanced preprocessing does not run the normal semaphore initializer.
   // Keep LP initialization in its existing fused preprocess kernel.
   if constexpr (kDeterministic) {
@@ -705,15 +660,12 @@ void RunAttentionBwdSm90Kernel(
   HPInitRows<<<(workspace_batch*params.h*seqlen_q_rounded+255)/256,256,0,stream>>>(params.hp_mass,hp_rows.data_ptr<float>(),params.seqlen_q,seqlen_q_rounded,workspace_batch*params.h);
   C10_CUDA_CHECK(cudaMemsetAsync(params.dq_accum_ptr,0,dq_accum.numel()*sizeof(float),stream));
   } else {
-  auto launch_preprocess = [&](auto output_state_tag) {
-    static constexpr bool OutputStateFp32 =
-        decltype(output_state_tag)::value;
+  auto launch_preprocess = [&]() {
     using PreprocessKernel = flash::AttentionBwdPreprocess<
         TileShapeMV, kHeadDim, Element, ElementAccum, ArchTag,
-        true /*Clear_dQaccum*/, Varlen, OutputStateFp32>;
+        true /*Clear_dQaccum*/, Varlen>;
     typename PreprocessKernel::Arguments preprocess_args{
-        OutputStateFp32 ? nullptr
-                        : static_cast<Element const*>(params.y_ptr),
+        static_cast<Element const*>(params.y_ptr),
         {params.seqlen_q, params.dv, params.h, params.b},
         {params.y_row_stride, _1{}, params.y_head_stride,
          params.y_batch_stride},
@@ -722,22 +674,20 @@ void RunAttentionBwdSm90Kernel(
          params.dy_batch_stride},
         static_cast<float*>(params.dpsum_ptr),
         {seqlen_q_rounded, params.h, workspace_batch},
-        {_1{}, seqlen_q_rounded, params.h * seqlen_q_rounded},
+        {_1{}, seqlen_q_rounded, int64_t(params.h) * seqlen_q_rounded},
         static_cast<float const*>(params.lse_ptr),
-        {_1{}, params.seqlen_q, params.h * params.seqlen_q},
+        {_1{}, params.seqlen_q, int64_t(params.h) * params.seqlen_q},
         static_cast<float*>(params.lse_log2_ptr),
-        {_1{}, seqlen_q_rounded, params.h * seqlen_q_rounded},
+        {_1{}, seqlen_q_rounded, int64_t(params.h) * seqlen_q_rounded},
         static_cast<ElementAccum*>(params.dq_accum_ptr),
-        {seqlen_q_rounded * kHeadDim, params.h, workspace_batch},
-        {_1{}, seqlen_q_rounded * kHeadDim,
-         params.h * seqlen_q_rounded * kHeadDim},
+        {int64_t(seqlen_q_rounded) * kHeadDim, params.h, workspace_batch},
+        {_1{}, int64_t(seqlen_q_rounded) * kHeadDim,
+         int64_t(params.h) * seqlen_q_rounded * kHeadDim},
         logical_batch,
         num_m_block,
         params.dq_semaphore,
         kVarlen ? params.cu_seqlens_q : nullptr,
         nullptr,
-        OutputStateFp32 ? static_cast<float const*>(params.y_ptr)
-                        : nullptr,
         kFixedDQ ? fixed_bounds.data_ptr<float>() : nullptr,
         kFixedDQ ? dq_exponent.data_ptr<int>() : nullptr};
     typename PreprocessKernel::Params preprocess_params =
@@ -748,9 +698,10 @@ void RunAttentionBwdSm90Kernel(
         PreprocessKernel::SharedStorageSize, stream, preprocess_params,
         false);
   };
-  cutlass::Status preprocess_status = params.y_is_fp32
-      ? launch_preprocess(std::true_type{})
-      : launch_preprocess(std::false_type{});
+  cutlass::Status preprocess_status = cutlass::Status::kSuccess;
+  if constexpr (!kNegQReaders) {
+    preprocess_status = launch_preprocess();
+  }
   TORCH_CHECK(preprocess_status == cutlass::Status::kSuccess,
               "attention SM90 BWD preprocess launch failed: ",
               cutlass::cutlassGetStatusString(preprocess_status));
@@ -758,8 +709,7 @@ void RunAttentionBwdSm90Kernel(
   }
   using TileShapeMNK =
       cute::Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
-  using ClusterShape = cute::Shape<
-      Int<kHeadPairClusterKVReuse ? 2 : 1>, _1, _1>;
+  using ClusterShape = cute::Shape<_1, _1, _1>;
   // Fixed-point dQ stages its row exponents in shared memory when the whole
   // kernel storage still fits; the staged variant also sizes the epilogue and
   // scheduler below (both independent of the staging).
@@ -771,8 +721,7 @@ void RunAttentionBwdSm90Kernel(
       DqSwapAB,
       NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ,
       MmaDPIsRS, kTwoComponentDV, kReaderPairKVReuse, kDirectChunkTile,
-      kHeadPairParallel, kHeadPairClusterKVReuse,
-      kHeadPairPrivateKVGrad, SplitDQ, kPrecisionLevel, true>;
+      SplitDQ, kPrecisionRepair, true, kNegQReaders>;
   using CollectiveMainloopUnstaged = flash::CollectiveMainloopBwdSm90<
       Stages, StagesDO, StagesDS, ClusterShape, TileShapeMNK, kHeadDimV,
       Element, ElementAccum, ArchTag, IsCausal, IsLocal, HasSoftcap, Varlen,
@@ -781,35 +730,29 @@ void RunAttentionBwdSm90Kernel(
       DqSwapAB,
       NumMmaWarpGroups, AtomLayoutMSdP, AtomLayoutNdKV, AtomLayoutMdQ,
       MmaDPIsRS, kTwoComponentDV, kReaderPairKVReuse, kDirectChunkTile,
-      kHeadPairParallel, kHeadPairClusterKVReuse,
-      kHeadPairPrivateKVGrad, SplitDQ, kPrecisionLevel, false>;
+      SplitDQ, kPrecisionRepair, false, kNegQReaders>;
   using CollectiveEpilogueDirect = flash::CollectiveEpilogueBwd<
       TileShapeMNK, kHeadDimV, HPOut, ArchTag,
       CollectiveMainloopStaged::NumMmaThreads, Varlen, DKvSwapAB,
       NumMmaWarpGroups / AtomLayoutNdKV>;
-  using CollectiveEpilogueSplitDestinations =
-      flash::CollectiveEpilogueBwdSplitBatchDestinations<
-          TileShapeMNK, kHeadDimV, Element, ArchTag,
-          CollectiveMainloopStaged::NumMmaThreads, Varlen, DKvSwapAB,
-          NumMmaWarpGroups / AtomLayoutNdKV>;
-  using CollectiveEpilogueMHA = std::conditional_t<
-      kHeadPairPrivateKVGrad, CollectiveEpilogueSplitDestinations,
-      CollectiveEpilogueDirect>;
   using CollectiveEpilogueGQA = flash::CollectiveEpilogueBwdGQA<
       TileShapeMNK, kHeadDimV, ElementAccum, ArchTag,
       CollectiveMainloopStaged::NumMmaThreads, Varlen, kDeterministic, DKvSwapAB>;
+  using CollectiveEpilogueNegQGroup = flash::CollectiveEpilogueBwdNegQGroup<
+      TileShapeMNK, kHeadDimV, Element, ArchTag,
+      CollectiveMainloopStaged::NumMmaThreads, DKvSwapAB,
+      NumMmaWarpGroups / AtomLayoutNdKV>;
   using CollectiveEpilogue = std::conditional_t<
-      kGQA && !kReaderPairKVReuse && !kHeadPairPrivateKVGrad,
-      CollectiveEpilogueGQA, CollectiveEpilogueMHA>;
+      kNegQGroups, CollectiveEpilogueNegQGroup,
+      std::conditional_t<
+          kGQA && !kReaderPairKVReuse,
+          CollectiveEpilogueGQA, CollectiveEpilogueDirect>>;
   using DenseScheduler =
       flash::SingleTileScheduler<Varlen, false /*Split*/, false /*PackGQA*/,
                                  kBlockN>;
   using DenseLPTScheduler =
       flash::SingleTileBwdLPTScheduler<
-          false, kBlockN, false /*SPT*/,
-          kHeadPairParallel ? 2 : 1,
-          !kHeadPairParallel ||
-              kHeadPairClusterKVReuse /*ContiguousWorkGroup*/>;
+          false, kBlockN, false /*SPT*/, kNegQReaders /*ResidualFirst*/>;
   using CausalDeterministicScheduler =
       flash::SingleTileBwdLPTScheduler<false, kBlockN, true /*SPT*/>;
   static constexpr int VarlenSchedulerProducerThreads =
@@ -935,14 +878,14 @@ void RunAttentionBwdSm90Kernel(
       {params.dy_row_stride, _1{}, params.dy_head_stride,
        params.dy_batch_stride},
       static_cast<ElementAccum*>(params.dq_accum_ptr),
-      {seqlen_q_rounded * kHeadDim, params.h, workspace_batch},
-      {_1{}, seqlen_q_rounded * kHeadDim,
-       params.h * seqlen_q_rounded * kHeadDim},
+      {int64_t(seqlen_q_rounded) * kHeadDim, params.h, workspace_batch},
+      {_1{}, int64_t(seqlen_q_rounded) * kHeadDim,
+       int64_t(params.h) * seqlen_q_rounded * kHeadDim},
       static_cast<float const*>(params.lse_log2_ptr),
       {seqlen_q_rounded, params.h, workspace_batch},
-      {_1{}, seqlen_q_rounded, params.h * seqlen_q_rounded},
+      {_1{}, seqlen_q_rounded, int64_t(params.h) * seqlen_q_rounded},
       static_cast<float const*>(params.dpsum_ptr),
-      {_1{}, seqlen_q_rounded, params.h * seqlen_q_rounded},
+      {_1{}, seqlen_q_rounded, int64_t(params.h) * seqlen_q_rounded},
       params.scale_softmax,
       params.window_size_left,
       params.window_size_right,
@@ -961,7 +904,6 @@ void RunAttentionBwdSm90Kernel(
       kHasSegment ? params.q_chunk_positions : nullptr,
       kHasSegment ? params.reset_attention_chunk : 0,
       deterministic_segment_ranges_ptr,
-      params.odd_head_window_right_delta,
       dq_slots, dq_slot_stride, params.hp_rho, params.hp_mass,
       hp_rows.defined() ? hp_rows.data_ptr<float>() : nullptr,
       hp_rows.defined() ? hp_rows.data_ptr<float>() + hp_rows.numel() / 4 : nullptr,
@@ -969,36 +911,30 @@ void RunAttentionBwdSm90Kernel(
       hp_rows.defined() ? hp_rows.data_ptr<float>() + 3 * (hp_rows.numel() / 4) : nullptr,
       params.hp_rho_exponent,
       kFixedDQ ? dq_exponent.data_ptr<int>() : nullptr,
-      segment_query_intervals, segment_key_intervals};
+      segment_query_intervals, segment_key_intervals,
+      kNegQReaders ? static_cast<Element const*>(params.neg_q_ptr) : nullptr,
+      {params.neg_q_row_stride, _1{}, params.neg_q_head_stride, params.neg_q_batch_stride},
+      kNegQReaders ? static_cast<Element const*>(params.neg_dy_ptr) : nullptr,
+      {params.neg_dy_row_stride, _1{}, params.neg_dy_head_stride,
+       params.neg_dy_batch_stride}};
 
   int num_blocks_n = cutlass::ceil_div(
       kVarlen ? params.max_seqlen_k : params.seqlen_k, kBlockN);
-  torch::Tensor secondary_dkv;
-  torch::Tensor secondary_dk;
-  torch::Tensor secondary_dv;
   torch::Tensor dkv_accum;
   torch::Tensor dk_accum;
   torch::Tensor dv_accum;
   torch::Tensor dk_semaphore;
   torch::Tensor dv_semaphore;
-  if constexpr (kHeadPairPrivateKVGrad) {
-    at::ScalarType constexpr pair_dtype =
-        std::is_same_v<Element, cutlass::bfloat16_t>
-            ? at::kBFloat16
-            : at::kHalf;
-    auto pair_options = torch::TensorOptions()
-                            .device(torch::kCUDA)
-                            .dtype(pair_dtype)
-                            .memory_format(at::MemoryFormat::Contiguous);
-    int64_t const dk_numel = int64_t(params.b) * params.seqlen_k *
-                             params.h_k * kHeadDim;
-    int64_t const dv_numel = int64_t(params.b) * params.seqlen_k *
-                             params.h_k * kHeadDimV;
-    secondary_dkv = torch::empty({dk_numel + dv_numel}, pair_options);
-    secondary_dk = secondary_dkv.narrow(0, 0, dk_numel).view(
-        {params.b, params.seqlen_k, params.h_k, kHeadDim});
-    secondary_dv = secondary_dkv.narrow(0, dk_numel, dv_numel).view(
-        {params.b, params.seqlen_k, params.h_k, kHeadDimV});
+  if constexpr (kNegQGroups) {
+    // Folded negative-query gradient: dK rows in FP32 for the dQ postprocess.
+    if (params.fold_neg_q) {
+      int64_t const dk_numel = int64_t(params.b) * params.seqlen_k * params.h_k * kHeadDim;
+      dk_accum = (params.dkv_accum_ptr != nullptr
+          ? torch::from_blob(params.dkv_accum_ptr, {dk_numel},
+                             torch::TensorOptions().device(torch::kCUDA).dtype(at::kFloat))
+          : torch::empty({dk_numel}, torch::TensorOptions().device(torch::kCUDA).dtype(at::kFloat)))
+          .view({params.b, params.seqlen_k, params.h_k, kHeadDim});
+    }
   } else if constexpr (kGQA && !kReaderPairKVReuse) {
     auto accum_options = torch::TensorOptions()
                              .device(torch::kCUDA)
@@ -1008,7 +944,9 @@ void RunAttentionBwdSm90Kernel(
                              params.h_k * kHeadDim;
     int64_t const dv_numel = int64_t(params.b) * params.seqlen_k *
                              params.h_k * kHeadDimV;
-    dkv_accum = torch::zeros({dk_numel + dv_numel}, accum_options);
+    dkv_accum = params.dkv_accum_ptr != nullptr
+        ? torch::from_blob(params.dkv_accum_ptr, {dk_numel + dv_numel}, accum_options)
+        : torch::zeros({dk_numel + dv_numel}, accum_options);
     dk_accum = dkv_accum.narrow(0, 0, dk_numel).view(
         {params.b, params.seqlen_k, params.h_k, kHeadDim});
     dv_accum = dkv_accum.narrow(0, dk_numel, dv_numel).view(
@@ -1027,46 +965,7 @@ void RunAttentionBwdSm90Kernel(
   }
 
   typename CollectiveEpilogue::Arguments epilogue_args = [&] {
-    if constexpr (kHeadPairPrivateKVGrad) {
-      using BaseArguments = typename CollectiveEpilogue::BaseArguments;
-      int64_t const dk_head_stride = kHeadDim;
-      int64_t const dv_head_stride = kHeadDimV;
-      int64_t const dk_row_stride = params.h_k * dk_head_stride;
-      int64_t const dv_row_stride = params.h_k * dv_head_stride;
-      int64_t const dk_batch_stride =
-          int64_t(params.seqlen_k) * dk_row_stride;
-      int64_t const dv_batch_stride =
-          int64_t(params.seqlen_k) * dv_row_stride;
-      return typename CollectiveEpilogue::Arguments{
-          BaseArguments{
-              static_cast<HPOut*>(params.dk_ptr),
-              {params.seqlen_k, kHeadDim, params.h_k, params.b},
-              {params.dk_row_stride, _1{}, params.dk_head_stride,
-               params.dk_batch_stride},
-              static_cast<HPOut*>(params.dv_ptr),
-              {params.seqlen_k, kHeadDimV, params.h_k, params.b},
-              {params.dv_row_stride, _1{}, params.dv_head_stride,
-               params.dv_batch_stride},
-              params.b,
-              params.h_k,
-              nullptr,
-              nullptr,
-              nullptr,
-              nullptr},
-          BaseArguments{
-              reinterpret_cast<Element*>(secondary_dk.data_ptr()),
-              {params.seqlen_k, kHeadDim, params.h_k, params.b},
-              {dk_row_stride, _1{}, dk_head_stride, dk_batch_stride},
-              reinterpret_cast<Element*>(secondary_dv.data_ptr()),
-              {params.seqlen_k, kHeadDimV, params.h_k, params.b},
-              {dv_row_stride, _1{}, dv_head_stride, dv_batch_stride},
-              params.b,
-              params.h_k,
-              nullptr,
-              nullptr,
-              nullptr,
-              nullptr}};
-    } else if constexpr (kGQA && !kReaderPairKVReuse) {
+    if constexpr (kGQA && !kReaderPairKVReuse) {
       int64_t const dk_head_stride = kHeadDim;
       int64_t const dv_head_stride = kHeadDimV;
       int64_t const dk_row_stride = params.h_k * dk_head_stride;
@@ -1090,6 +989,26 @@ void RunAttentionBwdSm90Kernel(
           kDeterministic ? dv_semaphore.data_ptr<int>() : nullptr,
           kVarlen ? params.cu_seqlens_k : nullptr,
           kVarlen ? params.seqused_k : nullptr};
+    } else if constexpr (kNegQGroups) {
+      return typename CollectiveEpilogue::Arguments{
+          {static_cast<HPOut*>(params.dk_ptr),
+           {params.seqlen_k, params.d, params.h_k, params.b},
+           {params.dk_row_stride, _1{}, params.dk_head_stride,
+            params.dk_batch_stride},
+           static_cast<HPOut*>(params.dv_ptr),
+           {params.seqlen_k, params.dv, params.h_k, params.b},
+           {params.dv_row_stride, _1{}, params.dv_head_stride,
+            params.dv_batch_stride},
+           params.b,
+           scheduled_q_heads,
+           nullptr,
+           nullptr,
+           nullptr,
+           nullptr},
+          params.fold_neg_q ? dk_accum.data_ptr<float>() : nullptr,
+          {params.seqlen_k, kHeadDim, params.h_k, params.b},
+          {int64_t(params.h_k) * kHeadDim, _1{}, int64_t(kHeadDim),
+           int64_t(params.seqlen_k) * params.h_k * kHeadDim}};
     } else {
       int const output_heads = kReaderPairKVReuse ? params.h_k : params.h;
       return typename CollectiveEpilogue::Arguments{
@@ -1117,7 +1036,7 @@ void RunAttentionBwdSm90Kernel(
                   "Segment worklist is only used by dense segment BWD");
     static_assert(sizeof(flash::SegmentBwdWorkTile) % sizeof(int) == 0,
                   "SegmentBwdWorkTile must be int-addressable");
-    int const max_segment_work = num_blocks_n * params.h * params.b;
+    int const max_segment_work = num_blocks_n * scheduled_q_heads * params.b;
     segment_work = torch::empty(
         {max_segment_work,
          static_cast<int64_t>(sizeof(flash::SegmentBwdWorkTile) /
@@ -1134,7 +1053,7 @@ void RunAttentionBwdSm90Kernel(
     AttentionBuildBwdSegmentWorklistKernel<
         kBlockM, kBlockN, Visibility>
         <<<worklist_blocks, kWorklistThreads, 0, stream>>>(
-            params.seqlen_q, params.seqlen_k, params.h, params.b,
+            params.seqlen_q, params.seqlen_k, scheduled_q_heads, params.b,
             params.window_size_left, params.window_size_right,
             params.attention_chunk, params.q_segment_idx,
             params.k_segment_idx, params.k_segment_len, segment_work_ptr);
@@ -1203,15 +1122,6 @@ void RunAttentionBwdSm90Kernel(
       AttnKernel::to_underlying_arguments(
           {mainloop_args, epilogue_args, {device, params.num_sm},
            scheduler_args});
-  if constexpr (kVarlen && !UseVarlenPersistentScheduler) {
-    if (logical_batch > 65535) {
-      int64_t const mainloop_grid_blocks =
-          int64_t(num_blocks_n) * scheduled_q_heads * logical_batch;
-      TORCH_CHECK(
-          mainloop_grid_blocks <= std::numeric_limits<int>::max(),
-          "attention SM90 BWD mainloop grid exceeds the CUDA x-dimension limit");
-    }
-  }
   dim3 grid_dims = AttnKernel::get_grid_shape(kernel_params);
   dim3 block_dims = AttnKernel::get_block_shape();
   int smem_size = AttnKernel::SharedStorageSize;
@@ -1228,55 +1138,51 @@ void RunAttentionBwdSm90Kernel(
         kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
         cudaSharedmemCarveoutMaxShared));
   }
-  cutlass::Status status;
-  if constexpr (kHeadPairClusterKVReuse) {
-    void const* kernel_ptr =
-        const_cast<void const*>(reinterpret_cast<void*>(kernel));
-    status = cutlass::launch_kernel_on_cluster(
-        {grid_dims, block_dims, dim3(2, 1, 1), smem_size, stream},
-        kernel_ptr, kernel_params);
-  } else {
-    status = cutlass::kernel_launch<AttnKernel>(
-        grid_dims, block_dims, smem_size, stream, kernel_params, false);
-  }
+  cutlass::Status status = cutlass::kernel_launch<AttnKernel>(
+      grid_dims, block_dims, smem_size, stream, kernel_params, false);
   TORCH_CHECK(status == cutlass::Status::kSuccess,
               "attention SM90 BWD mainloop launch failed: ",
               cutlass::cutlassGetStatusString(status));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-  if constexpr (kHeadPairPrivateKVGrad) {
-    constexpr int kElementsPerVector = 8;
-    static_assert(kHeadDim % kElementsPerVector == 0 &&
-                      kHeadDimV % kElementsPerVector == 0,
-                  "secondary K/V accumulation requires 128-bit head vectors");
-    constexpr int kMergeThreads = 256;
-    int64_t const dk_numel = int64_t(params.b) * params.seqlen_k *
-                             params.h_k * kHeadDim;
-    int64_t const dv_numel = int64_t(params.b) * params.seqlen_k *
-                             params.h_k * kHeadDimV;
-    int64_t const dk_vectors = dk_numel / kElementsPerVector;
-    int64_t const dv_vectors = dv_numel / kElementsPerVector;
-    int64_t const merge_vectors =
-        dk_vectors > dv_vectors ? dk_vectors : dv_vectors;
-    AttentionAccumulateSecondaryKVGradsKernel<Element>
-        <<<cutlass::ceil_div(merge_vectors, int64_t(kMergeThreads)),
-           kMergeThreads, 0, stream>>>(
-            dk_vectors, dv_vectors, params.seqlen_k, params.h_k,
-            kHeadDim / kElementsPerVector,
-            reinterpret_cast<Element const*>(secondary_dk.data_ptr()),
-            static_cast<HPOut*>(params.dk_ptr), params.dk_row_stride,
-            params.dk_head_stride, params.dk_batch_stride,
-            kHeadDimV / kElementsPerVector,
-            reinterpret_cast<Element const*>(secondary_dv.data_ptr()),
-            static_cast<HPOut*>(params.dv_ptr), params.dv_row_stride,
-            params.dv_head_stride, params.dv_batch_stride);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-  } else if constexpr (kGQA && !kReaderPairKVReuse) {
+  if (params.dk_accum_out != nullptr) {
+    *params.dk_accum_out = dk_accum;
+    *params.dv_accum_out = dv_accum;
+  } else if constexpr (kGroupedAccum) {
     constexpr int kCastThreads = 256;
     int64_t const dk_numel = dk_accum.numel();
     int64_t const dv_numel = dv_accum.numel();
     int64_t const dkv_numel = dk_numel > dv_numel ? dk_numel : dv_numel;
     auto launch_cast = [&] {
+      // Dense [rows, d] / [rows, dv] outputs: 8-value vectors (one 128-bit
+      // or wider load and store per thread) instead of one value per thread.
+      if constexpr (kHeadDim % 8 == 0 && kHeadDimV % 8 == 0) {
+        using CastOutput = cutlass::AlignedArray<HPOut, 8>;
+        int64_t const rows = dk_numel / kHeadDim;
+        auto aligned = [](void const* ptr) {
+          return reinterpret_cast<uintptr_t>(ptr) % alignof(CastOutput) == 0;
+        };
+        int const dk_row_vectors = params.d / 8;
+        int const dv_row_vectors = params.dv / 8;
+        int row_shift = 0;
+        while ((1 << row_shift) < (dk_row_vectors > dv_row_vectors ? dk_row_vectors : dv_row_vectors)) {
+          ++row_shift;
+        }
+        int64_t const cast_blocks = cutlass::ceil_div(rows << row_shift, int64_t(kCastThreads));
+        if (params.d % 8 == 0 && params.dv % 8 == 0 && params.d <= kHeadDim &&
+            params.dv <= kHeadDimV && dv_numel / kHeadDimV == rows &&
+            params.dk_head_stride == params.d && params.dv_head_stride == params.dv &&
+            aligned(params.dk_ptr) && aligned(params.dv_ptr) &&
+            cast_blocks <= std::numeric_limits<int>::max()) {
+          AttentionCastGroupedKVGradsVectorKernel<HPOut>
+              <<<uint32_t(cast_blocks), kCastThreads, 0, stream>>>(
+                  rows, row_shift, dk_accum.data_ptr<float>(),
+                  static_cast<HPOut*>(params.dk_ptr), dk_row_vectors, kHeadDim / 8,
+                  dv_accum.data_ptr<float>(), static_cast<HPOut*>(params.dv_ptr),
+                  dv_row_vectors, kHeadDimV / 8);
+          return;
+        }
+      }
       if constexpr (
           Visibility::kKind ==
               attention::semantics::VisibilityKind::kCausalFull &&
@@ -1312,12 +1218,12 @@ void RunAttentionBwdSm90Kernel(
       TileShapeMK, HPOut, ElementAccum, ArchTag,
       AttnKernel::CollectiveMainloop::NumMmaThreads,
       typename AttnKernel::CollectiveMainloop::TiledMmadQ,
-      AttnKernel::CollectiveMainloop::dQ_swapAB, SplitDQ>;
+      AttnKernel::CollectiveMainloop::dQ_swapAB, SplitDQ, kNegQReaders>;
   typename PostprocessKernel::Arguments postprocess_args{
       static_cast<ElementAccum const*>(params.dq_accum_ptr),
-      {seqlen_q_rounded * kHeadDim, params.h, workspace_batch},
-      {_1{}, seqlen_q_rounded * kHeadDim,
-       params.h * seqlen_q_rounded * kHeadDim},
+      {int64_t(seqlen_q_rounded) * kHeadDim, params.h, workspace_batch},
+      {_1{}, int64_t(seqlen_q_rounded) * kHeadDim,
+       int64_t(params.h) * seqlen_q_rounded * kHeadDim},
       static_cast<HPOut*>(params.dq_ptr),
       {params.seqlen_q, params.d, params.h, params.b},
       {params.dq_row_stride, _1{}, params.dq_head_stride,
@@ -1344,6 +1250,70 @@ void RunAttentionBwdSm90Kernel(
     C10_CUDA_CHECK(cudaFuncSetAttribute(
         postprocess_kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
         cudaSharedmemCarveoutMaxShared));
+  }
+  if constexpr (kNegQReaders) {
+    // One launch over logical heads: dq and dneg_q; folded, the negative-query heads
+    // write dk = round(dK accumulator + negative-query gradient) and the cast below
+    // covers dV only.
+    int const readers = params.h / params.h_k;
+    int64_t const dq_accum_head_stride = int64_t(seqlen_q_rounded) * kHeadDim;
+    typename PostprocessKernel::Arguments reader_args{
+        static_cast<ElementAccum const*>(params.dq_accum_ptr),
+        {int64_t(seqlen_q_rounded) * kHeadDim, params.h, workspace_batch},
+        {_1{}, dq_accum_head_stride, params.h * dq_accum_head_stride},
+        static_cast<HPOut*>(params.dq_ptr),
+        {params.seqlen_q, params.d, params.h - params.h_k, params.b},
+        {params.dq_row_stride, _1{}, params.dq_head_stride,
+         params.dq_batch_stride},
+        params.scale_softmax,
+        logical_batch,
+        num_m_block,
+        nullptr,
+        nullptr, dq_slots, dq_slot_stride,
+        nullptr,
+        {static_cast<HPOut*>(params.fold_neg_q ? params.dk_ptr : params.dneg_q_ptr),
+         params.fold_neg_q
+             ? typename PostprocessKernel::StridedQ{params.dk_row_stride, _1{},
+                                                    params.dk_head_stride,
+                                                    params.dk_batch_stride}
+             : typename PostprocessKernel::StridedQ{params.dneg_q_row_stride, _1{},
+                                                    params.dneg_q_head_stride,
+                                                    params.dneg_q_batch_stride},
+         params.fold_neg_q ? dk_accum.data_ptr<float>() : nullptr,
+         {int64_t(params.h_k) * kHeadDim, _1{}, int64_t(kHeadDim),
+          int64_t(params.seqlen_k) * params.h_k * kHeadDim},
+         readers}};
+    postprocess_kernel<<<auxiliary_grid,
+                         PostprocessKernel::MaxThreadsPerBlock,
+                         smem_size_postprocess, stream>>>(
+        PostprocessKernel::to_underlying_arguments(reader_args));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    if constexpr (kNegQGroups) {
+      return;  // dV and an unfolded dK were written by the epilogue
+    }
+    static_assert(kHeadDim % 8 == 0 && kHeadDimV % 8 == 0,
+                  "negative-query reader dK / dV cast uses 8-value vectors");
+    TORCH_CHECK(params.d % 8 == 0 && params.dv % 8 == 0 &&
+                    params.dk_head_stride == params.d && params.dv_head_stride == params.dv,
+                "negative-query reader BWD needs D, V multiples of 8 and contiguous dK / dV");
+    // Accumulator rows hold the instance's head dimensions; the outputs the actual ones.
+    int64_t const kv_rows = int64_t(params.b) * params.seqlen_k * params.h_k;
+    int const dk_row_vectors = params.fold_neg_q ? 0 : params.d / 8;
+    int const dv_row_vectors = params.dv / 8;
+    int row_shift = 0;
+    while ((1 << row_shift) < (dk_row_vectors > dv_row_vectors ? dk_row_vectors : dv_row_vectors)) {
+      ++row_shift;
+    }
+    int64_t const cast_threads = kv_rows << row_shift;
+    TORCH_CHECK(cutlass::ceil_div(cast_threads, int64_t(256)) <= std::numeric_limits<int>::max(),
+                "negative-query reader dK / dV cast grid exceeds the CUDA x-dimension limit");
+    AttentionCastGroupedKVGradsVectorKernel<HPOut>
+        <<<uint32_t(cutlass::ceil_div(cast_threads, int64_t(256))), 256, 0, stream>>>(
+            kv_rows, row_shift, dk_accum.data_ptr<float>(), static_cast<HPOut*>(params.dk_ptr),
+            dk_row_vectors, kHeadDim / 8, dv_accum.data_ptr<float>(),
+            static_cast<HPOut*>(params.dv_ptr), dv_row_vectors, kHeadDimV / 8);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return;
   }
   postprocess_kernel<<<auxiliary_grid,
                        PostprocessKernel::MaxThreadsPerBlock,

@@ -135,7 +135,7 @@ std::tuple<torch::Tensor, torch::Tensor> CausalAttentionFwd(
     const c10::optional<torch::Tensor>& k_segment_idx,
     const std::string& backend, bool strict_past,
     const c10::optional<torch::Tensor>& output_state,
-    bool causal_flash_attn, bool use_fast_reciprocal, bool output_fp32) {
+    bool causal_flash_attn, bool use_fast_reciprocal, bool high_precision) {
   CheckCausalAttentionInputs(
       q, k, v, window_size, prev_k, prev_v, q_segment_idx,
       k_segment_idx, true);
@@ -152,7 +152,7 @@ std::tuple<torch::Tensor, torch::Tensor> CausalAttentionFwd(
   return hopper::CausalAttentionSM90Fwd(
       q, k, v, window_size, scale, prev_k, prev_v,
       q_segment_idx, k_segment_idx, strict_past, output_state, causal_flash_attn,
-      use_fast_reciprocal, output_fp32);
+      use_fast_reciprocal, high_precision);
 #else
   TORCH_CHECK(false, "Causal attention SM90 support is not built");
 #endif
@@ -171,7 +171,7 @@ CausalAttentionBwd(
     const c10::optional<torch::Tensor>& q_segment_idx,
     const c10::optional<torch::Tensor>& k_segment_idx,
     bool deterministic, const std::string& backend, bool strict_past,
-    bool causal_flash_attn) {
+    bool causal_flash_attn, bool fp32_kv_grads) {
   CheckCausalAttentionInputs(
       q, k, v, window_size, prev_k, prev_v, q_segment_idx,
       k_segment_idx, true);
@@ -186,7 +186,8 @@ CausalAttentionBwd(
 #ifdef XATTN_HAS_SM90
   return hopper::CausalAttentionSM90Bwd(
       y_grad, q, k, v, y, lse, window_size, scale, prev_k, prev_v,
-      q_segment_idx, k_segment_idx, deterministic, strict_past, causal_flash_attn);
+      q_segment_idx, k_segment_idx, deterministic, strict_past, causal_flash_attn,
+      fp32_kv_grads);
 #else
   TORCH_CHECK(false, "Causal attention SM90 support is not built");
 #endif
@@ -200,14 +201,14 @@ std::tuple<torch::Tensor, torch::Tensor> CausalAttentionVarlenFwd(
     int64_t max_seqlen_q, int64_t max_seqlen_k,
     int64_t window_size, double scale,
     const std::string& backend, bool strict_past,
-    const c10::optional<torch::Tensor>& output_state, bool output_fp32) {
+    const c10::optional<torch::Tensor>& output_state, bool high_precision) {
   CheckOptionalCUDA(output_state, "output_state");
   CheckBackend(q, backend);
 #ifdef XATTN_HAS_SM90
   return hopper::CausalAttentionSM90VarlenFwd(
       q, k, v, cu_seqlens_q, cu_seqlens_k,
       max_seqlen_q, max_seqlen_k, window_size, scale, strict_past,
-      output_state, output_fp32);
+      output_state, high_precision);
 #else
   TORCH_CHECK(false, "Causal attention SM90 support is not built");
 #endif

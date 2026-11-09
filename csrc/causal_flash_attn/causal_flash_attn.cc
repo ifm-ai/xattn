@@ -17,11 +17,11 @@ std::tuple<torch::Tensor, torch::Tensor> CausalFlashAttnComponentFwd(
     const c10::optional<torch::Tensor>& k_segment_idx,
     const std::string& backend,
     const c10::optional<torch::Tensor>& output_state, bool strict_past,
-    bool use_fast_reciprocal, bool output_fp32) {
+    bool use_fast_reciprocal, bool high_precision) {
   return attention::CausalAttentionFwd(
       q, k, v, 0, scale, prev_k, prev_v,
       q_segment_idx, k_segment_idx, backend, strict_past, output_state,
-      true /*causal_flash_attn*/, use_fast_reciprocal, output_fp32);
+      true /*causal_flash_attn*/, use_fast_reciprocal, high_precision);
 }
 
 
@@ -37,10 +37,12 @@ CausalFlashAttnComponentBwd(
     const c10::optional<torch::Tensor>& prev_v,
     const c10::optional<torch::Tensor>& q_segment_idx,
     const c10::optional<torch::Tensor>& k_segment_idx,
-    bool deterministic, const std::string& backend, bool strict_past) {
+    bool deterministic, const std::string& backend, bool strict_past,
+    bool fp32_kv_grads = false) {
   return attention::CausalAttentionBwd(
       y_grad, q, k, v, y, lse, 0, scale, prev_k, prev_v,
-      q_segment_idx, k_segment_idx, deterministic, backend, strict_past, true /*causal_flash_attn*/);
+      q_segment_idx, k_segment_idx, deterministic, backend, strict_past, true /*causal_flash_attn*/,
+      fp32_kv_grads);
 }
 
 
@@ -51,11 +53,11 @@ std::tuple<torch::Tensor, torch::Tensor> CausalFlashAttnFwd(
     const c10::optional<torch::Tensor>& k_segment_idx,
     const std::string& backend,
     const c10::optional<torch::Tensor>& output_state,
-    bool use_fast_reciprocal, bool output_fp32) {
+    bool use_fast_reciprocal, bool high_precision) {
   return CausalFlashAttnComponentFwd(
       q, k, v, scale, c10::nullopt, c10::nullopt,
       q_segment_idx, k_segment_idx, backend, output_state,
-      false /*strict_past*/, use_fast_reciprocal, output_fp32);
+      false /*strict_past*/, use_fast_reciprocal, high_precision);
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> CausalFlashAttnBwd(
@@ -82,7 +84,7 @@ void DefineCausalFlashAttnOps(py::module& m) {
         py::arg("backend") = "auto",
         py::arg("output_state") = py::none(),
         py::arg("use_fast_reciprocal") = true,
-        py::arg("output_fp32") = false)
+        py::arg("high_precision") = false)
       .def("causal_flash_attn_bwd", &CausalFlashAttnBwd,
            "Segment-aware causal flash attention BWD: dq, dk, dv",
            py::arg("y_grad"), py::arg("q"), py::arg("k"), py::arg("v"),
@@ -103,7 +105,7 @@ void DefineCausalFlashAttnOps(py::module& m) {
        py::arg("output_state") = py::none(),
        py::arg("strict_past") = false,
        py::arg("use_fast_reciprocal") = true,
-       py::arg("output_fp32") = false)
+       py::arg("high_precision") = false)
       .def(
           "_causal_flash_attn_component_bwd", &CausalFlashAttnComponentBwd,
           py::arg("y_grad"), py::arg("q"), py::arg("k"),
@@ -115,7 +117,8 @@ void DefineCausalFlashAttnOps(py::module& m) {
           py::arg("k_segment_idx") = py::none(),
           py::arg("deterministic") = false,
           py::arg("backend") = "auto",
-          py::arg("strict_past") = false);
+          py::arg("strict_past") = false,
+          py::arg("fp32_kv_grads") = false);
 }
 
 }  // namespace ops

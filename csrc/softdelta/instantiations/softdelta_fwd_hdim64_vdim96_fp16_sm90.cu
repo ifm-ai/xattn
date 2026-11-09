@@ -1,4 +1,3 @@
-#include "softdelta/fwd_chunk_ordered_instantiation.cuh"
+#include "softdelta/fwd_template.cuh"
 
-XATTN_FLASH_SOFTDELTA_FWD_SM90_INSTANTIATE_CHUNK_ORDERED(
-    cutlass::half_t, 64, 96)
+XATTN_SOFTDELTA_FWD_SM90_INSTANTIATE(cutlass::half_t, 64, 96)

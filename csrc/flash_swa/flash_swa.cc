@@ -16,10 +16,10 @@ std::tuple<torch::Tensor, torch::Tensor> FlashSWAFwd(
     const c10::optional<torch::Tensor>& q_segment_idx,
     const c10::optional<torch::Tensor>& k_segment_idx,
     const std::string& backend,
-    const c10::optional<torch::Tensor>& output_state, bool output_fp32) {
+    const c10::optional<torch::Tensor>& output_state, bool high_precision) {
   return attention::CausalAttentionFwd(
       q, k, v, window_size, scale, prev_k, prev_v,
-      q_segment_idx, k_segment_idx, backend, false, output_state, false, false, output_fp32);
+      q_segment_idx, k_segment_idx, backend, false, output_state, false, false, high_precision);
 }
 
 std::tuple<torch::Tensor, torch::Tensor> FlashSWAStrictPastFwd(
@@ -30,10 +30,10 @@ std::tuple<torch::Tensor, torch::Tensor> FlashSWAStrictPastFwd(
     const c10::optional<torch::Tensor>& q_segment_idx,
     const c10::optional<torch::Tensor>& k_segment_idx,
     const std::string& backend,
-    const c10::optional<torch::Tensor>& output_state, bool output_fp32) {
+    const c10::optional<torch::Tensor>& output_state, bool high_precision) {
   return attention::CausalAttentionFwd(
       q, k, v, window_size, scale, prev_k, prev_v,
-      q_segment_idx, k_segment_idx, backend, true, output_state, false, false, output_fp32);
+      q_segment_idx, k_segment_idx, backend, true, output_state, false, false, high_precision);
 }
 
 std::tuple<
@@ -48,10 +48,11 @@ FlashSWABwd(
     const c10::optional<torch::Tensor>& prev_v,
     const c10::optional<torch::Tensor>& q_segment_idx,
     const c10::optional<torch::Tensor>& k_segment_idx,
-    bool deterministic, const std::string& backend) {
+    bool deterministic, const std::string& backend, bool fp32_kv_grads) {
   return attention::CausalAttentionBwd(
       y_grad, q, k, v, y, lse, window_size, scale, prev_k, prev_v,
-      q_segment_idx, k_segment_idx, deterministic, backend, false);
+      q_segment_idx, k_segment_idx, deterministic, backend, false, false,
+      fp32_kv_grads);
 }
 
 std::tuple<
@@ -80,10 +81,10 @@ std::tuple<torch::Tensor, torch::Tensor> FlashSWAVarlenFwd(
     int64_t max_seqlen_q, int64_t max_seqlen_k,
     int64_t window_size, double scale,
     const std::string& backend, bool strict_past,
-    const c10::optional<torch::Tensor>& output_state, bool output_fp32) {
+    const c10::optional<torch::Tensor>& output_state, bool high_precision) {
   return attention::CausalAttentionVarlenFwd(
       q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
-      window_size, scale, backend, strict_past, output_state, output_fp32);
+      window_size, scale, backend, strict_past, output_state, high_precision);
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
@@ -113,10 +114,11 @@ void DefineFlashSWAOps(py::module& m) {
        py::arg("k_segment_idx") = py::none(),
        py::arg("backend") = "auto",
        py::arg("output_state") = py::none(),
-          py::arg("output_fp32") = false)
+          py::arg("high_precision") = false)
       .def(
           "flash_swa_bwd", &FlashSWABwd,
-          "Segment-aware causal FlashSWA BWD",
+          "Segment-aware causal FlashSWA BWD; fp32_kv_grads (grouped heads) "
+          "returns dk / dv as their FP32 accumulators",
           py::arg("y_grad"), py::arg("q"), py::arg("k"),
           py::arg("v"), py::arg("y"), py::arg("lse"),
           py::arg("window_size"), py::arg("scale"),
@@ -125,7 +127,8 @@ void DefineFlashSWAOps(py::module& m) {
           py::arg("q_segment_idx") = py::none(),
           py::arg("k_segment_idx") = py::none(),
           py::arg("deterministic") = false,
-          py::arg("backend") = "auto")
+          py::arg("backend") = "auto",
+          py::arg("fp32_kv_grads") = false)
       .def(
           "_flash_swa_sm90_strict_past_fwd", &FlashSWAStrictPastFwd,
           "Strict-past FlashSWA SM90 FWD",
@@ -137,7 +140,7 @@ void DefineFlashSWAOps(py::module& m) {
           py::arg("k_segment_idx") = py::none(),
           py::arg("backend") = "auto",
           py::arg("output_state") = py::none(),
-          py::arg("output_fp32") = false)
+          py::arg("high_precision") = false)
       .def(
           "_flash_swa_sm90_strict_past_bwd", &FlashSWAStrictPastBwd,
           "Strict-past FlashSWA SM90 BWD",
@@ -160,7 +163,7 @@ void DefineFlashSWAOps(py::module& m) {
           py::arg("backend") = "auto",
           py::arg("strict_past") = false,
           py::arg("output_state") = py::none(),
-          py::arg("output_fp32") = false)
+          py::arg("high_precision") = false)
       .def(
           "_flash_swa_sm90_varlen_bwd", &FlashSWAVarlenBwd,
           "Packed varlen segment-isolated causal FlashSWA BWD",

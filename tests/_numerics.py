@@ -7,17 +7,14 @@ import torch
 import torch.nn.functional as F
 import xattn
 
-from tests.softdelta.reference import _allowed_masks, _attention_from_mask
-from tests.softdelta._inputs import ATOL, GRAD_ATOL, RTOL
+from tests._reference import _allowed_masks, _attention_from_mask
+from tests._reference import ATOL, GRAD_ATOL, RTOL
 
 DTYPES = (torch.float16, torch.bfloat16)
 HEAD_DIMS = (32, 64, 96, 128, 160, 192, 256)
-OPERATIONS = {
-    'full': 'causal_flash_attn', 'window': 'flash_swa', 'chunk': 'flash_sca',
-    'softdelta_full': 'softdelta_attention',
-    'softdelta_window': 'sliding_window_softdelta_attention',
-    'softdelta_chunk': 'sliding_chunk_softdelta_attention',
-}
+OPERATIONS = {'full': 'causal_flash_attn', 'window': 'flash_swa', 'chunk': 'flash_sca'}
+# Public high_precision_level values; level 1 runs the precision-repair backward.
+LEVELS = (0, 1)
 
 
 @dataclass(frozen=True)
@@ -31,7 +28,6 @@ class Case:
     previous: int = 0
     span: int = 64
     reset: bool = False
-    groups: int = 4
     layout: str = 'contiguous'
     batch: int = 2
     segment_length: int = 67
@@ -58,7 +54,7 @@ CASES = (
 
 
 def cases_for(operation):
-    visibility = operation.removeprefix('softdelta_')
+    visibility = operation
     cases = list(CASES)
     if operation != 'full':
         cases += [
@@ -68,7 +64,7 @@ def cases_for(operation):
         ]
     if visibility == 'window':
         cases += [Case('window-zero', span=0), Case('window-one', span=1),
-                  Case('covering-window', span=512, previous=37, groups=2)]
+                  Case('covering-window', span=512, previous=37)]
     if visibility == 'chunk':
         cases += [
             Case('chunk-one', span=1, previous=1),
@@ -80,9 +76,6 @@ def cases_for(operation):
             Case('reset-unmatched', 17, 41, metadata='unmatched', reset=True),
             Case('reset-long-q-run', 17, 41, metadata='long_run', reset=True),
         ]
-    if operation.startswith('softdelta_'):
-        cases += [Case(f'gate-groups-{g}', 127, 127, 256, 256, groups=g, batch=1)
-                  for g in (1, 2, 8)]
     if visibility == 'chunk':
         cases = [replace(case, span=case.previous) if case.previous else case for case in cases]
     return tuple(cases)
@@ -107,13 +100,12 @@ def case_seed(operation, case, dtype, kv_heads):
 
 
 def make_inputs(operation, case, dtype, kv_heads, device):
-    soft = operation.startswith('softdelta_')
     heads = 4
     seed = case_seed(operation, case, dtype, kv_heads)
     torch.manual_seed(seed)
     def rand(shape):
         return torch.randn(shape, device=device, dtype=dtype)
-    q_shape = (case.batch, case.q_length, heads * (2 if soft else 1), case.dim)
+    q_shape = (case.batch, case.q_length, heads, case.dim)
     if case.layout == 'head_slice':
         q = F.normalize(rand((*q_shape[:2], q_shape[2] * 2, case.dim)), dim=-1)[:, :, 1::2]
     elif case.layout == 'offset':
@@ -126,22 +118,18 @@ def make_inputs(operation, case, dtype, kv_heads, device):
         q = F.normalize(rand(q_shape), dim=-1)
     total = case.k_length + case.previous
     kt = F.normalize(rand((case.batch, total, kv_heads, case.dim)), dim=-1)
-    v_shape = (case.groups, case.value_dim // case.groups) if soft else (case.value_dim,)
-    vt = F.silu(rand((case.batch, total, kv_heads, *v_shape))) + 0.1
+    vt = F.silu(rand((case.batch, total, kv_heads, case.value_dim))) + 0.1
     inputs = [q, kt[:, case.previous:], vt[:, case.previous:]]
-    if soft:
-        inputs.append(rand((case.batch, case.q_length, heads, case.groups, 1)) * 0.2)
     if case.previous:
         inputs += [kt[:, :case.previous], vt[:, :case.previous]]
     return [t.detach().requires_grad_() for t in inputs]
 
 
 def options_and_segments(operation, case, inputs, backend):
-    visibility = operation.removeprefix('softdelta_')
     options = {'backend': backend}
-    if visibility == 'window':
+    if operation == 'window':
         options['window_size'] = case.span
-    elif visibility == 'chunk':
+    elif operation == 'chunk':
         options.update(chunk_size=case.span, reset_chunk_pos_per_seq=case.reset)
     if case.previous:
         options.update(prev_k=inputs[-2], prev_v=inputs[-1])
@@ -172,33 +160,19 @@ def options_and_segments(operation, case, inputs, backend):
 
 def oracle(operation, case, inputs, qi, ki):
     refs = [x.detach().double().requires_grad_() for x in inputs]
-    soft = operation.startswith('softdelta_')
     q, k, v = refs[:3]
     if case.previous:
         k, v = torch.cat((refs[-2], k), 1), torch.cat((refs[-1], v), 1)
     masks = _allowed_masks(case.q_length, k.shape[1], case.batch, q.device,
-                           operation.removeprefix('softdelta_'), case.span, qi, ki, case.reset)
-    if not soft:
-        expected = _attention_from_mask(q, k, v, masks[0], case.dim ** -0.5)
-        return refs, expected, None
-    reads = [_attention_from_mask(q[:, :, branch::2], k, v.flatten(3), masks[branch],
-                                  case.dim ** -0.5).reshape(case.batch, case.q_length, 4,
-                                                          case.groups, case.value_dim // case.groups)
-             for branch in (0, 1)]
-    return refs, reads[0] - refs[3].sigmoid() * reads[1], reads
+                           operation, case.span, qi, ki, case.reset)
+    return refs, _attention_from_mask(q, k, v, masks[0], case.dim ** -0.5)
 
 
-def assert_output(actual, expected, dtype, reads=None, gate=None):
+def assert_output(actual, expected, dtype):
     assert torch.isfinite(actual).all()
     assert actual.shape == expected.shape
     assert actual.dtype == dtype
-    if reads is None:
-        torch.testing.assert_close(actual, expected.to(dtype), atol=ATOL[dtype], rtol=RTOL[dtype])
-    else:
-        budget = (ATOL[dtype] + RTOL[dtype] * reads[0].abs()
-                  + gate.double().sigmoid() * (ATOL[dtype] + RTOL[dtype] * reads[1].abs())
-                  + ATOL[dtype] + RTOL[dtype] * expected.abs())
-        assert ((actual.double() - expected).abs() <= budget).all(), 'SoftDelta exceeds component rounding budget'
+    torch.testing.assert_close(actual, expected.to(dtype), atol=ATOL[dtype], rtol=RTOL[dtype])
 
 
 def assert_gradients(actual, expected, dtype):
@@ -212,13 +186,11 @@ def check_case(operation, case, dtype, kv_heads, deterministic, high_precision, 
     device = require_device(backend)
     inputs = make_inputs(operation, case, dtype, kv_heads, device)
     options, qi, ki = options_and_segments(operation, case, inputs, backend)
-    refs, expected, reads = oracle(operation, case, inputs, qi, ki)
-    soft = operation.startswith('softdelta_')
-    base_inputs = inputs[:4 if soft else 3]
-    gate = inputs[3] if soft else None
+    refs, expected = oracle(operation, case, inputs, qi, ki)
+    base_inputs = inputs[:3]
     fn = getattr(xattn, OPERATIONS[operation])
     actual = fn(*base_inputs, **options, deterministic=deterministic, high_precision_level=int(high_precision))
-    assert_output(actual, expected, dtype, reads, gate)
+    assert_output(actual, expected, dtype)
     dy = torch.randn_like(actual) / actual.numel() ** 0.5
     expected_grads = torch.autograd.grad(expected, refs, dy.double())
     grads = torch.autograd.grad(actual, inputs, dy, retain_graph=deterministic)
@@ -227,32 +199,18 @@ def check_case(operation, case, dtype, kv_heads, deterministic, high_precision, 
         repeated = torch.autograd.grad(actual, inputs, dy)
         for first, second in zip(grads, repeated):
             torch.testing.assert_close(first, second, atol=0, rtol=0)
-    if case.name == 'full-dimensions' and operation in ('softdelta_window', 'softdelta_chunk'):
-        from xattn.ops._flash_softdelta import flash_softdelta_paired_training
-        paired = flash_softdelta_paired_training(
-            *base_inputs, case.span, case.dim**-0.5,
-            1 if operation == 'softdelta_window' else 2, deterministic, int(high_precision),
-        )
-        assert_output(paired, expected, dtype, reads, gate)
-        assert_gradients(torch.autograd.grad(paired, inputs, dy), expected_grads, dtype)
     if backend != 'torch':
         fwd = getattr(xattn, OPERATIONS[operation] + '_fwd')
         bwd = getattr(xattn, OPERATIONS[operation] + '_bwd')
-        fwd_options = dict(options, high_precision_level=int(high_precision))
-        if soft:
-            fwd_options['deterministic'] = deterministic
         with torch.no_grad():
-            explicit, state, lse = fwd(*base_inputs, **fwd_options)
-            assert_output(explicit, expected, dtype, reads, gate)
-            saved = state if soft or high_precision else explicit
-            if high_precision:
-                assert state.dtype == torch.float32
-            explicit_grads = bwd(dy, *base_inputs, saved, lse, **options,
+            explicit, lse = fwd(*base_inputs, **options, high_precision_level=int(high_precision))
+            assert_output(explicit, expected, dtype)
+            explicit_grads = bwd(dy, *base_inputs, explicit, lse, **options,
                                  deterministic=deterministic, high_precision_level=int(high_precision))[:len(inputs)]
             assert_gradients(explicit_grads, expected_grads, dtype)
         with torch.inference_mode():
             inference = fn(*base_inputs, **options, high_precision_level=int(high_precision))
-            assert_output(inference, expected, dtype, reads, gate)
+            assert_output(inference, expected, dtype)
 
 
 def check_rounding_bias(operation, deterministic):
@@ -341,29 +299,19 @@ def check_long(operation, length, dim, value_dim, dtype, kv_heads, high_precisio
     positions = torch.tensor(sorted({0, 1, 127, 128, 191, 192, 255, 256, 257,
                                     511, 512, length//2, length-2, length-1}), device='cuda')
     qp = positions[:, None]; kp = torch.arange(length, device='cuda')[None, :]
-    visibility = operation.removeprefix('softdelta_')
     left = torch.ones_like(kp, dtype=torch.bool)
-    if visibility == 'window':
+    if operation == 'window':
         left = kp >= qp - case.span
-    elif visibility == 'chunk':
+    elif operation == 'chunk':
         left = kp >= qp // case.span * case.span - case.span
-    soft = operation.startswith('softdelta_')
-    reads = []
-    for branch in range(2 if soft else 1):
-        qr = refs[0][:, positions]
-        if soft:
-            qr = qr[:, :, branch::2]
-        mask = (left & (kp <= qp - branch))[None]
-        read = _attention_from_mask(qr, refs[1], refs[2].flatten(3) if soft else refs[2], mask, dim**-0.5)
-        reads.append(read.reshape(1, len(positions), 4, case.groups, value_dim//case.groups) if soft else read)
-    gate = refs[3][:, positions] if soft else None
-    expected = reads[0] - gate.sigmoid()*reads[1] if soft else reads[0]
+    mask = (left & (kp <= qp))[None]
+    expected = _attention_from_mask(refs[0][:, positions], refs[1], refs[2], mask, dim**-0.5)
     options, _, _ = options_and_segments(operation, case, inputs, 'sm90')
     actual = getattr(xattn, OPERATIONS[operation])(
         *inputs, **options, high_precision_level=int(high_precision), deterministic=deterministic)
     assert torch.isfinite(actual).all()
     selected = actual[:, positions]
-    assert_output(selected, expected, dtype, reads if soft else None, gate)
+    assert_output(selected, expected, dtype)
     dy = torch.randn_like(selected) / selected.numel()**0.5
     grads = torch.autograd.grad(selected, inputs, dy, retain_graph=deterministic)
     assert_gradients(grads, torch.autograd.grad(expected, refs, dy.double()), dtype)

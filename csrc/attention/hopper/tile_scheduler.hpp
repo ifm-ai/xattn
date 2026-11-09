@@ -103,18 +103,14 @@ public:
                 args.num_splits_dynamic_ptr};
     }
 
+    // Batches past the grid z limit are strided: a CTA serves batches
+    // blockIdx.z, blockIdx.z + gridDim.z, ... (get_next_work).
+    static constexpr int kMaxGridZ = 65535;
+
     static dim3
     get_grid_shape(Params const& params, int num_sm) {
-        if constexpr (Varlen) {
-            if (params.num_batch > 65535) {
-                return {
-                    uint32_t(int64_t(params.num_blocks) *
-                             int64_t((!Split ? 1 : params.num_splits) *
-                                     params.num_head) *
-                             int64_t(params.num_batch))};
-            }
-        }
-        return {uint32_t(params.num_blocks), uint32_t((!Split ? 1 : params.num_splits) * params.num_head), uint32_t(params.num_batch)};
+        return {uint32_t(params.num_blocks), uint32_t((!Split ? 1 : params.num_splits) * params.num_head),
+                uint32_t(params.num_batch < kMaxGridZ ? params.num_batch : kMaxGridZ)};
     }
 
     struct WorkTileInfo {
@@ -140,49 +136,45 @@ public:
     CUTLASS_DEVICE
     SingleTileScheduler(SharedStorage* const smem_scheduler) { }
 
+    // First valid tile at or after work_info.bidb (stepping by gridDim.z);
+    // work_info.split_idx holds the raw split index.
+    CUTLASS_DEVICE
+    WorkTileInfo
+    next_valid_work(Params const& params, WorkTileInfo work_info) const {
+        for (; work_info.bidb < params.num_batch; work_info.bidb += int(gridDim.z)) {
+            bool is_valid_tile = true;
+            if constexpr (Varlen) {
+                int seqlen = params.seqused
+                    ? params.seqused[work_info.bidb]
+                    : (params.cu_seqlens ? params.cu_seqlens[work_info.bidb + 1] - params.cu_seqlens[work_info.bidb] : params.seqlen);
+                if constexpr (PackGQA) { seqlen *= params.qhead_per_khead; }
+                is_valid_tile = work_info.block_idx * kBlock < seqlen;
+            }
+            if constexpr (Varlen && Split) {
+                int num_splits_dynamic = params.num_splits_dynamic_ptr ? params.num_splits_dynamic_ptr[work_info.bidb] : params.num_splits;
+                is_valid_tile &= work_info.split_idx < num_splits_dynamic;
+                if (is_valid_tile) {
+                    // Upper 16 bits encode num_splits.
+                    work_info.split_idx |= (num_splits_dynamic << 16);
+                }
+            }
+            if (is_valid_tile) { return work_info; }
+        }
+        work_info.bidb = -1;
+        return work_info;
+    }
+
     template<bool IsProducerWarp=false>
     CUTLASS_DEVICE
     WorkTileInfo
     get_initial_work(Params const& params) const {
-        WorkTileInfo work_info;
-        if constexpr (Varlen) {
-            if (params.num_batch > 65535) {
-                int tile_idx = int(blockIdx.x);
-                work_info.block_idx = tile_idx % params.num_blocks;
-                tile_idx /= params.num_blocks;
-                int const num_head_split =
-                    (!Split ? 1 : params.num_splits) * params.num_head;
-                work_info.bidh = tile_idx % num_head_split;
-                work_info.bidb = tile_idx / num_head_split;
-            } else {
-                work_info = {
-                    int(blockIdx.x), int(blockIdx.y), int(blockIdx.z), 0};
-            }
-        } else {
-            work_info = {
-                int(blockIdx.x), int(blockIdx.y), int(blockIdx.z), 0};
-        }
+        WorkTileInfo work_info = {int(blockIdx.x), int(blockIdx.y), int(blockIdx.z), 0};
         if constexpr (Split) {
             int split_idx;
             work_info.bidh = params.nsplits_divmod.divmod(split_idx, work_info.bidh);
             work_info.split_idx = split_idx;
         }
-        bool is_valid_tile = true;
-        if constexpr (Varlen) {
-            int seqlen = params.seqused
-                ? params.seqused[work_info.bidb]
-                : (params.cu_seqlens ? params.cu_seqlens[work_info.bidb + 1] - params.cu_seqlens[work_info.bidb] : params.seqlen);
-            if constexpr (PackGQA) { seqlen *= params.qhead_per_khead; }
-            is_valid_tile = work_info.block_idx * kBlock < seqlen;
-        }
-        if constexpr (Varlen && Split) {
-            int num_splits_dynamic = params.num_splits_dynamic_ptr ? params.num_splits_dynamic_ptr[work_info.bidb] : params.num_splits;
-            is_valid_tile &= work_info.split_idx < num_splits_dynamic;
-            // Upper 16 bits encode num_splits.
-            work_info.split_idx |= (num_splits_dynamic << 16);
-        }
-        work_info.bidb = is_valid_tile ? work_info.bidb : -1;
-        return work_info;
+        return next_valid_work(params, work_info);
     }
 
     CUTLASS_DEVICE
@@ -197,7 +189,11 @@ public:
     CUTLASS_DEVICE
     WorkTileInfo
     get_next_work(Params const& params, WorkTileInfo const& current_work) const {
-        return {0, 0, -1, 0};
+        if (params.num_batch <= kMaxGridZ) { return {0, 0, -1, 0}; }
+        WorkTileInfo work_info = current_work;
+        work_info.bidb += int(gridDim.z);
+        work_info.split_idx &= 0x0000FFFF;
+        return next_valid_work(params, work_info);
     }
 
 };
@@ -614,13 +610,13 @@ public:
 
 ///////////////////////////////////////////////////////////////////////////////
 
-template <bool Varlen, int kBlock, bool SPT = false, int WorkGroupX = 1,
-          bool ContiguousWorkGroup = true>
+// ResidualFirst schedules the partial L2 section (num_head * num_batch not a
+// multiple of the section size) before the full ones, so its longest blocks
+// do not form the tail.
+template <bool Varlen, int kBlock, bool SPT = false, bool ResidualFirst = false>
 class SingleTileBwdLPTScheduler {
 
 public:
-
-    static_assert(WorkGroupX >= 1, "BWD scheduler work-group width must be positive");
 
     using SharedStorage = int;
     static constexpr bool HasMBlockRange = false;
@@ -662,7 +658,7 @@ public:
 
     static dim3
     get_grid_shape(Params const& params, int num_sm) {
-        return {uint32_t(params.total_blocks * WorkGroupX)};
+        return {uint32_t(params.total_blocks)};
     }
 
     struct WorkTileInfo {
@@ -691,24 +687,27 @@ public:
     CUTLASS_DEVICE
     WorkTileInfo
     get_initial_work(Params const& params) const {
-        // CUDA clusters require contiguous reader groups. Independent readers
-        // use planes with the per-reader logical tile order.
-        int tile_idx;
-        if constexpr (ContiguousWorkGroup) {
-            tile_idx = blockIdx.x / WorkGroupX;
-        } else {
-            static_assert(WorkGroupX > 1,
-                          "planar work groups require multiple workers");
-            tile_idx = blockIdx.x % params.total_blocks;
-        }
+        int const tile_idx = blockIdx.x;
         int block, bidh, bidb;
         int l2_mod, bidhb, bidhb_residual;
+        if constexpr (ResidualFirst) {
+            int const residual_tiles = params.total_blocks
+                - params.num_hb_quotient * params.l2_major_divmod.divisor;
+            if (tile_idx < residual_tiles) {
+                bidhb = params.num_hb_quotient;
+                block = params.l2_minor_residual_divmod.divmod(bidhb_residual, tile_idx);
+            } else {
+                bidhb = params.l2_major_divmod.divmod(l2_mod, tile_idx - residual_tiles);
+                block = params.l2_minor_divmod.divmod(bidhb_residual, l2_mod);
+            }
+        } else {
         bidhb = params.l2_major_divmod.divmod(l2_mod, tile_idx);
         // Residual sections use their own divisor.
         if (bidhb < params.num_hb_quotient) {
             block = params.l2_minor_divmod.divmod(bidhb_residual, l2_mod);
         } else {
             block = params.l2_minor_residual_divmod.divmod(bidhb_residual, l2_mod);
+        }
         }
         bidb = params.head_divmod.divmod(bidh, bidhb * params.l2_minor_divmod.divisor + bidhb_residual);
         bool is_valid_tile = true;
